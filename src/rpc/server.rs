@@ -2,22 +2,24 @@
 //
 // Implements Sun RPC over TCP with record marking protocol (RFC 5531)
 
-use anyhow::{Result, anyhow};
-use bytes::{BytesMut, BufMut, Buf};
+use anyhow::{anyhow, Result};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, debug, error, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::protocol::v3::rpc::{RpcMessage, rpc_call_msg};
+use crate::portmap::Registry;
+use crate::protocol::v3::rpc::{rpc_call_msg, RpcMessage};
 
 /// RPC server handling TCP connections with record marking
 pub struct RpcServer {
     addr: String,
+    registry: Registry,
 }
 
 impl RpcServer {
-    pub fn new(addr: String) -> Self {
-        Self { addr }
+    pub fn new(addr: String, registry: Registry) -> Self {
+        Self { addr, registry }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -28,8 +30,9 @@ impl RpcServer {
             let (socket, peer_addr) = listener.accept().await?;
             info!("New connection from {}", peer_addr);
 
+            let registry = self.registry.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket).await {
+                if let Err(e) = handle_connection(socket, registry).await {
                     error!("Connection error from {}: {}", peer_addr, e);
                 }
             });
@@ -38,7 +41,7 @@ impl RpcServer {
 }
 
 /// Handle a single TCP connection
-async fn handle_connection(mut socket: TcpStream) -> Result<()> {
+async fn handle_connection(mut socket: TcpStream, registry: Registry) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(8192);
 
     loop {
@@ -70,7 +73,7 @@ async fn handle_connection(mut socket: TcpStream) -> Result<()> {
         if is_last {
             debug!("Complete RPC message received ({} bytes)", buffer.len());
 
-            match handle_rpc_message(&buffer).await {
+            match handle_rpc_message(&buffer, &registry).await {
                 Ok(response) => {
                     // Send response with record marking
                     let response_len = response.len() as u32;
@@ -97,8 +100,8 @@ async fn handle_connection(mut socket: TcpStream) -> Result<()> {
 }
 
 /// Handle a complete RPC message
-async fn handle_rpc_message(data: &[u8]) -> Result<BytesMut> {
-    // Deserialize RPC call
+async fn handle_rpc_message(data: &[u8], registry: &Registry) -> Result<BytesMut> {
+    // Deserialize RPC call header
     let call = RpcMessage::deserialize_call(data)?;
 
     debug!(
@@ -106,23 +109,39 @@ async fn handle_rpc_message(data: &[u8]) -> Result<BytesMut> {
         call.xid, call.prog, call.vers, call.proc_
     );
 
-    // Route to appropriate handler based on procedure number
-    match call.proc_ {
-        0 => handle_null_procedure(&call),
+    // Calculate where procedure arguments start (after RPC call header)
+    // RPC call header size: xid(4) + rpcvers(4) + prog(4) + vers(4) + proc(4) + cred + verf
+    // For AUTH_NONE: cred(4+4) + verf(4+4) = 16 bytes
+    // Total: 20 + 16 = 36 bytes for NULL auth
+    let args_offset = 36; // TODO: Parse cred/verf length dynamically
+    let args_data = if data.len() > args_offset {
+        &data[args_offset..]
+    } else {
+        &[]
+    };
+
+    // Route to appropriate handler based on program number
+    match call.prog {
+        100000 => {
+            // Portmapper protocol (program 100000)
+            debug!("Routing to PORTMAP protocol handler");
+            crate::portmap::handle_portmap_call(&call, args_data, registry)
+        }
+        100005 => {
+            // MOUNT protocol (program 100005)
+            debug!("Routing to MOUNT protocol handler");
+            crate::mount::handle_mount_call(&call, args_data)
+        }
+        100003 => {
+            // NFS protocol (program 100003)
+            debug!("Routing to NFS protocol handler");
+            // TODO: Implement NFS handler
+            warn!("NFS protocol not yet implemented");
+            Err(anyhow!("NFS protocol not yet implemented"))
+        }
         _ => {
-            warn!("Unsupported procedure: {}", call.proc_);
-            Err(anyhow!("Unsupported procedure: {}", call.proc_))
+            warn!("Unknown program number: {}", call.prog);
+            Err(anyhow!("Unknown program number: {}", call.prog))
         }
     }
-}
-
-/// Handle RPC NULL procedure (0)
-fn handle_null_procedure(call: &rpc_call_msg) -> Result<BytesMut> {
-    debug!("Handling NULL procedure for xid={}", call.xid);
-
-    // Create success reply using protocol middleware
-    let reply = RpcMessage::create_null_reply(call.xid);
-
-    // Serialize reply
-    RpcMessage::serialize_reply(&reply)
 }

@@ -24,6 +24,7 @@ fn main() {
     // List of XDR specs to compile
     let xdr_specs = vec![
         ("rpc.x", "rpc_generated.rs"),
+        ("portmap.x", "portmap_generated.rs"),
         ("mount.x", "mount_generated.rs"),
         ("nfs.x", "nfs_generated.rs"),
     ];

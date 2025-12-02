@@ -6,10 +6,12 @@
 // - Error handling
 
 pub mod rpc;
+pub mod portmap;
 pub mod mount;
 pub mod nfs;
 
 // Re-export for convenience
 pub use rpc::RpcMessage;
+pub use portmap::PortmapMessage;
 pub use mount::MountMessage;
 pub use nfs::NfsMessage;
