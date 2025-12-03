@@ -1,7 +1,9 @@
 use anyhow::Result;
 use tracing_subscriber;
 
+mod fsal;
 mod mount;
+mod nfs;
 mod portmap;
 mod protocol;
 mod rpc;

@@ -135,9 +135,7 @@ async fn handle_rpc_message(data: &[u8], registry: &Registry) -> Result<BytesMut
         100003 => {
             // NFS protocol (program 100003)
             debug!("Routing to NFS protocol handler");
-            // TODO: Implement NFS handler
-            warn!("NFS protocol not yet implemented");
-            Err(anyhow!("NFS protocol not yet implemented"))
+            crate::nfs::dispatch(&call)
         }
         _ => {
             warn!("Unknown program number: {}", call.prog);
