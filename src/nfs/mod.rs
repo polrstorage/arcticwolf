@@ -14,6 +14,7 @@ mod null;
 mod pathconf;
 mod read;
 mod readdir;
+mod readdirplus;
 mod setattr;
 mod write;
 

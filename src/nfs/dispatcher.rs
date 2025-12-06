@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::Filesystem;
 use crate::protocol::v3::rpc::rpc_call_msg;
 
-use super::{access, create, fsinfo, fsstat, getattr, lookup, null, pathconf, read, readdir, setattr, write};
+use super::{access, create, fsinfo, fsstat, getattr, lookup, null, pathconf, read, readdir, readdirplus, setattr, write};
 
 /// Dispatch NFS procedure call to appropriate handler
 ///
@@ -82,10 +82,8 @@ pub fn dispatch(
             pathconf::handle_pathconf(xid, args_data, filesystem)
         }
         17 => {
-            // READDIRPLUS - read directory entries with attributes (not yet implemented)
-            // Return NFS3ERR_NOTSUPP so client falls back to READDIR
-            warn!("NFS READDIRPLUS not yet implemented, returning NOTSUPP");
-            create_notsupp_response(xid)
+            // READDIRPLUS - read directory entries with attributes
+            readdirplus::handle_readdirplus(xid, args_data, filesystem)
         }
         7 => {
             // WRITE - write to file

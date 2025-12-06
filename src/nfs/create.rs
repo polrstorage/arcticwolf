@@ -196,22 +196,10 @@ mod tests {
             where_dir: fhandle3(root_handle),
             name: filename3(test_filename.to_string()),
             how: createhow3::UNCHECKED(sattr3 {
-                mode: set_mode3 {
-                    set_it: true,
-                    mode: 0o644,
-                },
-                uid: set_uid3 {
-                    set_it: false,
-                    uid: 0,
-                },
-                gid: set_gid3 {
-                    set_it: false,
-                    gid: 0,
-                },
-                size: set_size3 {
-                    set_it: false,
-                    size: 0,
-                },
+                mode: set_mode3::SET_MODE(0o644),
+                uid: set_uid3::default,
+                gid: set_gid3::default,
+                size: set_size3::default,
                 atime: set_atime::default,
                 mtime: set_mtime::default,
             }),
@@ -254,22 +242,10 @@ mod tests {
             where_dir: fhandle3(root_handle),
             name: filename3("existing.txt".to_string()),
             how: createhow3::UNCHECKED(sattr3 {
-                mode: set_mode3 {
-                    set_it: true,
-                    mode: 0o644,
-                },
-                uid: set_uid3 {
-                    set_it: false,
-                    uid: 0,
-                },
-                gid: set_gid3 {
-                    set_it: false,
-                    gid: 0,
-                },
-                size: set_size3 {
-                    set_it: false,
-                    size: 0,
-                },
+                mode: set_mode3::SET_MODE(0o644),
+                uid: set_uid3::default,
+                gid: set_gid3::default,
+                size: set_size3::default,
                 atime: set_atime::default,
                 mtime: set_mtime::default,
             }),

@@ -481,6 +481,47 @@ union READDIR3res switch (nfsstat3 status) {
         READDIR3resfail resfail;
 };
 
+/* ===== READDIRPLUS Procedure (17) ===== */
+
+struct READDIRPLUS3args {
+    fhandle3 dir;
+    cookie3 cookie;
+    cookieverf3 cookieverf;
+    uint32 dircount;
+    uint32 maxcount;
+};
+
+struct entryplus3 {
+    fileid3 fileid;
+    filename3 name;
+    cookie3 cookie;
+    fattr3 name_attributes;        /* post_op_attr - handled manually */
+    fhandle3 name_handle;          /* post_op_fh3 - handled manually */
+    entryplus3 *nextentry;
+};
+
+struct dirlistplus3 {
+    entryplus3 *entries;
+    bool eof;
+};
+
+struct READDIRPLUS3resok {
+    fattr3 dir_attributes;         /* post_op_attr - handled manually */
+    cookieverf3 cookieverf;
+    dirlistplus3 reply;
+};
+
+struct READDIRPLUS3resfail {
+    fattr3 dir_attributes;         /* post_op_attr - handled manually */
+};
+
+union READDIRPLUS3res switch (nfsstat3 status) {
+    case NFS3_OK:
+        READDIRPLUS3resok resok;
+    default:
+        READDIRPLUS3resfail resfail;
+};
+
 /* ===== PATHCONF Procedure (20) ===== */
 
 struct PATHCONF3args {

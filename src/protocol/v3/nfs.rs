@@ -432,4 +432,18 @@ impl NfsMessage {
         (status as i32).pack(&mut buf)?;
         Ok(BytesMut::from(&buf[..]))
     }
+
+    /// Deserialize READDIRPLUS3args from XDR bytes
+    pub fn deserialize_readdirplus3args(data: &[u8]) -> Result<READDIRPLUS3args> {
+        let mut cursor = Cursor::new(data);
+        let (args, _bytes_read) = READDIRPLUS3args::unpack(&mut cursor)?;
+        Ok(args)
+    }
+
+    /// Create a READDIRPLUS error response
+    pub fn create_readdirplus_error_response(status: nfsstat3) -> Result<BytesMut> {
+        let mut buf = Vec::new();
+        (status as i32).pack(&mut buf)?;
+        Ok(BytesMut::from(&buf[..]))
+    }
 }

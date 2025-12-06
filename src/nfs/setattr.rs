@@ -198,22 +198,10 @@ mod tests {
         let args = SETATTR3args {
             object: fhandle3(file_handle),
             new_attributes: sattr3 {
-                mode: set_mode3 {
-                    set_it: false,
-                    mode: 0,
-                },
-                uid: set_uid3 {
-                    set_it: false,
-                    uid: 0,
-                },
-                gid: set_gid3 {
-                    set_it: false,
-                    gid: 0,
-                },
-                size: set_size3 {
-                    set_it: true,
-                    size: 5,
-                },
+                mode: set_mode3::default,
+                uid: set_uid3::default,
+                gid: set_gid3::default,
+                size: set_size3::SET_SIZE(5),
                 atime: set_atime::default,
                 mtime: set_mtime::default,
             },
@@ -264,22 +252,10 @@ mod tests {
         let args = SETATTR3args {
             object: fhandle3(file_handle),
             new_attributes: sattr3 {
-                mode: set_mode3 {
-                    set_it: true,
-                    mode: 0o644,
-                },
-                uid: set_uid3 {
-                    set_it: false,
-                    uid: 0,
-                },
-                gid: set_gid3 {
-                    set_it: false,
-                    gid: 0,
-                },
-                size: set_size3 {
-                    set_it: false,
-                    size: 0,
-                },
+                mode: set_mode3::SET_MODE(0o644),
+                uid: set_uid3::default,
+                gid: set_gid3::default,
+                size: set_size3::default,
                 atime: set_atime::default,
                 mtime: set_mtime::default,
             },
