@@ -5,6 +5,7 @@
 
 pub mod dispatcher;
 mod access;
+mod commit;
 mod create;
 mod fsinfo;
 mod fsstat;

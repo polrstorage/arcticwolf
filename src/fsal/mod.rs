@@ -251,6 +251,20 @@ pub trait Filesystem: Send + Sync {
     /// # Returns
     /// The file handle (should be the same as source file handle since they share the same inode)
     fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
+
+    /// Commit cached data to stable storage
+    ///
+    /// Ensures that all data for the specified file that was written with WRITE
+    /// procedure calls with stable=UNSTABLE are committed to stable storage.
+    ///
+    /// # Arguments
+    /// * `handle` - File handle
+    /// * `offset` - Starting offset (0 means from beginning)
+    /// * `count` - Number of bytes (0 means to end of file)
+    ///
+    /// # Returns
+    /// Ok if data is committed to stable storage
+    fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()>;
 }
 
 /// Filesystem backend types

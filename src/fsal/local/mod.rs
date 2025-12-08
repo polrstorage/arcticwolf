@@ -594,6 +594,33 @@ impl Filesystem for LocalFilesystem {
         // Return the same file handle (hard links share the same inode)
         Ok(file_handle.clone())
     }
+
+    fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()> {
+        let path = self.resolve_handle(handle)?;
+
+        // Open file for syncing
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .context(format!("Failed to open file for commit: {:?}", path))?;
+
+        // Sync data to disk
+        // Note: For a more sophisticated implementation, we could:
+        // 1. Only sync the specified range (offset, count) if the OS supports it
+        // 2. Use sync_data() instead of sync_all() to skip metadata sync
+        // 3. Track UNSTABLE writes and only sync those
+        //
+        // For now, we sync all data in the file for simplicity
+        file.sync_all()
+            .context(format!("Failed to sync file: {:?}", path))?;
+
+        debug!(
+            "COMMIT: {:?} (offset={}, count={})",
+            path, offset, count
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::Filesystem;
 use crate::protocol::v3::rpc::rpc_call_msg;
 
-use super::{access, create, fsinfo, fsstat, getattr, link, lookup, mkdir, null, pathconf, read, readdir, readdirplus, readlink, remove, rename, rmdir, setattr, symlink, write};
+use super::{access, commit, create, fsinfo, fsstat, getattr, link, lookup, mkdir, null, pathconf, read, readdir, readdirplus, readlink, remove, rename, rmdir, setattr, symlink, write};
 
 /// Dispatch NFS procedure call to appropriate handler
 ///
@@ -120,6 +120,10 @@ pub fn dispatch(
         15 => {
             // LINK - create hard link
             link::handle_link(xid, args_data, filesystem)
+        }
+        21 => {
+            // COMMIT - commit cached writes to stable storage
+            commit::handle_commit(xid, args_data, filesystem)
         }
         _ => {
             warn!("Unknown NFS procedure: {}", procedure);

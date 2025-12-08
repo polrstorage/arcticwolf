@@ -495,4 +495,11 @@ impl NfsMessage {
         let (args, _bytes_read) = LINK3args::unpack(&mut cursor)?;
         Ok(args)
     }
+
+    /// Deserialize COMMIT3args from XDR bytes
+    pub fn deserialize_commit3args(data: &[u8]) -> Result<COMMIT3args> {
+        let mut cursor = Cursor::new(data);
+        let (args, _bytes_read) = COMMIT3args::unpack(&mut cursor)?;
+        Ok(args)
+    }
 }

@@ -728,6 +728,30 @@ union PATHCONF3res switch (nfsstat3 status) {
         PATHCONF3resfail resfail;
 };
 
+/* ===== COMMIT Procedure (21) ===== */
+
+struct COMMIT3args {
+    fhandle3 file;
+    uint64 offset;
+    uint32 count;
+};
+
+struct COMMIT3resok {
+    fattr3 file_wcc;           /* wcc_data for file */
+    opaque writeverf[8];       /* write verifier */
+};
+
+struct COMMIT3resfail {
+    fattr3 file_wcc;           /* wcc_data for file */
+};
+
+union COMMIT3res switch (nfsstat3 status) {
+    case NFS3_OK:
+        COMMIT3resok resok;
+    default:
+        COMMIT3resfail resfail;
+};
+
 /* ===== NULL Procedure (0) ===== */
 /* Arguments: void */
 /* Results: void */
