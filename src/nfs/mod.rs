@@ -17,6 +17,7 @@ mod read;
 mod readdir;
 mod readdirplus;
 mod remove;
+mod rename;
 mod rmdir;
 mod setattr;
 mod write;

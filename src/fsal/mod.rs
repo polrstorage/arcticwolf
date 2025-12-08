@@ -208,6 +208,21 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Name of directory to remove
     fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
+
+    /// Rename a file or directory
+    ///
+    /// # Arguments
+    /// * `from_dir_handle` - Source directory handle
+    /// * `from_name` - Source name
+    /// * `to_dir_handle` - Target directory handle
+    /// * `to_name` - Target name
+    fn rename(
+        &self,
+        from_dir_handle: &FileHandle,
+        from_name: &str,
+        to_dir_handle: &FileHandle,
+        to_name: &str,
+    ) -> Result<()>;
 }
 
 /// Filesystem backend types

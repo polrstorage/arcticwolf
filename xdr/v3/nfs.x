@@ -413,6 +413,32 @@ union RMDIR3res switch (nfsstat3 status) {
         RMDIR3resfail resfail;
 };
 
+/* ===== RENAME Procedure (14) ===== */
+
+struct RENAME3args {
+    fhandle3 from_dir;
+    filename3 from_name;
+    fhandle3 to_dir;
+    filename3 to_name;
+};
+
+struct RENAME3resok {
+    fattr3 fromdir_wcc;   /* wcc_data for source directory */
+    fattr3 todir_wcc;     /* wcc_data for target directory */
+};
+
+struct RENAME3resfail {
+    fattr3 fromdir_wcc;   /* wcc_data for source directory */
+    fattr3 todir_wcc;     /* wcc_data for target directory */
+};
+
+union RENAME3res switch (nfsstat3 status) {
+    case NFS3_OK:
+        RENAME3resok resok;
+    default:
+        RENAME3resfail resfail;
+};
+
 /* ===== ACCESS Procedure (4) ===== */
 
 const ACCESS3_READ    = 0x0001;

@@ -467,6 +467,40 @@ impl Filesystem for LocalFilesystem {
 
         Ok(())
     }
+
+    fn rename(
+        &self,
+        from_dir_handle: &FileHandle,
+        from_name: &str,
+        to_dir_handle: &FileHandle,
+        to_name: &str,
+    ) -> Result<()> {
+        let from_dir_path = self.resolve_handle(from_dir_handle)?;
+        let to_dir_path = self.resolve_handle(to_dir_handle)?;
+
+        // Security: prevent path traversal
+        if from_name.contains('/') || from_name.contains("..") {
+            return Err(anyhow!("Invalid source name: {}", from_name));
+        }
+        if to_name.contains('/') || to_name.contains("..") {
+            return Err(anyhow!("Invalid target name: {}", to_name));
+        }
+
+        let from_full_path = from_dir_path.join(from_name);
+        let to_full_path = to_dir_path.join(to_name);
+
+        // Validate both paths are within export root
+        self.validate_path(&from_full_path)?;
+        self.validate_path(&to_full_path)?;
+
+        // Rename/move the file or directory
+        fs::rename(&from_full_path, &to_full_path)
+            .context(format!("Failed to rename {:?} to {:?}", from_full_path, to_full_path))?;
+
+        debug!("RENAME: {:?} -> {:?}", from_full_path, to_full_path);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

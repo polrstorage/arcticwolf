@@ -467,4 +467,11 @@ impl NfsMessage {
         let (args, _bytes_read) = RMDIR3args::unpack(&mut cursor)?;
         Ok(args)
     }
+
+    /// Deserialize RENAME3args from XDR bytes
+    pub fn deserialize_rename3args(data: &[u8]) -> Result<RENAME3args> {
+        let mut cursor = Cursor::new(data);
+        let (args, _bytes_read) = RENAME3args::unpack(&mut cursor)?;
+        Ok(args)
+    }
 }

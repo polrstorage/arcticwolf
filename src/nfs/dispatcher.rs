@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::Filesystem;
 use crate::protocol::v3::rpc::rpc_call_msg;
 
-use super::{access, create, fsinfo, fsstat, getattr, lookup, mkdir, null, pathconf, read, readdir, readdirplus, remove, rmdir, setattr, write};
+use super::{access, create, fsinfo, fsstat, getattr, lookup, mkdir, null, pathconf, read, readdir, readdirplus, remove, rename, rmdir, setattr, write};
 
 /// Dispatch NFS procedure call to appropriate handler
 ///
@@ -104,6 +104,10 @@ pub fn dispatch(
         13 => {
             // RMDIR - remove directory
             rmdir::handle_rmdir(xid, args_data, filesystem)
+        }
+        14 => {
+            // RENAME - rename file or directory
+            rename::handle_rename(xid, args_data, filesystem)
         }
         _ => {
             warn!("Unknown NFS procedure: {}", procedure);

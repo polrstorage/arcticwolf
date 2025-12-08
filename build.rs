@@ -94,6 +94,10 @@ fn main() {
                 "#[derive( Copy , Clone , Debug , Eq , PartialEq )] pub enum RMDIR3res",
                 "#[derive( Clone , Debug , Eq , PartialEq )] pub enum RMDIR3res"
             );
+            generated_code = generated_code.replace(
+                "#[derive( Copy , Clone , Debug , Eq , PartialEq )] pub enum RENAME3res",
+                "#[derive( Clone , Debug , Eq , PartialEq )] pub enum RENAME3res"
+            );
         }
 
         fs::write(&output_path, generated_code.as_bytes())
