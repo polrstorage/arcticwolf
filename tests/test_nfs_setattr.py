@@ -99,6 +99,71 @@ def parse_rpc_reply(reply_data):
     return 24  # Return offset to procedure-specific data
 
 
+def parse_wcc_data(reply_data, offset):
+    """
+    Parse wcc_data structure (RFC 1813)
+
+    wcc_data = {
+        pre_op_attr:  bool + optional wcc_attr (24 bytes if present)
+        post_op_attr: bool + optional fattr3 (84 bytes if present)
+    }
+
+    Returns: (pre_attr_dict, post_attr_dict, next_offset)
+    """
+    start_offset = offset
+
+    # 1. Parse pre_op_attr
+    pre_attr_follows = struct.unpack('>I', reply_data[offset:offset+4])[0]
+    offset += 4
+
+    pre_attr = None
+    if pre_attr_follows:
+        # wcc_attr = size(8) + mtime(8) + ctime(8) = 24 bytes
+        size = struct.unpack('>Q', reply_data[offset:offset+8])[0]
+        offset += 8
+        mtime_sec, mtime_nsec = struct.unpack('>II', reply_data[offset:offset+8])
+        offset += 8
+        ctime_sec, ctime_nsec = struct.unpack('>II', reply_data[offset:offset+8])
+        offset += 8
+        pre_attr = {
+            'size': size,
+            'mtime': (mtime_sec, mtime_nsec),
+            'ctime': (ctime_sec, ctime_nsec)
+        }
+
+    # 2. Parse post_op_attr
+    post_attr_follows = struct.unpack('>I', reply_data[offset:offset+4])[0]
+    offset += 4
+
+    post_attr = None
+    if post_attr_follows:
+        # fattr3 = 84 bytes
+        ftype = struct.unpack('>I', reply_data[offset:offset+4])[0]
+        mode = struct.unpack('>I', reply_data[offset+4:offset+8])[0]
+        nlink = struct.unpack('>I', reply_data[offset+8:offset+12])[0]
+        uid = struct.unpack('>I', reply_data[offset+12:offset+16])[0]
+        gid = struct.unpack('>I', reply_data[offset+16:offset+20])[0]
+        size = struct.unpack('>Q', reply_data[offset+20:offset+28])[0]
+        offset += 84
+
+        post_attr = {
+            'type': ftype,
+            'mode': mode,
+            'nlink': nlink,
+            'uid': uid,
+            'gid': gid,
+            'size': size
+        }
+
+    # Validate total wcc_data size
+    expected_size = 4 + (24 if pre_attr_follows else 0) + 4 + (84 if post_attr_follows else 0)
+    actual_size = offset - start_offset
+    if actual_size != expected_size:
+        raise Exception(f"wcc_data size mismatch: expected {expected_size}, got {actual_size}")
+
+    return pre_attr, post_attr, offset
+
+
 def test_nfs_setattr():
     """Test NFS SETATTR procedure"""
 
@@ -236,13 +301,35 @@ def test_nfs_setattr():
     reply_data = rpc_call(host, port, setattr_xid, 100003, 3, 2, setattr_args)
     offset = parse_rpc_reply(reply_data)
 
+    # Parse SETATTR3res (RFC 1813)
+    # SETATTR3res = nfsstat3 + wcc_data (obj_wcc)
     nfs_status = struct.unpack('>I', reply_data[offset:offset+4])[0]
+    offset += 4
+
     print(f"  NFS status: {nfs_status} (0=NFS3_OK)")
 
     if nfs_status != 0:
         print(f"  ✗ SETATTR failed with status {nfs_status}")
         sys.exit(1)
 
+    # Parse wcc_data (obj_wcc - file's weak cache consistency data)
+    pre_attr, post_attr, offset = parse_wcc_data(reply_data, offset)
+
+    if post_attr:
+        print(f"  ✓ File post_op_attr: size={post_attr['size']}")
+        if post_attr['size'] == new_size:
+            print(f"    ✅ Confirmed size changed to {new_size} bytes")
+
+    # Validate exact response length
+    expected_rpc_header = 24
+    expected_nfs_status = 4
+    expected_wcc_data = 4 + (24 if pre_attr else 0) + 4 + (84 if post_attr else 0)
+    expected_total = expected_rpc_header + expected_nfs_status + expected_wcc_data
+
+    if len(reply_data) != expected_total:
+        raise Exception(f"SETATTR response length mismatch: expected {expected_total}, got {len(reply_data)}")
+
+    print(f"  ✓ Response format validation passed (length={len(reply_data)} bytes)")
     print(f"  ✓ SETATTR succeeded")
     print()
 

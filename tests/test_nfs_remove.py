@@ -99,6 +99,72 @@ def parse_rpc_reply(reply_data):
     return 24  # Return offset to NFS data
 
 
+def parse_wcc_data(reply_data, offset):
+    """
+    Parse wcc_data structure (RFC 1813)
+
+    wcc_data = {
+        pre_op_attr:  bool + optional wcc_attr (24 bytes if present)
+        post_op_attr: bool + optional fattr3 (84 bytes if present)
+    }
+
+    Returns: (pre_attr_dict, post_attr_dict, next_offset)
+    """
+    start_offset = offset
+
+    # 1. Parse pre_op_attr
+    pre_attr_follows = struct.unpack('>I', reply_data[offset:offset+4])[0]
+    offset += 4
+
+    pre_attr = None
+    if pre_attr_follows:
+        # wcc_attr = size(8) + mtime(8) + ctime(8) = 24 bytes
+        size = struct.unpack('>Q', reply_data[offset:offset+8])[0]
+        offset += 8
+        mtime_sec, mtime_nsec = struct.unpack('>II', reply_data[offset:offset+8])
+        offset += 8
+        ctime_sec, ctime_nsec = struct.unpack('>II', reply_data[offset:offset+8])
+        offset += 8
+        pre_attr = {
+            'size': size,
+            'mtime': (mtime_sec, mtime_nsec),
+            'ctime': (ctime_sec, ctime_nsec)
+        }
+
+    # 2. Parse post_op_attr
+    post_attr_follows = struct.unpack('>I', reply_data[offset:offset+4])[0]
+    offset += 4
+
+    post_attr = None
+    if post_attr_follows:
+        # fattr3 = 84 bytes
+        fattr_start = offset
+        ftype = struct.unpack('>I', reply_data[offset:offset+4])[0]
+        mode = struct.unpack('>I', reply_data[offset+4:offset+8])[0]
+        nlink = struct.unpack('>I', reply_data[offset+8:offset+12])[0]
+        uid = struct.unpack('>I', reply_data[offset+12:offset+16])[0]
+        gid = struct.unpack('>I', reply_data[offset+16:offset+20])[0]
+        size = struct.unpack('>Q', reply_data[offset+20:offset+28])[0]
+        offset += 84
+
+        post_attr = {
+            'type': ftype,
+            'mode': mode,
+            'nlink': nlink,
+            'uid': uid,
+            'gid': gid,
+            'size': size
+        }
+
+    # Validate total wcc_data size
+    expected_size = 4 + (24 if pre_attr_follows else 0) + 4 + (84 if post_attr_follows else 0)
+    actual_size = offset - start_offset
+    if actual_size != expected_size:
+        raise Exception(f"wcc_data size mismatch: expected {expected_size}, got {actual_size}")
+
+    return pre_attr, post_attr, offset
+
+
 def test_remove(host, port):
     """Test REMOVE procedure"""
     print("\n=== Test: NFS REMOVE ===")
@@ -177,15 +243,29 @@ def test_remove(host, port):
 
     print(f"  REMOVE status: NFS3_OK (0)")
 
-    # post_op_attr (dir_wcc)
-    attr_follows = struct.unpack('>I', remove_reply[offset:offset+4])[0]
-    offset += 4
+    # Parse wcc_data (dir_wcc) - RFC 1813 format
+    pre_attr, post_attr, offset = parse_wcc_data(remove_reply, offset)
 
-    if attr_follows:
-        print(f"  Directory attributes present")
-        # Skip fattr3 (84 bytes)
-        offset += 84
+    if pre_attr:
+        print(f"  Directory pre_op_attr: size={pre_attr['size']}")
+    else:
+        print(f"  Directory pre_op_attr: not present")
 
+    if post_attr:
+        print(f"  Directory post_op_attr: present (mode={oct(post_attr['mode'])}, size={post_attr['size']})")
+    else:
+        print(f"  Directory post_op_attr: not present")
+
+    # Validate exact response length
+    expected_rpc_header = 24  # RPC reply header
+    expected_nfs_status = 4   # nfsstat3
+    expected_wcc_data = 4 + (24 if pre_attr else 0) + 4 + (84 if post_attr else 0)
+    expected_total = expected_rpc_header + expected_nfs_status + expected_wcc_data
+
+    if len(remove_reply) != expected_total:
+        raise Exception(f"Response length mismatch: expected {expected_total}, got {len(remove_reply)}")
+
+    print(f"  ✓ Response format validation passed (length={len(remove_reply)} bytes)")
     print(f"  Total response size: {len(remove_reply)} bytes")
 
     # Step 4: Verify file was removed by trying to LOOKUP
@@ -249,12 +329,29 @@ def test_remove_nonexistent(host, port):
 
     # Parse REMOVE reply
     status = struct.unpack('>I', remove_reply[offset:offset+4])[0]
+    offset += 4
 
     if status == 2:  # NFS3ERR_NOENT = 2
         print(f"  ✓ REMOVE correctly returned NOENT (2)")
     else:
         raise Exception(f"Expected NOENT (2) for nonexistent file, got status {status}")
 
+    # Parse wcc_data even on error
+    pre_attr, post_attr, offset = parse_wcc_data(remove_reply, offset)
+
+    if post_attr:
+        print(f"  Directory post_op_attr present (error case)")
+
+    # Validate exact response length
+    expected_rpc_header = 24
+    expected_nfs_status = 4
+    expected_wcc_data = 4 + (24 if pre_attr else 0) + 4 + (84 if post_attr else 0)
+    expected_total = expected_rpc_header + expected_nfs_status + expected_wcc_data
+
+    if len(remove_reply) != expected_total:
+        raise Exception(f"Response length mismatch: expected {expected_total}, got {len(remove_reply)}")
+
+    print(f"  ✓ Response format validation passed (length={len(remove_reply)} bytes)")
     print("\n✓ REMOVE nonexistent file test passed!")
 
 
