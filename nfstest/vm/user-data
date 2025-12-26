@@ -1,0 +1,48 @@
+#cloud-config
+
+# Alpine cloud-init configuration for nfstest VM
+
+hostname: nfstest-vm
+
+# Enable SSH password authentication
+ssh_pwauth: true
+
+# Set root password
+chpasswd:
+  expire: false
+  list:
+    - root:nfstest
+
+# Enable root SSH login
+disable_root: false
+
+# Install packages (Alpine uses apk)
+packages:
+  - openssh
+  - nfs-utils
+  - python3
+  - py3-setuptools
+  - git
+  - bash
+  - netcat-openbsd
+  - tcpdump
+
+# Run commands after boot
+runcmd:
+  # Enable and start SSH
+  - rc-update add sshd default
+  - rc-service sshd start
+  # Allow root login with password
+  - sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - rc-service sshd restart
+  # Create mount point
+  - mkdir -p /mnt/nfstest
+  - chmod 777 /mnt/nfstest
+  # Clone nfstest and add to PATH/PYTHONPATH
+  - git clone git://git.linux-nfs.org/projects/mora/nfstest.git /opt/nfstest
+  # Set environment variables for all sessions (login and non-login)
+  - echo 'PYTHONPATH=/opt/nfstest' >> /etc/environment
+  - echo 'PATH=/opt/nfstest/test:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> /etc/environment
+  # Signal completion to console (this goes to QEMU serial output which is monitored by nfstest.py)
+  - echo "NFSTEST_VM_READY"
