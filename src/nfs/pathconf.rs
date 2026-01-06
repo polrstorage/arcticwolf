@@ -20,7 +20,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with PATHCONF3res
-pub fn handle_pathconf(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_pathconf(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS PATHCONF: xid={}", xid);
 
     // Parse arguments - just a file handle
@@ -32,7 +32,7 @@ pub fn handle_pathconf(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) 
     debug!("  object handle: {} bytes", object.0.len());
 
     // Get file attributes
-    let obj_attrs = match filesystem.getattr(&object.0) {
+    let obj_attrs = match filesystem.getattr(&object.0).await {
         Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
         Err(e) => {
             debug!("PATHCONF failed: {}", e);

@@ -26,7 +26,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized MKNOD3res wrapped in RPC reply
-pub fn handle_mknod(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_mknod(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS MKNOD: xid={}", xid);
 
     // Parse arguments
@@ -40,7 +40,7 @@ pub fn handle_mknod(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
     );
 
     // Get directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).ok();
+    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
 
     // Extract file type, mode, and device numbers from union
     let (file_type, mode, rdev) = match &args.what {
@@ -69,12 +69,12 @@ pub fn handle_mknod(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
     let name = &args.name.0;
 
     // Perform mknod operation
-    match filesystem.mknod(&args.where_dir.0, &name, file_type, mode, rdev) {
+    match filesystem.mknod(&args.where_dir.0, &name, file_type, mode, rdev).await {
         Ok(handle) => {
             debug!("MKNOD OK: created {:?}", name);
 
             // Get attributes of the created special file
-            let obj_attr = match filesystem.getattr(&handle) {
+            let obj_attr = match filesystem.getattr(&handle).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get attributes after mknod: {}", e);
@@ -83,7 +83,7 @@ pub fn handle_mknod(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
             };
 
             // Get directory attributes after operation
-            let dir_after = match filesystem.getattr(&args.where_dir.0) {
+            let dir_after = match filesystem.getattr(&args.where_dir.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get dir attributes after mknod: {}", e);
@@ -113,7 +113,7 @@ fn extract_mode(sattr: &crate::protocol::v3::nfs::sattr3) -> u32 {
 /// Create MKNOD3res response
 ///
 /// MKNOD3res structure (RFC 1813):
-/// ```
+/// ```text
 /// union MKNOD3res switch (nfsstat3 status) {
 ///     case NFS3_OK:
 ///         struct {

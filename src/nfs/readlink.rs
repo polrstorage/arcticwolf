@@ -19,7 +19,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized READLINK3res response
-pub fn handle_readlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_readlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS READLINK: xid={}", xid);
 
     // Parse arguments
@@ -28,15 +28,15 @@ pub fn handle_readlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) 
     debug!("  symlink: {} bytes", args.symlink.0.len());
 
     // Get symlink attributes before operation (for post_op_attr)
-    let symlink_attr_before = filesystem.getattr(&args.symlink.0).ok();
+    let symlink_attr_before = filesystem.getattr(&args.symlink.0).await.ok();
 
     // Read the symlink target
-    match filesystem.readlink(&args.symlink.0) {
+    match filesystem.readlink(&args.symlink.0).await {
         Ok(target) => {
             debug!("READLINK OK: target = {}", target);
 
             // Get symlink attributes after operation
-            let symlink_attr_after = match filesystem.getattr(&args.symlink.0) {
+            let symlink_attr_after = match filesystem.getattr(&args.symlink.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get symlink attributes after readlink: {}", e);

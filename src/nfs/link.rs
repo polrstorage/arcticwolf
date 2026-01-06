@@ -7,7 +7,7 @@
 // - Returns updated file attributes (link count increases)
 // - Returns wcc_data for the target directory
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
@@ -26,7 +26,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized LINK3res wrapped in RPC reply
-pub fn handle_link(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_link(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS LINK: xid={}", xid);
 
     // Parse arguments
@@ -40,18 +40,18 @@ pub fn handle_link(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> R
     );
 
     // Get source file attributes before operation (for post_op_attr)
-    let file_before = filesystem.getattr(&args.file.0).ok();
+    let file_before = filesystem.getattr(&args.file.0).await.ok();
 
     // Get target directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.link_dir.0).ok();
+    let dir_before = filesystem.getattr(&args.link_dir.0).await.ok();
 
     // Perform link operation
-    match filesystem.link(&args.file.0, &args.link_dir.0, &args.name.0) {
+    match filesystem.link(&args.file.0, &args.link_dir.0, &args.name.0).await {
         Ok(_file_handle) => {
             debug!("LINK OK: created hard link '{}'", args.name.0);
 
             // Get source file attributes after operation (link count should increase)
-            let file_after = match filesystem.getattr(&args.file.0) {
+            let file_after = match filesystem.getattr(&args.file.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get file attributes after link: {}", e);
@@ -60,7 +60,7 @@ pub fn handle_link(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> R
             };
 
             // Get target directory attributes after operation
-            let dir_after = match filesystem.getattr(&args.link_dir.0) {
+            let dir_after = match filesystem.getattr(&args.link_dir.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get directory attributes after link: {}", e);
@@ -83,7 +83,7 @@ pub fn handle_link(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> R
 /// Create LINK3res response
 ///
 /// LINK3res structure (RFC 1813):
-/// ```
+/// ```text
 /// union LINK3res switch (nfsstat3 status) {
 ///     case NFS3_OK:
 ///         struct {

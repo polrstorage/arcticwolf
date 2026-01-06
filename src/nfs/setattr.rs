@@ -22,7 +22,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with status and attributes
-pub fn handle_setattr(
+pub async fn handle_setattr(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -38,7 +38,7 @@ pub fn handle_setattr(
     );
 
     // Get file attributes before setattr (for wcc_data)
-    let before_attrs = filesystem.getattr(&args.object.0).ok();
+    let before_attrs = filesystem.getattr(&args.object.0).await.ok();
 
     // Check guard if requested (guard is a union: CHECK with ctime or DONT_CHECK)
     if let crate::protocol::v3::nfs::sattrguard3::CHECK(guard_ctime) = &args.guard {
@@ -63,7 +63,7 @@ pub fn handle_setattr(
     if let crate::protocol::v3::nfs::set_size3::SET_SIZE(new_size) = &new_attrs.size {
         debug!("SETATTR: setting size to {}", new_size);
 
-        if let Err(e) = filesystem.setattr_size(&args.object.0, *new_size) {
+        if let Err(e) = filesystem.setattr_size(&args.object.0, *new_size).await {
             debug!("SETATTR: failed to set size: {}", e);
             let error_status = if e.to_string().contains("not found") {
                 nfsstat3::NFS3ERR_STALE
@@ -83,7 +83,7 @@ pub fn handle_setattr(
     if let crate::protocol::v3::nfs::set_mode3::SET_MODE(mode) = &new_attrs.mode {
         debug!("SETATTR: setting mode to {:o}", mode);
 
-        if let Err(e) = filesystem.setattr_mode(&args.object.0, *mode) {
+        if let Err(e) = filesystem.setattr_mode(&args.object.0, *mode).await {
             debug!("SETATTR: failed to set mode: {}", e);
             let error_status = if e.to_string().contains("not found") {
                 nfsstat3::NFS3ERR_STALE
@@ -110,7 +110,7 @@ pub fn handle_setattr(
     if uid.is_some() || gid.is_some() {
         debug!("SETATTR: setting uid={:?}, gid={:?}", uid, gid);
 
-        if let Err(e) = filesystem.setattr_owner(&args.object.0, uid, gid) {
+        if let Err(e) = filesystem.setattr_owner(&args.object.0, uid, gid).await {
             debug!("SETATTR: failed to set owner: {}", e);
             let error_status = if e.to_string().contains("not found") {
                 nfsstat3::NFS3ERR_STALE
@@ -129,7 +129,7 @@ pub fn handle_setattr(
     // (SET_TO_SERVER_TIME vs SET_TO_CLIENT_TIME)
 
     // Get file attributes after setattr
-    let after_attrs = match filesystem.getattr(&args.object.0) {
+    let after_attrs = match filesystem.getattr(&args.object.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("SETATTR: failed to get attributes after setattr: {}", e);
@@ -168,12 +168,12 @@ pub fn handle_setattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_setattr_truncate() {
+    #[tokio::test]
+    async fn test_setattr_truncate() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -183,41 +183,45 @@ mod tests {
         let test_file = temp_dir.path().join("truncate_test.txt");
         fs::write(&test_file, b"Hello, World! This is a long file.").unwrap();
 
-        // Get file handle
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "truncate_test.txt").unwrap();
+        // Get file handle and current ctime for guard
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "truncate_test.txt").await.unwrap();
+        let before_attrs = fs.getattr(&file_handle).await.unwrap();
 
         // Serialize SETATTR3args to truncate to 5 bytes
         use crate::protocol::v3::nfs::{
-            fhandle3, sattrguard3, sattr3, set_atime, set_gid3, set_mode3,
-            set_mtime, set_size3, set_uid3, time_how, SETATTR3args,
+            fhandle3, nfstime3, sattrguard3, sattr3, set_atime, set_gid3, set_mode3,
+            set_mtime, set_size3, set_uid3, SETATTR3args,
         };
         use xdr_codec::Pack;
 
         let args = SETATTR3args {
             object: fhandle3(file_handle),
             new_attributes: sattr3 {
-                mode: set_mode3::default,
-                uid: set_uid3::default,
-                gid: set_gid3::default,
+                mode: set_mode3::SET_MODE(0o644),
+                uid: set_uid3::SET_UID(0),
+                gid: set_gid3::SET_GID(0),
                 size: set_size3::SET_SIZE(5),
-                atime: set_atime::default,
-                mtime: set_mtime::default,
-            },
-            guard: sattrguard3 {
-                check: false,
-                obj_ctime: crate::protocol::v3::nfs::nfstime3 {
+                atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
                     seconds: 0,
                     nseconds: 0,
-                },
+                }),
+                mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
             },
+            guard: sattrguard3::CHECK(nfstime3 {
+                seconds: before_attrs.ctime.seconds as u32,
+                nseconds: before_attrs.ctime.nseconds as u32,
+            }),
         };
 
         let mut args_buf = Vec::new();
         args.pack(&mut args_buf).unwrap();
 
         // Call SETATTR
-        let result = handle_setattr(12345, &args_buf, fs.as_ref());
+        let result = handle_setattr(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "SETATTR should succeed");
 
@@ -226,8 +230,8 @@ mod tests {
         assert_eq!(content, "Hello");
     }
 
-    #[test]
-    fn test_setattr_mode() {
+    #[tokio::test]
+    async fn test_setattr_mode() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -237,14 +241,15 @@ mod tests {
         let test_file = temp_dir.path().join("mode_test.txt");
         fs::write(&test_file, b"test").unwrap();
 
-        // Get file handle
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "mode_test.txt").unwrap();
+        // Get file handle and current ctime for guard
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "mode_test.txt").await.unwrap();
+        let before_attrs = fs.getattr(&file_handle).await.unwrap();
 
         // Serialize SETATTR3args to set mode to 0644
         use crate::protocol::v3::nfs::{
-            fhandle3, sattrguard3, sattr3, set_atime, set_gid3, set_mode3,
-            set_mtime, set_size3, set_uid3, time_how, SETATTR3args,
+            fhandle3, nfstime3, sattrguard3, sattr3, set_atime, set_gid3, set_mode3,
+            set_mtime, set_size3, set_uid3, SETATTR3args,
         };
         use xdr_codec::Pack;
 
@@ -252,26 +257,29 @@ mod tests {
             object: fhandle3(file_handle),
             new_attributes: sattr3 {
                 mode: set_mode3::SET_MODE(0o644),
-                uid: set_uid3::default,
-                gid: set_gid3::default,
-                size: set_size3::default,
-                atime: set_atime::default,
-                mtime: set_mtime::default,
-            },
-            guard: sattrguard3 {
-                check: false,
-                obj_ctime: crate::protocol::v3::nfs::nfstime3 {
+                uid: set_uid3::SET_UID(0),
+                gid: set_gid3::SET_GID(0),
+                size: set_size3::SET_SIZE(4),
+                atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
                     seconds: 0,
                     nseconds: 0,
-                },
+                }),
+                mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
             },
+            guard: sattrguard3::CHECK(nfstime3 {
+                seconds: before_attrs.ctime.seconds as u32,
+                nseconds: before_attrs.ctime.nseconds as u32,
+            }),
         };
 
         let mut args_buf = Vec::new();
         args.pack(&mut args_buf).unwrap();
 
         // Call SETATTR
-        let result = handle_setattr(12345, &args_buf, fs.as_ref());
+        let result = handle_setattr(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "SETATTR should succeed");
     }

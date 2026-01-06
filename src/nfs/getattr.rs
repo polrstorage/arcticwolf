@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use tracing::debug;
 
 use crate::fsal::Filesystem;
-use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
+use crate::protocol::v3::nfs::NfsMessage;
 use crate::protocol::v3::rpc::RpcMessage;
 
 /// Handle NFS GETATTR procedure (procedure 1)
@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with file attributes
-pub fn handle_getattr(
+pub async fn handle_getattr(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -34,7 +34,7 @@ pub fn handle_getattr(
     debug!("GETATTR: file handle = {} bytes", args.object.0.len());
 
     // Get file attributes from FSAL
-    let fsal_attrs = match filesystem.getattr(&args.object.0) {
+    let fsal_attrs = match filesystem.getattr(&args.object.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("GETATTR failed: {}", e);
@@ -68,19 +68,18 @@ pub fn handle_getattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::fsal::BackendConfig;
     use tempfile::TempDir;
-    use crate::fsal::{BackendConfig, LocalFilesystem};
 
-    #[test]
-    fn test_getattr_root() {
+    #[tokio::test]
+    async fn test_getattr_root() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize the handle as GETATTR3args
         use crate::protocol::v3::nfs::{GETATTR3args, fhandle3};
@@ -94,7 +93,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call GETATTR
-        let result = handle_getattr(12345, &args_buf, fs.as_ref());
+        let result = handle_getattr(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "GETATTR should succeed for root");
 

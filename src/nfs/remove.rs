@@ -22,7 +22,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with REMOVE3res
-pub fn handle_remove(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_remove(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS REMOVE: xid={}", xid);
 
     // Parse arguments
@@ -35,15 +35,15 @@ pub fn handle_remove(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
     );
 
     // Get directory attributes before removal (for wcc_data)
-    let dir_before = filesystem.getattr(&args.dir.0).ok();
+    let dir_before = filesystem.getattr(&args.dir.0).await.ok();
 
     // Perform remove operation
-    match filesystem.remove(&args.dir.0, &args.name.0) {
+    match filesystem.remove(&args.dir.0, &args.name.0).await {
         Ok(()) => {
             debug!("REMOVE OK: removed file '{}'", args.name.0);
 
             // Get directory attributes after removal
-            let dir_after = match filesystem.getattr(&args.dir.0) {
+            let dir_after = match filesystem.getattr(&args.dir.0).await {
                 Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
                 Err(e) => {
                     warn!("Failed to get dir attributes after remove: {}", e);
@@ -79,7 +79,7 @@ pub fn handle_remove(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
             };
 
             // Try to get current directory attributes for wcc_data
-            let dir_after = filesystem.getattr(&args.dir.0).ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_after = filesystem.getattr(&args.dir.0).await.ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
 
             create_remove_response(xid, status, dir_after)
         }
@@ -134,8 +134,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_remove_file() {
+    #[tokio::test]
+    async fn test_remove_file() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_remove");
         let _ = fs::remove_dir_all(&test_dir);
@@ -149,7 +149,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_remove".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create REMOVE3args manually
         use xdr_codec::Pack;
@@ -167,7 +167,7 @@ mod tests {
         assert!(test_file.exists());
 
         // Call REMOVE
-        let result = handle_remove(12345, &args_buf, &fs);
+        let result = handle_remove(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "REMOVE should succeed");
 
         // Verify file was removed
@@ -177,8 +177,8 @@ mod tests {
         fs::remove_dir_all(&test_dir).unwrap();
     }
 
-    #[test]
-    fn test_remove_nonexistent_file() {
+    #[tokio::test]
+    async fn test_remove_nonexistent_file() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_remove_nonexistent");
         let _ = fs::remove_dir_all(&test_dir);
@@ -188,7 +188,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_remove_nonexistent".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create REMOVE3args manually
         use xdr_codec::Pack;
@@ -203,7 +203,7 @@ mod tests {
         filename.pack(&mut args_buf).unwrap();
 
         // Call REMOVE - should fail with NOENT
-        let result = handle_remove(12345, &args_buf, &fs);
+        let result = handle_remove(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "REMOVE should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_NOENT

@@ -22,7 +22,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with file handle and attributes
-pub fn handle_lookup(
+pub async fn handle_lookup(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -42,7 +42,7 @@ pub fn handle_lookup(
     );
 
     // Look up the file in the directory
-    let file_handle = match filesystem.lookup(&args.what_dir.0, name) {
+    let file_handle = match filesystem.lookup(&args.what_dir.0, name).await {
         Ok(handle) => handle,
         Err(e) => {
             debug!("LOOKUP failed: {}", e);
@@ -63,7 +63,7 @@ pub fn handle_lookup(
     };
 
     // Get attributes for the found file
-    let obj_attrs = match filesystem.getattr(&file_handle) {
+    let obj_attrs = match filesystem.getattr(&file_handle).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("LOOKUP: failed to get attributes for found file: {}", e);
@@ -74,7 +74,7 @@ pub fn handle_lookup(
     };
 
     // Get attributes for the directory (optional but recommended)
-    let dir_attrs = match filesystem.getattr(&args.what_dir.0) {
+    let dir_attrs = match filesystem.getattr(&args.what_dir.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("LOOKUP: failed to get directory attributes: {}", e);
@@ -125,12 +125,12 @@ pub fn handle_lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
-    use crate::fsal::{BackendConfig, Filesystem};
 
-    #[test]
-    fn test_lookup_existing_file() {
+    #[tokio::test]
+    async fn test_lookup_existing_file() {
         // Create temp filesystem with a test file
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("testfile.txt");
@@ -140,7 +140,7 @@ mod tests {
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize LOOKUP3args
         use crate::protocol::v3::nfs::{LOOKUP3args, filename3, fhandle3};
@@ -155,7 +155,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call LOOKUP
-        let result = handle_lookup(12345, &args_buf, fs.as_ref());
+        let result = handle_lookup(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "LOOKUP should succeed for existing file");
 
@@ -163,15 +163,15 @@ mod tests {
         assert!(!reply.is_empty(), "Reply should contain data");
     }
 
-    #[test]
-    fn test_lookup_nonexistent_file() {
+    #[tokio::test]
+    async fn test_lookup_nonexistent_file() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize LOOKUP3args for non-existent file
         use crate::protocol::v3::nfs::{LOOKUP3args, filename3, fhandle3};
@@ -186,7 +186,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call LOOKUP
-        let result = handle_lookup(12345, &args_buf, fs.as_ref());
+        let result = handle_lookup(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "LOOKUP should return error response (not panic)");
     }

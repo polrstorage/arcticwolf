@@ -20,7 +20,7 @@ use super::{access, commit, create, fsinfo, fsstat, getattr, link, lookup, mkdir
 ///
 /// # Returns
 /// Serialized RPC reply message
-pub fn dispatch(
+pub async fn dispatch(
     call: &rpc_call_msg,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -43,91 +43,91 @@ pub fn dispatch(
     match procedure {
         0 => {
             // NULL - test procedure
-            null::handle_null(xid)
+            null::handle_null(xid).await
         }
         1 => {
             // GETATTR - get file attributes
-            getattr::handle_getattr(xid, args_data, filesystem)
+            getattr::handle_getattr(xid, args_data, filesystem).await
         }
         2 => {
             // SETATTR - set file attributes
-            setattr::handle_setattr(xid, args_data, filesystem)
+            setattr::handle_setattr(xid, args_data, filesystem).await
         }
         3 => {
             // LOOKUP - lookup filename
-            lookup::handle_lookup(xid, args_data, filesystem)
+            lookup::handle_lookup(xid, args_data, filesystem).await
         }
         4 => {
             // ACCESS - check file access permissions
-            access::handle_access(xid, args_data, filesystem)
+            access::handle_access(xid, args_data, filesystem).await
         }
         5 => {
             // READLINK - read symbolic link
-            readlink::handle_readlink(xid, args_data, filesystem)
+            readlink::handle_readlink(xid, args_data, filesystem).await
         }
         6 => {
             // READ - read from file
-            read::handle_read(xid, args_data, filesystem)
+            read::handle_read(xid, args_data, filesystem).await
         }
         16 => {
             // READDIR - read directory entries
-            readdir::handle_readdir(xid, args_data, filesystem)
+            readdir::handle_readdir(xid, args_data, filesystem).await
         }
         18 => {
             // FSSTAT - get filesystem statistics
-            fsstat::handle_fsstat(xid, args_data, filesystem)
+            fsstat::handle_fsstat(xid, args_data, filesystem).await
         }
         19 => {
             // FSINFO - get filesystem information
-            fsinfo::handle_fsinfo(xid, args_data, filesystem)
+            fsinfo::handle_fsinfo(xid, args_data, filesystem).await
         }
         20 => {
             // PATHCONF - get filesystem path configuration
-            pathconf::handle_pathconf(xid, args_data, filesystem)
+            pathconf::handle_pathconf(xid, args_data, filesystem).await
         }
         17 => {
             // READDIRPLUS - read directory entries with attributes
-            readdirplus::handle_readdirplus(xid, args_data, filesystem)
+            readdirplus::handle_readdirplus(xid, args_data, filesystem).await
         }
         7 => {
             // WRITE - write to file
-            write::handle_write(xid, args_data, filesystem)
+            write::handle_write(xid, args_data, filesystem).await
         }
         8 => {
             // CREATE - create file
-            create::handle_create(xid, args_data, filesystem)
+            create::handle_create(xid, args_data, filesystem).await
         }
         9 => {
             // MKDIR - create directory
-            mkdir::handle_mkdir(xid, args_data, filesystem)
+            mkdir::handle_mkdir(xid, args_data, filesystem).await
         }
         10 => {
             // SYMLINK - create symbolic link
-            symlink::handle_symlink(xid, args_data, filesystem)
+            symlink::handle_symlink(xid, args_data, filesystem).await
         }
         11 => {
             // MKNOD - create special file
-            mknod::handle_mknod(xid, args_data, filesystem)
+            mknod::handle_mknod(xid, args_data, filesystem).await
         }
         12 => {
             // REMOVE - remove file
-            remove::handle_remove(xid, args_data, filesystem)
+            remove::handle_remove(xid, args_data, filesystem).await
         }
         13 => {
             // RMDIR - remove directory
-            rmdir::handle_rmdir(xid, args_data, filesystem)
+            rmdir::handle_rmdir(xid, args_data, filesystem).await
         }
         14 => {
             // RENAME - rename file or directory
-            rename::handle_rename(xid, args_data, filesystem)
+            rename::handle_rename(xid, args_data, filesystem).await
         }
         15 => {
             // LINK - create hard link
-            link::handle_link(xid, args_data, filesystem)
+            link::handle_link(xid, args_data, filesystem).await
         }
         21 => {
             // COMMIT - commit cached writes to stable storage
-            commit::handle_commit(xid, args_data, filesystem)
+            commit::handle_commit(xid, args_data, filesystem).await
         }
         _ => {
             warn!("Unknown NFS procedure: {}", procedure);

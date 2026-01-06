@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with write status
-pub fn handle_write(
+pub async fn handle_write(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -40,10 +40,10 @@ pub fn handle_write(
     );
 
     // Get file attributes before write (for wcc_data)
-    let before_attrs = filesystem.getattr(&args.file.0).ok();
+    let before_attrs = filesystem.getattr(&args.file.0).await.ok();
 
     // Write data to the file
-    let bytes_written = match filesystem.write(&args.file.0, args.offset, &args.data) {
+    let bytes_written = match filesystem.write(&args.file.0, args.offset, &args.data).await {
         Ok(count) => count,
         Err(e) => {
             debug!("WRITE failed: {}", e);
@@ -70,7 +70,7 @@ pub fn handle_write(
     };
 
     // Get file attributes after write (for wcc_data)
-    let after_attrs = match filesystem.getattr(&args.file.0) {
+    let after_attrs = match filesystem.getattr(&args.file.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("WRITE: failed to get file attributes after write: {}", e);
@@ -128,12 +128,12 @@ pub fn handle_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_write_file() {
+    #[tokio::test]
+    async fn test_write_file() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -144,8 +144,8 @@ mod tests {
         fs::write(&test_file, b"").unwrap();
 
         // Get file handle
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "writetest.txt").unwrap();
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "writetest.txt").await.unwrap();
 
         // Serialize WRITE3args
         use crate::protocol::v3::nfs::{fhandle3, stable_how, WRITE3args};
@@ -164,7 +164,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref());
+        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "WRITE should succeed");
 
@@ -173,8 +173,8 @@ mod tests {
         assert_eq!(content, "Hello, NFS World!");
     }
 
-    #[test]
-    fn test_write_with_offset() {
+    #[tokio::test]
+    async fn test_write_with_offset() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -185,8 +185,8 @@ mod tests {
         fs::write(&test_file, b"0123456789").unwrap();
 
         // Get file handle
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "offset.txt").unwrap();
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "offset.txt").await.unwrap();
 
         // Write at offset 5
         use crate::protocol::v3::nfs::{fhandle3, stable_how, WRITE3args};
@@ -205,7 +205,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref());
+        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "WRITE with offset should succeed");
 
@@ -214,8 +214,8 @@ mod tests {
         assert_eq!(content, "01234ABCDE");
     }
 
-    #[test]
-    fn test_write_nonexistent_handle() {
+    #[tokio::test]
+    async fn test_write_nonexistent_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -238,7 +238,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref());
+        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "WRITE should return error response (not panic)");
     }

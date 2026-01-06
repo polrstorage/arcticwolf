@@ -27,7 +27,7 @@ const FSF3_CANSETTIME: u32 = 0x0010; // Server can set time on server
 ///
 /// # Returns
 /// Serialized RPC reply message with filesystem information
-pub fn handle_fsinfo(
+pub async fn handle_fsinfo(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -44,7 +44,7 @@ pub fn handle_fsinfo(
            args.fsroot.0.len(), &args.fsroot.0);
 
     // Get filesystem attributes
-    let obj_attrs = match filesystem.getattr(&args.fsroot.0) {
+    let obj_attrs = match filesystem.getattr(&args.fsroot.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("FSINFO failed: {}", e);
@@ -110,18 +110,18 @@ pub fn handle_fsinfo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_fsinfo_root() {
+    #[tokio::test]
+    async fn test_fsinfo_root() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize FSINFO3args
         use crate::protocol::v3::nfs::FSINFO3args;
@@ -135,7 +135,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSINFO
-        let result = handle_fsinfo(12345, &args_buf, fs.as_ref());
+        let result = handle_fsinfo(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "FSINFO should succeed");
 
@@ -143,8 +143,8 @@ mod tests {
         assert!(!reply.is_empty(), "Reply should contain data");
     }
 
-    #[test]
-    fn test_fsinfo_invalid_handle() {
+    #[tokio::test]
+    async fn test_fsinfo_invalid_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -162,7 +162,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSINFO
-        let result = handle_fsinfo(12345, &args_buf, fs.as_ref());
+        let result = handle_fsinfo(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "FSINFO should return error response (not panic)");
     }

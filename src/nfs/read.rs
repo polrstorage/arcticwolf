@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with file data
-pub fn handle_read(
+pub async fn handle_read(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -39,7 +39,7 @@ pub fn handle_read(
     );
 
     // Read data from the file
-    let data = match filesystem.read(&args.file.0, args.offset, args.count) {
+    let data = match filesystem.read(&args.file.0, args.offset, args.count).await {
         Ok(data) => data,
         Err(e) => {
             debug!("READ failed: {}", e);
@@ -62,7 +62,7 @@ pub fn handle_read(
     };
 
     // Get file attributes (for the response)
-    let file_attrs = match filesystem.getattr(&args.file.0) {
+    let file_attrs = match filesystem.getattr(&args.file.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("READ: failed to get file attributes: {}", e);
@@ -123,12 +123,12 @@ pub fn handle_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_read_file() {
+    #[tokio::test]
+    async fn test_read_file() {
         // Create temp filesystem with a test file
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("readtest.txt");
@@ -139,8 +139,8 @@ mod tests {
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle and lookup the file
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "readtest.txt").unwrap();
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "readtest.txt").await.unwrap();
 
         // Serialize READ3args
         use crate::protocol::v3::nfs::READ3args;
@@ -156,7 +156,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref());
+        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "READ should succeed");
 
@@ -164,8 +164,8 @@ mod tests {
         assert!(!reply.is_empty(), "Reply should contain data");
     }
 
-    #[test]
-    fn test_read_partial() {
+    #[tokio::test]
+    async fn test_read_partial() {
         // Create temp filesystem with a test file
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("partial.txt");
@@ -176,8 +176,8 @@ mod tests {
         let fs = config.create_filesystem().unwrap();
 
         // Get file handle
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "partial.txt").unwrap();
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "partial.txt").await.unwrap();
 
         // Read middle section (offset 5, count 10)
         use crate::protocol::v3::nfs::READ3args;
@@ -193,13 +193,13 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref());
+        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "Partial READ should succeed");
     }
 
-    #[test]
-    fn test_read_nonexistent_handle() {
+    #[tokio::test]
+    async fn test_read_nonexistent_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -219,7 +219,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref());
+        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "READ should return error response (not panic)");
     }

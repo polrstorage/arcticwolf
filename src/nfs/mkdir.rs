@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with MKDIR3res
-pub fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS MKDIR: xid={}", xid);
 
     // Parse arguments
@@ -34,7 +34,7 @@ pub fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
     );
 
     // Get parent directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).ok();
+    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
 
     // Extract mode from sattr3, default to 0755
     let mode = match args.attributes.mode {
@@ -43,12 +43,12 @@ pub fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
     };
 
     // Perform mkdir operation
-    match filesystem.mkdir(&args.where_dir.0, &args.name.0, mode) {
+    match filesystem.mkdir(&args.where_dir.0, &args.name.0, mode).await {
         Ok(new_dir_handle) => {
             debug!("MKDIR OK: created directory '{}'", args.name.0);
 
             // Get new directory attributes
-            let new_dir_attr = match filesystem.getattr(&new_dir_handle) {
+            let new_dir_attr = match filesystem.getattr(&new_dir_handle).await {
                 Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
                 Err(e) => {
                     warn!("Failed to get new directory attributes: {}", e);
@@ -57,7 +57,7 @@ pub fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
             };
 
             // Get parent directory attributes after operation
-            let dir_after = match filesystem.getattr(&args.where_dir.0) {
+            let dir_after = match filesystem.getattr(&args.where_dir.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get parent dir attributes after mkdir: {}", e);
@@ -99,7 +99,7 @@ pub fn handle_mkdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
             };
 
             // Try to get current parent directory attributes for wcc_data
-            let dir_after = filesystem.getattr(&args.where_dir.0).ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_after = filesystem.getattr(&args.where_dir.0).await.ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
 
             create_mkdir_response(xid, status, None, None, dir_after)
         }
@@ -186,8 +186,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_mkdir() {
+    #[tokio::test]
+    async fn test_mkdir() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_mkdir");
         let _ = fs::remove_dir_all(&test_dir);
@@ -197,7 +197,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create MKDIR3args manually
         use xdr_codec::Pack;
@@ -213,17 +213,27 @@ mod tests {
 
         // attributes (sattr3)
         let sattr = crate::protocol::v3::nfs::sattr3 {
-            mode: Some(0o755),
-            uid: None,
-            gid: None,
-            size: None,
-            atime: crate::protocol::v3::nfs::set_atime::DONT_CHANGE,
-            mtime: crate::protocol::v3::nfs::set_mtime::DONT_CHANGE,
+            mode: crate::protocol::v3::nfs::set_mode3::SET_MODE(0o755),
+            uid: crate::protocol::v3::nfs::set_uid3::SET_UID(0),
+            gid: crate::protocol::v3::nfs::set_gid3::SET_GID(0),
+            size: crate::protocol::v3::nfs::set_size3::SET_SIZE(0),
+            atime: crate::protocol::v3::nfs::set_atime::SET_TO_CLIENT_TIME(
+                crate::protocol::v3::nfs::nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                },
+            ),
+            mtime: crate::protocol::v3::nfs::set_mtime::SET_TO_CLIENT_TIME(
+                crate::protocol::v3::nfs::nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                },
+            ),
         };
         sattr.pack(&mut args_buf).unwrap();
 
         // Call MKDIR
-        let result = handle_mkdir(12345, &args_buf, &fs);
+        let result = handle_mkdir(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "MKDIR should succeed");
 
         // Verify directory was created
@@ -235,8 +245,8 @@ mod tests {
         fs::remove_dir_all(&test_dir).unwrap();
     }
 
-    #[test]
-    fn test_mkdir_already_exists() {
+    #[tokio::test]
+    async fn test_mkdir_already_exists() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_mkdir_exists");
         let _ = fs::remove_dir_all(&test_dir);
@@ -249,7 +259,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir_exists".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create MKDIR3args manually
         use xdr_codec::Pack;
@@ -262,17 +272,27 @@ mod tests {
         dirname.pack(&mut args_buf).unwrap();
 
         let sattr = crate::protocol::v3::nfs::sattr3 {
-            mode: Some(0o755),
-            uid: None,
-            gid: None,
-            size: None,
-            atime: crate::protocol::v3::nfs::set_atime::DONT_CHANGE,
-            mtime: crate::protocol::v3::nfs::set_mtime::DONT_CHANGE,
+            mode: crate::protocol::v3::nfs::set_mode3::SET_MODE(0o755),
+            uid: crate::protocol::v3::nfs::set_uid3::SET_UID(0),
+            gid: crate::protocol::v3::nfs::set_gid3::SET_GID(0),
+            size: crate::protocol::v3::nfs::set_size3::SET_SIZE(0),
+            atime: crate::protocol::v3::nfs::set_atime::SET_TO_CLIENT_TIME(
+                crate::protocol::v3::nfs::nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                },
+            ),
+            mtime: crate::protocol::v3::nfs::set_mtime::SET_TO_CLIENT_TIME(
+                crate::protocol::v3::nfs::nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                },
+            ),
         };
         sattr.pack(&mut args_buf).unwrap();
 
-        // Call MKDIR - should return error response
-        let result = handle_mkdir(12345, &args_buf, &fs);
+        // Call MKDIR
+        let result = handle_mkdir(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "MKDIR should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_EXIST

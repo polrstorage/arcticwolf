@@ -7,7 +7,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::protocol::v3::rpc::{rpc_call_msg, rpc_reply_msg, RpcMessage};
+use crate::protocol::v3::rpc::{rpc_call_msg, RpcMessage};
 
 /// Handle MOUNT NULL procedure
 ///

@@ -3,10 +3,12 @@
 // Implements the Filesystem trait for local filesystem access.
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use super::handle::{FileHandle, HandleManager};
@@ -192,12 +194,13 @@ impl LocalFilesystem {
     }
 }
 
+#[async_trait]
 impl Filesystem for LocalFilesystem {
-    fn root_handle(&self) -> FileHandle {
+    async fn root_handle(&self) -> FileHandle {
         self.root_handle.clone()
     }
 
-    fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
+    async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -223,27 +226,28 @@ impl Filesystem for LocalFilesystem {
         Ok(handle)
     }
 
-    fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes> {
+    async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes> {
         let path = self.resolve_handle(handle)?;
 
-        let metadata = fs::metadata(&path).context(format!("Failed to stat: {:?}", path))?;
+        let metadata = tokio_fs::metadata(&path).await.context(format!("Failed to stat: {:?}", path))?;
 
         Ok(self.metadata_to_attr(&metadata, &path))
     }
 
-    fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>> {
+    async fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>> {
         let path = self.resolve_handle(handle)?;
 
         let mut file =
-            fs::File::open(&path).context(format!("Failed to open file: {:?}", path))?;
+            tokio_fs::File::open(&path).await.context(format!("Failed to open file: {:?}", path))?;
 
         // Seek to offset
-        file.seek(SeekFrom::Start(offset))
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
             .context("Failed to seek")?;
 
         // Read up to count bytes
         let mut buffer = vec![0u8; count as usize];
-        let bytes_read = file.read(&mut buffer).context("Failed to read file")?;
+        let bytes_read = file.read(&mut buffer).await.context("Failed to read file")?;
 
         // Truncate buffer to actual bytes read
         buffer.truncate(bytes_read);
@@ -256,11 +260,12 @@ impl Filesystem for LocalFilesystem {
         Ok(buffer)
     }
 
-    fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32) -> Result<(Vec<DirEntry>, bool)> {
+    async fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32) -> Result<(Vec<DirEntry>, bool)> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Verify it's a directory
-        let metadata = fs::metadata(&dir_path)
+        let metadata = tokio_fs::metadata(&dir_path)
+            .await
             .context(format!("Failed to stat directory: {:?}", dir_path))?;
 
         if !metadata.is_dir() {
@@ -268,16 +273,18 @@ impl Filesystem for LocalFilesystem {
         }
 
         // Read directory entries
-        let read_dir = fs::read_dir(&dir_path)
+        let mut read_dir = tokio_fs::read_dir(&dir_path)
+            .await
             .context(format!("Failed to read directory: {:?}", dir_path))?;
 
         // Collect all entries
         let mut entries: Vec<DirEntry> = Vec::new();
+        let mut index: u64 = 0;
 
-        for (index, entry_result) in read_dir.enumerate() {
-            let entry = entry_result.context("Failed to read directory entry")?;
+        while let Some(entry) = read_dir.next_entry().await.context("Failed to read directory entry")? {
             let entry_path = entry.path();
             let entry_metadata = entry.metadata()
+                .await
                 .context(format!("Failed to get metadata for: {:?}", entry_path))?;
 
             #[cfg(unix)]
@@ -320,7 +327,8 @@ impl Filesystem for LocalFilesystem {
                 .to_string();
 
             // Skip entries before cookie (cookie is 0-based index + 1)
-            if cookie > 0 && (index as u64) < cookie {
+            if cookie > 0 && index < cookie {
+                index += 1;
                 continue;
             }
 
@@ -329,6 +337,8 @@ impl Filesystem for LocalFilesystem {
                 name,
                 file_type,
             });
+
+            index += 1;
 
             // Check if we've reached the requested count
             if entries.len() >= count as usize {
@@ -348,24 +358,26 @@ impl Filesystem for LocalFilesystem {
         Ok((entries, true)) // EOF reached
     }
 
-    fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
+    async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let path = self.resolve_handle(handle)?;
 
-        let mut file = fs::OpenOptions::new()
+        let mut file = tokio_fs::OpenOptions::new()
             .write(true)
             .create(true)
             .open(&path)
+            .await
             .context(format!("Failed to open file for writing: {:?}", path))?;
 
         // Seek to offset
-        file.seek(SeekFrom::Start(offset))
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
             .context("Failed to seek")?;
 
         // Write data
-        let bytes_written = file.write(data).context("Failed to write file")?;
+        let bytes_written = file.write(data).await.context("Failed to write file")?;
 
         // Flush to disk
-        file.sync_all().context("Failed to sync file")?;
+        file.sync_all().await.context("Failed to sync file")?;
 
         debug!(
             "WRITE: {:?} offset={} count={} -> {} bytes",
@@ -378,15 +390,17 @@ impl Filesystem for LocalFilesystem {
         Ok(bytes_written as u32)
     }
 
-    fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()> {
+    async fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()> {
         let path = self.resolve_handle(handle)?;
 
-        let file = fs::OpenOptions::new()
+        let file = tokio_fs::OpenOptions::new()
             .write(true)
             .open(&path)
+            .await
             .context(format!("Failed to open file for setattr: {:?}", path))?;
 
         file.set_len(size)
+            .await
             .context("Failed to set file size")?;
 
         debug!("SETATTR: {:?} size={}", path, size);
@@ -394,11 +408,12 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()> {
+    async fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()> {
         let path = self.resolve_handle(handle)?;
 
         let permissions = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&path, permissions)
+        tokio_fs::set_permissions(&path, permissions)
+            .await
             .context(format!("Failed to set permissions: {:?}", path))?;
 
         debug!("SETATTR: {:?} mode={:o}", path, mode);
@@ -406,7 +421,7 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    async fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
         let path = self.resolve_handle(handle)?;
 
         // Note: chown requires root privileges on Unix systems
@@ -417,7 +432,7 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -431,12 +446,14 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&full_path)?;
 
         // Create file
-        let file = fs::File::create(&full_path)
+        let file = tokio_fs::File::create(&full_path)
+            .await
             .context(format!("Failed to create file: {:?}", full_path))?;
 
         // Set permissions
         let permissions = fs::Permissions::from_mode(mode);
         file.set_permissions(permissions)
+            .await
             .context("Failed to set permissions")?;
 
         // Create handle
@@ -447,7 +464,7 @@ impl Filesystem for LocalFilesystem {
         Ok(handle)
     }
 
-    fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
+    async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -461,14 +478,14 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&full_path)?;
 
         // Remove file
-        fs::remove_file(&full_path).context(format!("Failed to remove file: {:?}", full_path))?;
+        tokio_fs::remove_file(&full_path).await.context(format!("Failed to remove file: {:?}", full_path))?;
 
         debug!("REMOVE: {:?}", full_path);
 
         Ok(())
     }
 
-    fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -482,11 +499,11 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&full_path)?;
 
         // Create directory
-        fs::create_dir(&full_path).context(format!("Failed to create directory: {:?}", full_path))?;
+        tokio_fs::create_dir(&full_path).await.context(format!("Failed to create directory: {:?}", full_path))?;
 
         // Set permissions
         let permissions = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&full_path, permissions).context("Failed to set permissions")?;
+        tokio_fs::set_permissions(&full_path, permissions).await.context("Failed to set permissions")?;
 
         // Create handle
         let handle = self.handle_manager.create_handle(full_path.clone());
@@ -496,7 +513,7 @@ impl Filesystem for LocalFilesystem {
         Ok(handle)
     }
 
-    fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
+    async fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -510,7 +527,8 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&full_path)?;
 
         // Remove directory
-        fs::remove_dir(&full_path)
+        tokio_fs::remove_dir(&full_path)
+            .await
             .context(format!("Failed to remove directory: {:?}", full_path))?;
 
         debug!("RMDIR: {:?}", full_path);
@@ -518,7 +536,7 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn rename(
+    async fn rename(
         &self,
         from_dir_handle: &FileHandle,
         from_name: &str,
@@ -544,7 +562,8 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&to_full_path)?;
 
         // Rename/move the file or directory
-        fs::rename(&from_full_path, &to_full_path)
+        tokio_fs::rename(&from_full_path, &to_full_path)
+            .await
             .context(format!("Failed to rename {:?} to {:?}", from_full_path, to_full_path))?;
 
         debug!("RENAME: {:?} -> {:?}", from_full_path, to_full_path);
@@ -552,7 +571,7 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn symlink(&self, dir_handle: &FileHandle, name: &str, target: &str) -> Result<FileHandle> {
+    async fn symlink(&self, dir_handle: &FileHandle, name: &str, target: &str) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal in symlink name
@@ -572,7 +591,8 @@ impl Filesystem for LocalFilesystem {
 
         // Create symbolic link
         #[cfg(unix)]
-        std::os::unix::fs::symlink(target, &symlink_path)
+        tokio_fs::symlink(target, &symlink_path)
+            .await
             .context(format!("Failed to create symlink {:?} -> {}", symlink_path, target))?;
 
         #[cfg(not(unix))]
@@ -585,11 +605,12 @@ impl Filesystem for LocalFilesystem {
         Ok(handle)
     }
 
-    fn readlink(&self, handle: &FileHandle) -> Result<String> {
+    async fn readlink(&self, handle: &FileHandle) -> Result<String> {
         let path = self.resolve_handle(handle)?;
 
         // Verify the path is a symlink
-        let metadata = fs::symlink_metadata(&path)
+        let metadata = tokio_fs::symlink_metadata(&path)
+            .await
             .context(format!("Failed to get metadata for {:?}", path))?;
 
         if !metadata.file_type().is_symlink() {
@@ -597,7 +618,8 @@ impl Filesystem for LocalFilesystem {
         }
 
         // Read the symlink target
-        let target = fs::read_link(&path)
+        let target = tokio_fs::read_link(&path)
+            .await
             .context(format!("Failed to read symlink {:?}", path))?;
 
         let target_str = target.to_string_lossy().to_string();
@@ -607,7 +629,7 @@ impl Filesystem for LocalFilesystem {
         Ok(target_str)
     }
 
-    fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
+    async fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
         let file_path = self.resolve_handle(file_handle)?;
         let dir_path = self.resolve_handle(dir_handle)?;
 
@@ -627,7 +649,8 @@ impl Filesystem for LocalFilesystem {
         }
 
         // Get source file metadata to check if it's a directory
-        let metadata = fs::metadata(&file_path)
+        let metadata = tokio_fs::metadata(&file_path)
+            .await
             .context(format!("Failed to get metadata for {:?}", file_path))?;
 
         // Cannot create hard link to a directory (POSIX restriction)
@@ -636,7 +659,8 @@ impl Filesystem for LocalFilesystem {
         }
 
         // Create hard link
-        fs::hard_link(&file_path, &link_path)
+        tokio_fs::hard_link(&file_path, &link_path)
+            .await
             .context(format!("Failed to create hard link {:?} -> {:?}", link_path, file_path))?;
 
         debug!("LINK: {:?} -> {:?}", link_path, file_path);
@@ -645,13 +669,14 @@ impl Filesystem for LocalFilesystem {
         Ok(file_handle.clone())
     }
 
-    fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()> {
+    async fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()> {
         let path = self.resolve_handle(handle)?;
 
         // Open file for syncing
-        let file = fs::OpenOptions::new()
+        let file = tokio_fs::OpenOptions::new()
             .write(true)
             .open(&path)
+            .await
             .context(format!("Failed to open file for commit: {:?}", path))?;
 
         // Sync data to disk
@@ -662,6 +687,7 @@ impl Filesystem for LocalFilesystem {
         //
         // For now, we sync all data in the file for simplicity
         file.sync_all()
+            .await
             .context(format!("Failed to sync file: {:?}", path))?;
 
         debug!(
@@ -672,7 +698,7 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    fn mknod(
+    async fn mknod(
         &self,
         dir_handle: &FileHandle,
         name: &str,
@@ -688,37 +714,31 @@ impl Filesystem for LocalFilesystem {
             dir_path, name, file_type, mode, rdev.0, rdev.1
         );
 
-        // On Unix systems, we can create special files using libc functions
-        // For portability, we'll use std::os::unix::fs
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            use std::os::unix::io::AsRawFd;
+        // Create special files using libc on Linux; blocking operations are wrapped in spawn_blocking.
+        let file_path_clone = file_path.clone();
+        let file_type_clone = file_type;
 
-            match file_type {
+        tokio::task::spawn_blocking(move || {
+            match file_type_clone {
                 FileType::NamedPipe => {
-                    // Create FIFO using mkfifo
                     use std::ffi::CString;
-                    let c_path = CString::new(file_path.to_str().unwrap())?;
-                    let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
+                    let c_path = CString::new(file_path_clone.to_str().unwrap())?;
+                    let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode as libc::mode_t) };
                     if result != 0 {
                         return Err(anyhow::anyhow!("Failed to create FIFO: {}", std::io::Error::last_os_error()));
                     }
                 }
                 FileType::Socket => {
                     // Unix domain sockets are typically created by bind(), not mknod
-                    // For now, we'll create a placeholder file
-                    // A real implementation would need socket creation logic
                     return Err(anyhow::anyhow!("Socket creation via MKNOD not fully supported"));
                 }
                 FileType::CharDevice | FileType::BlockDevice => {
-                    // Create device file using mknod
                     use std::ffi::CString;
-                    let c_path = CString::new(file_path.to_str().unwrap())?;
+                    let c_path = CString::new(file_path_clone.to_str().unwrap())?;
                     let dev = libc::makedev(rdev.0, rdev.1);
-                    let mode_with_type = mode | match file_type {
-                        FileType::CharDevice => libc::S_IFCHR,
-                        FileType::BlockDevice => libc::S_IFBLK,
+                    let mode_with_type = (mode as libc::mode_t) | match file_type_clone {
+                        FileType::CharDevice => libc::S_IFCHR as libc::mode_t,
+                        FileType::BlockDevice => libc::S_IFBLK as libc::mode_t,
                         _ => 0,
                     };
                     let result = unsafe { libc::mknod(c_path.as_ptr(), mode_with_type, dev) };
@@ -727,15 +747,11 @@ impl Filesystem for LocalFilesystem {
                     }
                 }
                 _ => {
-                    return Err(anyhow::anyhow!("Invalid file type for MKNOD: {:?}", file_type));
+                    return Err(anyhow::anyhow!("Invalid file type for MKNOD: {:?}", file_type_clone));
                 }
             }
-        }
-
-        #[cfg(not(unix))]
-        {
-            return Err(anyhow::anyhow!("MKNOD is only supported on Unix systems"));
-        }
+            Ok(())
+        }).await.context("spawn_blocking failed")??;
 
         // Create handle for the new special file
         let handle = self.handle_manager.create_handle(file_path.clone());
@@ -746,8 +762,6 @@ impl Filesystem for LocalFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::io::Write;
     use tempfile::TempDir;
 
     /// Helper: Create a test filesystem with a temporary directory
@@ -757,186 +771,186 @@ mod tests {
         (fs, temp_dir)
     }
 
-    #[test]
-    fn test_root_handle() {
+    #[tokio::test]
+    async fn test_root_handle() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
         assert!(!root.is_empty(), "Root handle should not be empty");
         assert_eq!(root.len(), 32, "Root handle should be 32 bytes");
     }
 
-    #[test]
-    fn test_getattr_root() {
+    #[tokio::test]
+    async fn test_getattr_root() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
-        let attr = fs.getattr(&root).expect("Failed to get root attributes");
+        let attr = fs.getattr(&root).await.expect("Failed to get root attributes");
         assert_eq!(attr.ftype, FileType::Directory, "Root should be a directory");
     }
 
-    #[test]
-    fn test_create_and_lookup_file() {
+    #[tokio::test]
+    async fn test_create_and_lookup_file() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create a file
-        let file_handle = fs.create(&root, "test.txt", 0o644)
+        let file_handle = fs.create(&root, "test.txt", 0o644).await
             .expect("Failed to create file");
 
         // Lookup the file
-        let lookup_handle = fs.lookup(&root, "test.txt")
+        let lookup_handle = fs.lookup(&root, "test.txt").await
             .expect("Failed to lookup file");
 
         assert_eq!(file_handle, lookup_handle, "Handles should match");
 
         // Get attributes
-        let attr = fs.getattr(&file_handle).expect("Failed to get attributes");
+        let attr = fs.getattr(&file_handle).await.expect("Failed to get attributes");
         assert_eq!(attr.ftype, FileType::RegularFile, "Should be a regular file");
         assert_eq!(attr.size, 0, "New file should be empty");
     }
 
-    #[test]
-    fn test_write_and_read() {
+    #[tokio::test]
+    async fn test_write_and_read() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create file
-        let file_handle = fs.create(&root, "data.txt", 0o644)
+        let file_handle = fs.create(&root, "data.txt", 0o644).await
             .expect("Failed to create file");
 
         // Write data
         let data = b"Hello, NFS World!";
-        let written = fs.write(&file_handle, 0, data)
+        let written = fs.write(&file_handle, 0, data).await
             .expect("Failed to write");
         assert_eq!(written, data.len() as u32, "Should write all bytes");
 
         // Read data back
-        let read_data = fs.read(&file_handle, 0, data.len() as u32)
+        let read_data = fs.read(&file_handle, 0, data.len() as u32).await
             .expect("Failed to read");
         assert_eq!(read_data, data, "Read data should match written data");
 
         // Read partial data
-        let partial = fs.read(&file_handle, 7, 3)
+        let partial = fs.read(&file_handle, 7, 3).await
             .expect("Failed to read partial");
         assert_eq!(partial, b"NFS", "Partial read should work");
     }
 
-    #[test]
-    fn test_mkdir_and_lookup() {
+    #[tokio::test]
+    async fn test_mkdir_and_lookup() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create directory
-        let dir_handle = fs.mkdir(&root, "subdir", 0o755)
+        let dir_handle = fs.mkdir(&root, "subdir", 0o755).await
             .expect("Failed to create directory");
 
         // Lookup directory
-        let lookup_handle = fs.lookup(&root, "subdir")
+        let lookup_handle = fs.lookup(&root, "subdir").await
             .expect("Failed to lookup directory");
 
         assert_eq!(dir_handle, lookup_handle, "Handles should match");
 
         // Get attributes
-        let attr = fs.getattr(&dir_handle).expect("Failed to get attributes");
+        let attr = fs.getattr(&dir_handle).await.expect("Failed to get attributes");
         assert_eq!(attr.ftype, FileType::Directory, "Should be a directory");
     }
 
-    #[test]
-    fn test_nested_operations() {
+    #[tokio::test]
+    async fn test_nested_operations() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create nested directory structure
-        let dir1 = fs.mkdir(&root, "dir1", 0o755)
+        let dir1 = fs.mkdir(&root, "dir1", 0o755).await
             .expect("Failed to create dir1");
 
-        let dir2 = fs.mkdir(&dir1, "dir2", 0o755)
+        let dir2 = fs.mkdir(&dir1, "dir2", 0o755).await
             .expect("Failed to create dir2");
 
         // Create file in nested directory
-        let file = fs.create(&dir2, "nested.txt", 0o644)
+        let file = fs.create(&dir2, "nested.txt", 0o644).await
             .expect("Failed to create nested file");
 
         // Write and read
-        fs.write(&file, 0, b"nested content")
+        fs.write(&file, 0, b"nested content").await
             .expect("Failed to write");
 
-        let content = fs.read(&file, 0, 100)
+        let content = fs.read(&file, 0, 100).await
             .expect("Failed to read");
         assert_eq!(content, b"nested content");
     }
 
-    #[test]
-    fn test_remove_file() {
+    #[tokio::test]
+    async fn test_remove_file() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create and remove file
-        fs.create(&root, "temp.txt", 0o644)
+        fs.create(&root, "temp.txt", 0o644).await
             .expect("Failed to create file");
 
-        fs.remove(&root, "temp.txt")
+        fs.remove(&root, "temp.txt").await
             .expect("Failed to remove file");
 
         // Lookup should fail
-        let result = fs.lookup(&root, "temp.txt");
+        let result = fs.lookup(&root, "temp.txt").await;
         assert!(result.is_err(), "Lookup should fail after removal");
     }
 
-    #[test]
-    fn test_rmdir() {
+    #[tokio::test]
+    async fn test_rmdir() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create and remove directory
-        fs.mkdir(&root, "tempdir", 0o755)
+        fs.mkdir(&root, "tempdir", 0o755).await
             .expect("Failed to create directory");
 
-        fs.rmdir(&root, "tempdir")
+        fs.rmdir(&root, "tempdir").await
             .expect("Failed to remove directory");
 
         // Lookup should fail
-        let result = fs.lookup(&root, "tempdir");
+        let result = fs.lookup(&root, "tempdir").await;
         assert!(result.is_err(), "Lookup should fail after rmdir");
     }
 
-    #[test]
-    fn test_path_traversal_prevention() {
+    #[tokio::test]
+    async fn test_path_traversal_prevention() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Try to create file with path traversal
-        let result = fs.create(&root, "../etc/passwd", 0o644);
+        let result = fs.create(&root, "../etc/passwd", 0o644).await;
         assert!(result.is_err(), "Should prevent path traversal with ..");
 
-        let result = fs.create(&root, "subdir/../file", 0o644);
+        let result = fs.create(&root, "subdir/../file", 0o644).await;
         assert!(result.is_err(), "Should prevent .. in filename");
 
-        let result = fs.create(&root, "dir/file", 0o644);
+        let result = fs.create(&root, "dir/file", 0o644).await;
         assert!(result.is_err(), "Should prevent / in filename");
     }
 
-    #[test]
-    fn test_lookup_nonexistent() {
+    #[tokio::test]
+    async fn test_lookup_nonexistent() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
-        let result = fs.lookup(&root, "nonexistent.txt");
+        let result = fs.lookup(&root, "nonexistent.txt").await;
         assert!(result.is_err(), "Lookup should fail for nonexistent file");
     }
 
-    #[test]
-    fn test_handle_idempotency() {
+    #[tokio::test]
+    async fn test_handle_idempotency() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle();
+        let root = fs.root_handle().await;
 
         // Create file
-        fs.create(&root, "file.txt", 0o644)
+        fs.create(&root, "file.txt", 0o644).await
             .expect("Failed to create file");
 
         // Lookup multiple times should return same handle
-        let handle1 = fs.lookup(&root, "file.txt").expect("Failed to lookup");
-        let handle2 = fs.lookup(&root, "file.txt").expect("Failed to lookup");
+        let handle1 = fs.lookup(&root, "file.txt").await.expect("Failed to lookup");
+        let handle2 = fs.lookup(&root, "file.txt").await.expect("Failed to lookup");
 
         assert_eq!(handle1, handle2, "Multiple lookups should return same handle");
     }

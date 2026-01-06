@@ -15,6 +15,7 @@ pub mod local;
 // pub mod memory;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use std::path::PathBuf;
 
 pub use handle::{FileHandle, HandleManager};
@@ -90,11 +91,12 @@ pub struct DirEntry {
 ///
 /// This trait defines the interface that all filesystem backends must implement.
 /// It provides operations for file/directory access, metadata queries, and I/O.
+#[async_trait]
 pub trait Filesystem: Send + Sync {
     /// Get the root file handle
     ///
     /// This is typically the starting point for all filesystem operations.
-    fn root_handle(&self) -> FileHandle;
+    async fn root_handle(&self) -> FileHandle;
 
     /// Look up a name in a directory
     ///
@@ -107,7 +109,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// File handle of the found entry
-    fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
+    async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
 
     /// Get file attributes
     ///
@@ -116,7 +118,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// File attributes
-    fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes>;
+    async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes>;
 
     /// Read data from a file
     ///
@@ -127,7 +129,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// Vector of bytes read (may be shorter than count if EOF reached)
-    fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>>;
+    async fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>>;
 
     /// Read directory entries
     ///
@@ -138,7 +140,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// Tuple of (entries, eof) where eof indicates if all entries were returned
-    fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32) -> Result<(Vec<DirEntry>, bool)>;
+    async fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32) -> Result<(Vec<DirEntry>, bool)>;
 
     /// Write data to a file
     ///
@@ -149,21 +151,21 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// Number of bytes actually written
-    fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32>;
+    async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32>;
 
     /// Set file size (truncate/extend)
     ///
     /// # Arguments
     /// * `handle` - File handle
     /// * `size` - New size in bytes
-    fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()>;
+    async fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()>;
 
     /// Set file mode (permissions)
     ///
     /// # Arguments
     /// * `handle` - File handle
     /// * `mode` - New file mode (permissions)
-    fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()>;
+    async fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()>;
 
     /// Set file owner (uid/gid)
     ///
@@ -171,7 +173,7 @@ pub trait Filesystem: Send + Sync {
     /// * `handle` - File handle
     /// * `uid` - New user ID (None to keep current)
     /// * `gid` - New group ID (None to keep current)
-    fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
+    async fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
 
     /// Create a file
     ///
@@ -182,14 +184,14 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// File handle of created file
-    fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
 
     /// Remove a file
     ///
     /// # Arguments
     /// * `dir_handle` - Directory handle
     /// * `name` - Name of file to remove
-    fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
+    async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
 
     /// Create a directory
     ///
@@ -200,14 +202,14 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// File handle of created directory
-    fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
 
     /// Remove a directory
     ///
     /// # Arguments
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Name of directory to remove
-    fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
+    async fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
 
     /// Rename a file or directory
     ///
@@ -216,7 +218,7 @@ pub trait Filesystem: Send + Sync {
     /// * `from_name` - Source name
     /// * `to_dir_handle` - Target directory handle
     /// * `to_name` - Target name
-    fn rename(
+    async fn rename(
         &self,
         from_dir_handle: &FileHandle,
         from_name: &str,
@@ -230,7 +232,7 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Symlink name
     /// * `target` - Target path the symlink points to
-    fn symlink(&self, dir_handle: &FileHandle, name: &str, target: &str) -> Result<FileHandle>;
+    async fn symlink(&self, dir_handle: &FileHandle, name: &str, target: &str) -> Result<FileHandle>;
 
     /// Read a symbolic link
     ///
@@ -239,7 +241,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// Target path the symlink points to
-    fn readlink(&self, handle: &FileHandle) -> Result<String>;
+    async fn readlink(&self, handle: &FileHandle) -> Result<String>;
 
     /// Create a hard link
     ///
@@ -250,7 +252,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// The file handle (should be the same as source file handle since they share the same inode)
-    fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
+    async fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
 
     /// Commit cached data to stable storage
     ///
@@ -264,7 +266,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// Ok if data is committed to stable storage
-    fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()>;
+    async fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()>;
 
     /// Create a special file (device, FIFO, socket)
     ///
@@ -277,7 +279,7 @@ pub trait Filesystem: Send + Sync {
     ///
     /// # Returns
     /// File handle of created special file
-    fn mknod(
+    async fn mknod(
         &self,
         dir_handle: &FileHandle,
         name: &str,

@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use tracing::{debug, warn};
 
 use crate::fsal::Filesystem;
-use crate::protocol::v3::nfs::{cookieverf3, entry3, fileid3, nfsstat3, NfsMessage, COOKIEVERFSIZE};
+use crate::protocol::v3::nfs::{cookieverf3, fileid3, nfsstat3, NfsMessage, COOKIEVERFSIZE};
 use crate::protocol::v3::rpc::RpcMessage;
 
 /// Handle NFS READDIR request
@@ -19,7 +19,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with READDIR3res
-pub fn handle_readdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_readdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS READDIR: xid={}", xid);
 
     // Parse arguments
@@ -33,7 +33,7 @@ pub fn handle_readdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -
     );
 
     // Get directory attributes
-    let dir_attr = match filesystem.getattr(&args.dir.0) {
+    let dir_attr = match filesystem.getattr(&args.dir.0).await {
         Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
         Err(e) => {
             warn!("READDIR failed: getattr error: {}", e);
@@ -43,7 +43,7 @@ pub fn handle_readdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -
     };
 
     // Read directory entries
-    let (entries, eof) = match filesystem.readdir(&args.dir.0, args.cookie, args.count) {
+    let (entries, eof) = match filesystem.readdir(&args.dir.0, args.cookie, args.count).await {
         Ok(result) => result,
         Err(e) => {
             warn!("READDIR failed: {}", e);

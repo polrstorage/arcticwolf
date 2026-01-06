@@ -17,7 +17,7 @@ use crate::protocol::v3::rpc::{rpc_call_msg, RpcMessage};
 ///
 /// Arguments: dirpath (string)
 /// Returns: mountres3 (file handle + auth flavors on success)
-pub fn handle(
+pub async fn handle(
     call: &rpc_call_msg,
     args_data: &[u8],
     filesystem: &dyn crate::fsal::Filesystem,
@@ -38,7 +38,7 @@ pub fn handle(
     // For root path "/" or empty, return the root file handle
     // In a production NFS server, we would validate export permissions here
     // For now, accept any path and return root handle (temporary workaround for path parsing issue)
-    let fhandle_bytes = filesystem.root_handle();
+    let fhandle_bytes = filesystem.root_handle().await;
 
     info!(
         "Generated file handle ({} bytes) for path '{}'",
