@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with filesystem statistics
-pub fn handle_fsstat(
+pub async fn handle_fsstat(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -34,7 +34,7 @@ pub fn handle_fsstat(
     debug!("FSSTAT: fsroot_handle={} bytes", args.fsroot.0.len());
 
     // Get filesystem attributes
-    let obj_attrs = match filesystem.getattr(&args.fsroot.0) {
+    let obj_attrs = match filesystem.getattr(&args.fsroot.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("FSSTAT failed: {}", e);
@@ -98,18 +98,18 @@ pub fn handle_fsstat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_fsstat_root() {
+    #[tokio::test]
+    async fn test_fsstat_root() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize FSSTAT3args
         use crate::protocol::v3::nfs::FSSTAT3args;
@@ -123,7 +123,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSSTAT
-        let result = handle_fsstat(12345, &args_buf, fs.as_ref());
+        let result = handle_fsstat(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "FSSTAT should succeed");
 
@@ -131,8 +131,8 @@ mod tests {
         assert!(!reply.is_empty(), "Reply should contain data");
     }
 
-    #[test]
-    fn test_fsstat_invalid_handle() {
+    #[tokio::test]
+    async fn test_fsstat_invalid_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -150,7 +150,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSSTAT
-        let result = handle_fsstat(12345, &args_buf, fs.as_ref());
+        let result = handle_fsstat(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "FSSTAT should return error response (not panic)");
     }

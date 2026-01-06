@@ -29,7 +29,7 @@ const ACCESS3_EXECUTE: u32 = 0x0020;
 ///
 /// # Returns
 /// Serialized RPC reply message with granted access rights
-pub fn handle_access(
+pub async fn handle_access(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -46,7 +46,7 @@ pub fn handle_access(
     );
 
     // Get file attributes to check type and permissions
-    let file_attrs = match filesystem.getattr(&args.object.0) {
+    let file_attrs = match filesystem.getattr(&args.object.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("ACCESS failed: {}", e);
@@ -130,12 +130,12 @@ pub fn handle_access(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_access_file() {
+    #[tokio::test]
+    async fn test_access_file() {
         // Create temp filesystem with a test file
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("access_test.txt");
@@ -145,8 +145,8 @@ mod tests {
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle and lookup the file
-        let root_handle = fs.root_handle();
-        let file_handle = fs.lookup(&root_handle, "access_test.txt").unwrap();
+        let root_handle = fs.root_handle().await;
+        let file_handle = fs.lookup(&root_handle, "access_test.txt").await.unwrap();
 
         // Serialize ACCESS3args
         use crate::protocol::v3::nfs::ACCESS3args;
@@ -161,7 +161,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref());
+        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "ACCESS should succeed for existing file");
 
@@ -169,15 +169,15 @@ mod tests {
         assert!(!reply.is_empty(), "Reply should contain data");
     }
 
-    #[test]
-    fn test_access_directory() {
+    #[tokio::test]
+    async fn test_access_directory() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
         // Get root handle (which is a directory)
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize ACCESS3args with LOOKUP permission
         use crate::protocol::v3::nfs::ACCESS3args;
@@ -192,13 +192,13 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref());
+        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "ACCESS should succeed for directory");
     }
 
-    #[test]
-    fn test_access_invalid_handle() {
+    #[tokio::test]
+    async fn test_access_invalid_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -217,7 +217,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref());
+        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "ACCESS should return error response (not panic)");
     }

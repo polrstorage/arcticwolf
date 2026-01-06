@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     let fsal_config = BackendConfig::local(&export_path);
     let filesystem: Arc<dyn fsal::Filesystem> = Arc::from(fsal_config.create_filesystem()?);
 
-    let root_handle = filesystem.root_handle();
+    let root_handle = filesystem.root_handle().await;
     println!("  Root handle: {} bytes", root_handle.len());
     println!();
 

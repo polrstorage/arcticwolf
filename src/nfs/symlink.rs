@@ -2,7 +2,7 @@
 //
 // Creates a symbolic link
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
@@ -19,7 +19,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized SYMLINK3res response
-pub fn handle_symlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_symlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS SYMLINK: xid={}", xid);
 
     // Parse arguments
@@ -33,15 +33,15 @@ pub fn handle_symlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -
     );
 
     // Get parent directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).ok();
+    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
 
     // Perform symlink operation
-    match filesystem.symlink(&args.where_dir.0, &args.name.0, &args.symlink.symlink_data.0) {
+    match filesystem.symlink(&args.where_dir.0, &args.name.0, &args.symlink.symlink_data.0).await {
         Ok(new_symlink_handle) => {
             debug!("SYMLINK OK: created symlink '{}'", args.name.0);
 
             // Get new symlink attributes
-            let symlink_attr = match filesystem.getattr(&new_symlink_handle) {
+            let symlink_attr = match filesystem.getattr(&new_symlink_handle).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get symlink attributes: {}", e);
@@ -50,7 +50,7 @@ pub fn handle_symlink(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -
             };
 
             // Get parent directory attributes after operation
-            let dir_after = match filesystem.getattr(&args.where_dir.0) {
+            let dir_after = match filesystem.getattr(&args.where_dir.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get directory attributes after symlink: {}", e);

@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with RENAME3res
-pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS RENAME: xid={}", xid);
 
     // Parse arguments
@@ -39,14 +39,14 @@ pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
     );
 
     // Get source directory attributes before operation (for wcc_data)
-    let fromdir_before = filesystem.getattr(&args.from_dir.0).ok();
+    let fromdir_before = filesystem.getattr(&args.from_dir.0).await.ok();
 
     // Get target directory attributes before operation (for wcc_data)
     // Only if different from source directory
     let todir_before = if args.from_dir.0 == args.to_dir.0 {
         None  // Same directory, use fromdir_before
     } else {
-        filesystem.getattr(&args.to_dir.0).ok()
+        filesystem.getattr(&args.to_dir.0).await.ok()
     };
 
     // Perform rename operation
@@ -55,7 +55,7 @@ pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
         &args.from_name.0,
         &args.to_dir.0,
         &args.to_name.0,
-    ) {
+    ).await {
         Ok(()) => {
             debug!(
                 "RENAME OK: '{}' -> '{}'",
@@ -63,7 +63,7 @@ pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
             );
 
             // Get source directory attributes after operation
-            let fromdir_after = match filesystem.getattr(&args.from_dir.0) {
+            let fromdir_after = match filesystem.getattr(&args.from_dir.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get source dir attributes after rename: {}", e);
@@ -75,7 +75,7 @@ pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
             let todir_after = if args.from_dir.0 == args.to_dir.0 {
                 fromdir_after.clone()  // Same directory
             } else {
-                match filesystem.getattr(&args.to_dir.0) {
+                match filesystem.getattr(&args.to_dir.0).await {
                     Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                     Err(e) => {
                         warn!("Failed to get target dir attributes after rename: {}", e);
@@ -120,11 +120,11 @@ pub fn handle_rename(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
             };
 
             // Try to get current directory attributes for wcc_data
-            let fromdir_after = filesystem.getattr(&args.from_dir.0).ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let fromdir_after = filesystem.getattr(&args.from_dir.0).await.ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
             let todir_after = if args.from_dir.0 == args.to_dir.0 {
                 fromdir_after.clone()
             } else {
-                filesystem.getattr(&args.to_dir.0).ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr))
+                filesystem.getattr(&args.to_dir.0).await.ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr))
             };
 
             create_rename_response(xid, status, fromdir_after, todir_after)
@@ -199,8 +199,8 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_rename_file() {
+    #[tokio::test]
+    async fn test_rename_file() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_rename");
         let _ = fs::remove_dir_all(&test_dir);
@@ -214,7 +214,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_rename".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create RENAME3args manually
         use xdr_codec::Pack;
@@ -236,7 +236,7 @@ mod tests {
         to_name.pack(&mut args_buf).unwrap();
 
         // Call RENAME
-        let result = handle_rename(12345, &args_buf, &fs);
+        let result = handle_rename(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "RENAME should succeed");
 
         // Verify file was renamed
@@ -247,8 +247,8 @@ mod tests {
         fs::remove_dir_all(&test_dir).unwrap();
     }
 
-    #[test]
-    fn test_rename_directory() {
+    #[tokio::test]
+    async fn test_rename_directory() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_rename_dir");
         let _ = fs::remove_dir_all(&test_dir);
@@ -261,7 +261,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_rename_dir".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create RENAME3args manually
         use xdr_codec::Pack;
@@ -279,7 +279,7 @@ mod tests {
         to_name.pack(&mut args_buf).unwrap();
 
         // Call RENAME
-        let result = handle_rename(12346, &args_buf, &fs);
+        let result = handle_rename(12346, &args_buf, &fs).await;
         assert!(result.is_ok(), "RENAME should succeed");
 
         // Verify directory was renamed

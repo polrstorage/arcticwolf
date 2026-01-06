@@ -26,7 +26,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized COMMIT3res wrapped in RPC reply
-pub fn handle_commit(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_commit(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS COMMIT: xid={}", xid);
 
     // Parse arguments
@@ -40,15 +40,15 @@ pub fn handle_commit(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
     );
 
     // Get file attributes before operation (for wcc_data)
-    let file_before = filesystem.getattr(&args.file.0).ok();
+    let file_before = filesystem.getattr(&args.file.0).await.ok();
 
     // Perform commit operation
-    match filesystem.commit(&args.file.0, args.offset, args.count) {
+    match filesystem.commit(&args.file.0, args.offset, args.count).await {
         Ok(()) => {
             debug!("COMMIT OK");
 
             // Get file attributes after operation
-            let file_after = match filesystem.getattr(&args.file.0) {
+            let file_after = match filesystem.getattr(&args.file.0).await {
                 Ok(attr) => Some(NfsMessage::fsal_to_fattr3(&attr)),
                 Err(e) => {
                     warn!("Failed to get file attributes after commit: {}", e);
@@ -78,7 +78,7 @@ pub fn handle_commit(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) ->
 /// Create COMMIT3res response
 ///
 /// COMMIT3res structure (RFC 1813):
-/// ```
+/// ```text
 /// union COMMIT3res switch (nfsstat3 status) {
 ///     case NFS3_OK:
 ///         struct {

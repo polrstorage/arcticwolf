@@ -3,7 +3,7 @@
 // Implements Sun RPC over TCP with record marking protocol (RFC 5531)
 
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::fsal::Filesystem;
 use crate::portmap::Registry;
-use crate::protocol::v3::rpc::{rpc_call_msg, RpcMessage};
+use crate::protocol::v3::rpc::RpcMessage;
 
 /// RPC server handling TCP connections with record marking
 pub struct RpcServer {
@@ -85,7 +85,7 @@ async fn handle_connection(
         if is_last {
             debug!("Complete RPC message received ({} bytes)", buffer.len());
 
-            let response = match handle_rpc_message(&buffer, &registry, filesystem.as_ref()) {
+            let response = match handle_rpc_message(&buffer, &registry, filesystem.as_ref()).await {
                 Ok(response) => response,
                 Err(e) => {
                     error!("Failed to handle RPC message: {}", e);
@@ -137,7 +137,7 @@ async fn handle_connection(
 }
 
 /// Handle a complete RPC message
-fn handle_rpc_message(
+async fn handle_rpc_message(
     data: &[u8],
     registry: &Registry,
     filesystem: &dyn Filesystem,
@@ -212,12 +212,12 @@ fn handle_rpc_message(
         100005 => {
             // MOUNT protocol (program 100005)
             debug!("Routing to MOUNT protocol handler");
-            crate::mount::handle_mount_call(&call, args_data, filesystem)
+            crate::mount::handle_mount_call(&call, args_data, filesystem).await
         }
         100003 => {
             // NFS protocol (program 100003)
             debug!("Routing to NFS protocol handler");
-            crate::nfs::dispatch(&call, args_data, filesystem)
+            crate::nfs::dispatch(&call, args_data, filesystem).await
         }
         _ => {
             warn!("Unknown program number: {}", call.prog);

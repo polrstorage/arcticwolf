@@ -27,7 +27,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with READDIRPLUS3res
-pub fn handle_readdirplus(
+pub async fn handle_readdirplus(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -46,7 +46,7 @@ pub fn handle_readdirplus(
     );
 
     // Get directory attributes
-    let dir_attr = match filesystem.getattr(&args.dir.0) {
+    let dir_attr = match filesystem.getattr(&args.dir.0).await {
         Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
         Err(e) => {
             warn!("READDIRPLUS failed: getattr error: {}", e);
@@ -57,7 +57,7 @@ pub fn handle_readdirplus(
 
     // Read directory entries
     // Use dircount as the count parameter (RFC 1813 says dircount is for entry names)
-    let (entries, eof) = match filesystem.readdir(&args.dir.0, args.cookie, args.dircount) {
+    let (entries, eof) = match filesystem.readdir(&args.dir.0, args.cookie, args.dircount).await {
         Ok(result) => result,
         Err(e) => {
             warn!("READDIRPLUS failed: {}", e);
@@ -107,10 +107,10 @@ pub fn handle_readdirplus(
 
         // post_op_attr: Get attributes for this entry
         // We need to lookup the file handle first
-        match filesystem.lookup(&args.dir.0, &dir_entry.name) {
+        match filesystem.lookup(&args.dir.0, &dir_entry.name).await {
             Ok(entry_handle) => {
                 // Get attributes for this entry
-                match filesystem.getattr(&entry_handle) {
+                match filesystem.getattr(&entry_handle).await {
                     Ok(entry_attr) => {
                         // post_op_attr: true + fattr3
                         true.pack(&mut buf)?;
@@ -165,8 +165,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_readdirplus_basic() {
+    #[tokio::test]
+    async fn test_readdirplus_basic() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_readdirplus");
         let _ = fs::remove_dir_all(&test_dir);
@@ -181,7 +181,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_readdirplus".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create READDIRPLUS3args manually
         use xdr_codec::Pack;
@@ -205,7 +205,7 @@ mod tests {
         32768u32.pack(&mut args_buf).unwrap();
 
         // Call handler
-        let result = handle_readdirplus(1, &args_buf, &fs);
+        let result = handle_readdirplus(1, &args_buf, &fs).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();

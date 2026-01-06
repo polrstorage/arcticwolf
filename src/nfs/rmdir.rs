@@ -22,7 +22,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply with RMDIR3res
-pub fn handle_rmdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
+pub async fn handle_rmdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> Result<BytesMut> {
     debug!("NFS RMDIR: xid={}", xid);
 
     // Parse arguments
@@ -35,15 +35,15 @@ pub fn handle_rmdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
     );
 
     // Get parent directory attributes before removal (for wcc_data)
-    let dir_before = filesystem.getattr(&args.dir.0).ok();
+    let dir_before = filesystem.getattr(&args.dir.0).await.ok();
 
     // Perform rmdir operation
-    match filesystem.rmdir(&args.dir.0, &args.name.0) {
+    match filesystem.rmdir(&args.dir.0, &args.name.0).await {
         Ok(()) => {
             debug!("RMDIR OK: removed directory '{}'", args.name.0);
 
             // Get parent directory attributes after removal
-            let dir_after = match filesystem.getattr(&args.dir.0) {
+            let dir_after = match filesystem.getattr(&args.dir.0).await {
                 Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
                 Err(e) => {
                     warn!("Failed to get parent dir attributes after rmdir: {}", e);
@@ -81,7 +81,7 @@ pub fn handle_rmdir(xid: u32, args_data: &[u8], filesystem: &dyn Filesystem) -> 
             };
 
             // Try to get current parent directory attributes for wcc_data
-            let dir_after = filesystem.getattr(&args.dir.0).ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_after = filesystem.getattr(&args.dir.0).await.ok().map(|attr| NfsMessage::fsal_to_fattr3(&attr));
 
             create_rmdir_response(xid, status, dir_after)
         }
@@ -136,8 +136,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_rmdir() {
+    #[tokio::test]
+    async fn test_rmdir() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_rmdir");
         let _ = fs::remove_dir_all(&test_dir);
@@ -151,7 +151,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create RMDIR3args manually
         use xdr_codec::Pack;
@@ -169,7 +169,7 @@ mod tests {
         assert!(target_dir.exists());
 
         // Call RMDIR
-        let result = handle_rmdir(12345, &args_buf, &fs);
+        let result = handle_rmdir(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "RMDIR should succeed");
 
         // Verify directory was removed
@@ -179,8 +179,8 @@ mod tests {
         fs::remove_dir_all(&test_dir).unwrap();
     }
 
-    #[test]
-    fn test_rmdir_nonexistent() {
+    #[tokio::test]
+    async fn test_rmdir_nonexistent() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_rmdir_nonexistent");
         let _ = fs::remove_dir_all(&test_dir);
@@ -190,7 +190,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_nonexistent".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create RMDIR3args manually
         use xdr_codec::Pack;
@@ -203,7 +203,7 @@ mod tests {
         dirname.pack(&mut args_buf).unwrap();
 
         // Call RMDIR - should fail with NOENT
-        let result = handle_rmdir(12345, &args_buf, &fs);
+        let result = handle_rmdir(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "RMDIR should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_NOENT
@@ -212,8 +212,8 @@ mod tests {
         fs::remove_dir_all(&test_dir).unwrap();
     }
 
-    #[test]
-    fn test_rmdir_not_empty() {
+    #[tokio::test]
+    async fn test_rmdir_not_empty() {
         // Create test directory
         let test_dir = PathBuf::from("/tmp/nfs_test_rmdir_notempty");
         let _ = fs::remove_dir_all(&test_dir);
@@ -228,7 +228,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_notempty".to_string()).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Create RMDIR3args manually
         use xdr_codec::Pack;
@@ -241,7 +241,7 @@ mod tests {
         dirname.pack(&mut args_buf).unwrap();
 
         // Call RMDIR - should fail with NOTEMPTY
-        let result = handle_rmdir(12345, &args_buf, &fs);
+        let result = handle_rmdir(12345, &args_buf, &fs).await;
         assert!(result.is_ok(), "RMDIR should return response (not crash)");
 
         // Verify directory still exists

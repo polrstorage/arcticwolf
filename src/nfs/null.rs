@@ -19,7 +19,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message (success with no data)
-pub fn handle_null(xid: u32) -> Result<BytesMut> {
+pub async fn handle_null(xid: u32) -> Result<BytesMut> {
     debug!("NFS NULL called (xid={})", xid);
 
     // Create successful reply (same as RPC/MOUNT NULL)
@@ -33,10 +33,10 @@ pub fn handle_null(xid: u32) -> Result<BytesMut> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_null_procedure() {
+    #[tokio::test]
+    async fn test_null_procedure() {
         let xid = 12345;
-        let result = handle_null(xid);
+        let result = handle_null(xid).await;
 
         assert!(result.is_ok(), "NULL procedure should succeed");
 

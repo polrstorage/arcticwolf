@@ -21,7 +21,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 ///
 /// # Returns
 /// Serialized RPC reply message with new file handle
-pub fn handle_create(
+pub async fn handle_create(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn Filesystem,
@@ -44,7 +44,7 @@ pub fn handle_create(
     );
 
     // Get directory attributes before create (for wcc_data)
-    let _before_dir_attrs = filesystem.getattr(&args.where_dir.0).ok();
+    let _before_dir_attrs = filesystem.getattr(&args.where_dir.0).await.ok();
 
     // Create the file based on mode
     let file_handle = match &args.how {
@@ -59,7 +59,7 @@ pub fn handle_create(
             };
 
             // Create the file
-            match filesystem.create(&args.where_dir.0, &filename, mode) {
+            match filesystem.create(&args.where_dir.0, &filename, mode).await {
                 Ok(handle) => handle,
                 Err(e) => {
                     debug!("CREATE failed: {}", e);
@@ -87,7 +87,7 @@ pub fn handle_create(
             // EXCLUSIVE mode: create file with verifier stored in mtime/atime
             // This is for safe concurrent creation
             // For simplicity, we'll treat it like GUARDED for now
-            match filesystem.create(&args.where_dir.0, &filename, 0o644) {
+            match filesystem.create(&args.where_dir.0, &filename, 0o644).await {
                 Ok(handle) => handle,
                 Err(e) => {
                     debug!("CREATE (EXCLUSIVE) failed: {}", e);
@@ -104,7 +104,7 @@ pub fn handle_create(
     };
 
     // Get file attributes
-    let file_attrs = match filesystem.getattr(&file_handle) {
+    let file_attrs = match filesystem.getattr(&file_handle).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("CREATE: failed to get file attributes: {}", e);
@@ -115,7 +115,7 @@ pub fn handle_create(
     };
 
     // Get directory attributes after create
-    let dir_attrs = match filesystem.getattr(&args.where_dir.0) {
+    let dir_attrs = match filesystem.getattr(&args.where_dir.0).await {
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("CREATE: failed to get dir attributes: {}", e);
@@ -171,23 +171,23 @@ pub fn handle_create(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{BackendConfig, Filesystem};
+    use crate::fsal::BackendConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_create_file() {
+    #[tokio::test]
+    async fn test_create_file() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
         let fs = config.create_filesystem().unwrap();
 
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize CREATE3args
         use crate::protocol::v3::nfs::{
-            createhow3, fhandle3, filename3, sattr3, set_atime, set_gid3, set_mode3,
-            set_mtime, set_size3, set_uid3, time_how, CREATE3args,
+            createhow3, fhandle3, filename3, nfstime3, sattr3, set_atime, set_gid3,
+            set_mode3, set_mtime, set_size3, set_uid3, CREATE3args,
         };
         use xdr_codec::Pack;
 
@@ -197,11 +197,17 @@ mod tests {
             name: filename3(test_filename.to_string()),
             how: createhow3::UNCHECKED(sattr3 {
                 mode: set_mode3::SET_MODE(0o644),
-                uid: set_uid3::default,
-                gid: set_gid3::default,
-                size: set_size3::default,
-                atime: set_atime::default,
-                mtime: set_mtime::default,
+                uid: set_uid3::SET_UID(0),
+                gid: set_gid3::SET_GID(0),
+                size: set_size3::SET_SIZE(0),
+                atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
+                mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
             }),
         };
 
@@ -209,7 +215,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call CREATE
-        let result = handle_create(12345, &args_buf, fs.as_ref());
+        let result = handle_create(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "CREATE should succeed");
 
@@ -218,8 +224,8 @@ mod tests {
         assert!(test_file.exists(), "File should be created");
     }
 
-    #[test]
-    fn test_create_existing_file_unchecked() {
+    #[tokio::test]
+    async fn test_create_existing_file_unchecked() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
         let config = BackendConfig::local(temp_dir.path());
@@ -229,12 +235,12 @@ mod tests {
         let test_file = temp_dir.path().join("existing.txt");
         fs::write(&test_file, b"old content").unwrap();
 
-        let root_handle = fs.root_handle();
+        let root_handle = fs.root_handle().await;
 
         // Serialize CREATE3args with UNCHECKED mode
         use crate::protocol::v3::nfs::{
-            createhow3, fhandle3, filename3, sattr3, set_atime, set_gid3, set_mode3,
-            set_mtime, set_size3, set_uid3, time_how, CREATE3args,
+            createhow3, fhandle3, filename3, nfstime3, sattr3, set_atime, set_gid3,
+            set_mode3, set_mtime, set_size3, set_uid3, CREATE3args,
         };
         use xdr_codec::Pack;
 
@@ -243,11 +249,17 @@ mod tests {
             name: filename3("existing.txt".to_string()),
             how: createhow3::UNCHECKED(sattr3 {
                 mode: set_mode3::SET_MODE(0o644),
-                uid: set_uid3::default,
-                gid: set_gid3::default,
-                size: set_size3::default,
-                atime: set_atime::default,
-                mtime: set_mtime::default,
+                uid: set_uid3::SET_UID(0),
+                gid: set_gid3::SET_GID(0),
+                size: set_size3::SET_SIZE(0),
+                atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
+                mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                    seconds: 0,
+                    nseconds: 0,
+                }),
             }),
         };
 
@@ -255,7 +267,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call CREATE - should succeed (UNCHECKED allows overwriting)
-        let result = handle_create(12345, &args_buf, fs.as_ref());
+        let result = handle_create(12345, &args_buf, fs.as_ref()).await;
 
         assert!(result.is_ok(), "CREATE UNCHECKED should succeed even if file exists");
     }

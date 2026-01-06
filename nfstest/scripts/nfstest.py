@@ -428,8 +428,16 @@ def main():
         parser.print_help()
         return 1
 
-    # Create configuration from command line arguments
-    # All defaults must be provided by caller (typically Makefile)
+    if args.command == "stop-server":
+        return stop_server()
+    elif args.command == "stop-client":
+        return stop_client()
+    elif args.command == "stop-env":
+        stop_server()
+        stop_client()
+        return 0
+
+    # Create configuration from command line arguments (defaults typically provided by Makefile)
     cfg = Config(
         image_name=args.image_name,
         image_tag=args.image_tag,
@@ -441,21 +449,13 @@ def main():
     # Execute command
     if args.command == "start-server":
         return start_server(cfg)
-    elif args.command == "stop-server":
-        return stop_server()
     elif args.command == "start-client":
         return start_client(cfg)
-    elif args.command == "stop-client":
-        return stop_client()
     elif args.command == "start-env":
         ret = start_server(cfg)
         if ret != 0:
             return ret
         return start_client(cfg)
-    elif args.command == "stop-env":
-        stop_server()
-        stop_client()
-        return 0
     elif args.command == "test":
         return run_tests(cfg, testcase=args.testcase)
     else:
