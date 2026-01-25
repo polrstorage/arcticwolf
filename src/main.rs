@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("Arctic Wolf NFS server only supports Linux");
+
 use anyhow::Result;
 use std::sync::Arc;
 

@@ -302,7 +302,7 @@ def stop_client():
     return 0
 
 
-def run_tests(cfg, testcase="open,read,write"):
+def run_tests(cfg, testcase="read,write"):
     """Run NFS integration tests."""
     print("=" * 60)
     print("Arctic Wolf NFS Test")

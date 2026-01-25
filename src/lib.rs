@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("Arctic Wolf NFS server only supports Linux");
+
 // Arctic Wolf NFS Server - Library
 //
 // This library provides the core components for building an NFSv3 server

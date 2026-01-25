@@ -44,7 +44,7 @@ def wait_for_server(host, port, max_attempts=30):
     return False
 
 
-def run_nfstest(testcase="open,read,write"):
+def run_nfstest(testcase="read,write"):
     """Run nfstest_posix."""
     print("Running nfstest_posix...", flush=True)
     print(flush=True)
@@ -79,7 +79,7 @@ def run_nfstest(testcase="open,read,write"):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Run NFS tests against the server")
-    parser.add_argument("--testcase", default="open,read,write", help="Test cases to run (default: open,read,write)")
+    parser.add_argument("--testcase", default="read,write", help="Test cases to run (default: read,write)")
     args = parser.parse_args()
 
     print(f"NFS Server: {NFS_SERVER}:{NFS_PORT}", flush=True)

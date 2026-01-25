@@ -8,6 +8,8 @@ Arctic Wolf is a Rust-based NFSv3 server implementing RFC 1813 (NFSv3), RFC 5531
 
 ## Build Commands
 
+**Important:** Always use `make` commands for building and testing. Do not run `cargo` or `earthly` directly.
+
 ```bash
 make build    # Build in container
 make test     # Run unit tests

@@ -132,37 +132,23 @@ impl LocalFilesystem {
 
     /// Convert std::fs::Metadata to FileAttributes
     fn metadata_to_attr(&self, metadata: &fs::Metadata, _path: &Path) -> FileAttributes {
-        #[cfg(unix)]
-        let ftype = {
-            use std::os::unix::fs::FileTypeExt;
-            let file_type = metadata.file_type();
+        use std::os::unix::fs::FileTypeExt;
+        let file_type = metadata.file_type();
 
-            if file_type.is_dir() {
-                FileType::Directory
-            } else if file_type.is_file() {
-                FileType::RegularFile
-            } else if file_type.is_symlink() {
-                FileType::SymbolicLink
-            } else if file_type.is_fifo() {
-                FileType::NamedPipe
-            } else if file_type.is_char_device() {
-                FileType::CharDevice
-            } else if file_type.is_block_device() {
-                FileType::BlockDevice
-            } else if file_type.is_socket() {
-                FileType::Socket
-            } else {
-                FileType::RegularFile // Default
-            }
-        };
-
-        #[cfg(not(unix))]
-        let ftype = if metadata.is_dir() {
+        let ftype = if file_type.is_dir() {
             FileType::Directory
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
             FileType::RegularFile
-        } else if metadata.is_symlink() {
+        } else if file_type.is_symlink() {
             FileType::SymbolicLink
+        } else if file_type.is_fifo() {
+            FileType::NamedPipe
+        } else if file_type.is_char_device() {
+            FileType::CharDevice
+        } else if file_type.is_block_device() {
+            FileType::BlockDevice
+        } else if file_type.is_socket() {
+            FileType::Socket
         } else {
             FileType::RegularFile // Default
         };
@@ -303,37 +289,23 @@ impl Filesystem for LocalFilesystem {
                 .await
                 .context(format!("Failed to get metadata for: {:?}", entry_path))?;
 
-            #[cfg(unix)]
-            let file_type = {
-                use std::os::unix::fs::FileTypeExt;
-                let ft = entry_metadata.file_type();
+            use std::os::unix::fs::FileTypeExt;
+            let ft = entry_metadata.file_type();
 
-                if ft.is_dir() {
-                    FileType::Directory
-                } else if ft.is_file() {
-                    FileType::RegularFile
-                } else if ft.is_symlink() {
-                    FileType::SymbolicLink
-                } else if ft.is_fifo() {
-                    FileType::NamedPipe
-                } else if ft.is_char_device() {
-                    FileType::CharDevice
-                } else if ft.is_block_device() {
-                    FileType::BlockDevice
-                } else if ft.is_socket() {
-                    FileType::Socket
-                } else {
-                    FileType::RegularFile // Default
-                }
-            };
-
-            #[cfg(not(unix))]
-            let file_type = if entry_metadata.is_dir() {
+            let file_type = if ft.is_dir() {
                 FileType::Directory
-            } else if entry_metadata.is_file() {
+            } else if ft.is_file() {
                 FileType::RegularFile
-            } else if entry_metadata.is_symlink() {
+            } else if ft.is_symlink() {
                 FileType::SymbolicLink
+            } else if ft.is_fifo() {
+                FileType::NamedPipe
+            } else if ft.is_char_device() {
+                FileType::CharDevice
+            } else if ft.is_block_device() {
+                FileType::BlockDevice
+            } else if ft.is_socket() {
+                FileType::Socket
             } else {
                 FileType::RegularFile // Default
             };
@@ -636,16 +608,12 @@ impl Filesystem for LocalFilesystem {
         }
 
         // Create symbolic link
-        #[cfg(unix)]
         tokio_fs::symlink(target, &symlink_path)
             .await
             .context(format!(
                 "Failed to create symlink {:?} -> {}",
                 symlink_path, target
             ))?;
-
-        #[cfg(not(unix))]
-        return Err(anyhow!("Symbolic links are only supported on Unix systems"));
 
         debug!("SYMLINK: {:?} -> {}", symlink_path, target);
 

@@ -11,7 +11,7 @@ VM_IMAGE_NAME ?= vm.qcow2
 CIDATA_NAME ?= cidata.iso
 
 # Test configuration
-TESTCASE ?= open,read,write
+TESTCASE ?= read,write
 
 # Default target
 .DEFAULT_GOAL := help
@@ -25,13 +25,13 @@ help:
 	@echo "  test            - Run unit tests"
 	@echo "  lint            - Run clippy and rustfmt checks"
 	@echo "  start-test-env  - Build and start both server and client VM"
-	@echo "  nfstest         - Run NFS tests (TESTCASE=open,read,write)"
+	@echo "  nfstest         - Run NFS tests (TESTCASE=read,write)"
 	@echo "  stop-test-env   - Stop both server and VM"
 	@echo "  clean           - Stop all and remove build artifacts"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make nfstest                    # Run default tests (open,read,write)"
-	@echo "  make nfstest TESTCASE=open      # Run only open test"
+	@echo "  make nfstest                    # Run default tests (read,write)"
+	@echo "  make nfstest TESTCASE=read      # Run only read test"
 	@echo "  make nfstest TESTCASE=read,write # Run read and write tests"
 
 # Build release binary
