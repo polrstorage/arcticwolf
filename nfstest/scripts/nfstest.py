@@ -154,6 +154,7 @@ def start_server(cfg):
         "docker", "run", "-d",
         "--name", CONTAINER_NAME,
         "-p", f"{NFS_PORT}:{NFS_PORT}",
+        "-v", "nfs_exports:/tmp/nfs_exports",
         cfg.docker_image
     ])
     print(f"✓ NFS server container started in background")
@@ -168,7 +169,7 @@ def stop_server():
     print("=" * 60)
     print()
 
-    print(f"[1/2] Stopping container '{CONTAINER_NAME}'...")
+    print(f"[1/3] Stopping container '{CONTAINER_NAME}'...")
     result = run_command(["docker", "stop", CONTAINER_NAME], check=False, silent=True)
     if result.returncode == 0:
         print("✓ Container stopped")
@@ -176,12 +177,20 @@ def stop_server():
         print("⚠ Container was not running or already stopped")
 
     print()
-    print(f"[2/2] Removing container '{CONTAINER_NAME}'...")
+    print(f"[2/3] Removing container '{CONTAINER_NAME}'...")
     result = run_command(["docker", "rm", CONTAINER_NAME], check=False, silent=True)
     if result.returncode == 0:
         print("✓ Container removed")
     else:
         print("⚠ Container was already removed")
+
+    print()
+    print("[3/3] Removing export volume 'nfs_exports'...")
+    result = run_command(["docker", "volume", "rm", "nfs_exports"], check=False, silent=True)
+    if result.returncode == 0:
+        print("✓ Volume removed")
+    else:
+        print("⚠ Volume was already removed")
 
     print()
     return 0

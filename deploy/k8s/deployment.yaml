@@ -36,7 +36,21 @@ spec:
               cpu: "500m"
       volumes:
         - name: nfs-exports
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nfs-exports
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-exports
+  labels:
+    app: arcticwolf
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
