@@ -1,0 +1,18 @@
+# Arctic Wolf NFS Server Configuration
+# Copy this file to /etc/arcticwolf/config.toml
+
+[server]
+# Listen address (default: "0.0.0.0")
+bind_address = "0.0.0.0"
+# Server port (default: 4000)
+port = 4000
+
+[fsal]
+# Filesystem backend type: "local" (default: "local")
+backend = "local"
+# NFS export root directory (default: "/tmp/nfs_exports")
+export_path = "/tmp/nfs_exports"
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace" (default: "info")
+level = "info"
