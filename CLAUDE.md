@@ -65,3 +65,29 @@ Using structs for optional fields causes "failed to fill whole buffer" errors wi
 5. Implement in `src/fsal/local.rs`
 6. Add test: `tests/test_nfs_operation.py`
 
+## Code Quality Guidelines
+
+### Logging Initialization Order
+Do not use `tracing::info!` or other tracing macros before `tracing_subscriber::init()` - messages will be silently dropped. Use `println!` or `eprintln!` for output before tracing is initialized.
+
+### Handle Invalid User Input Explicitly
+Avoid silent fallbacks with `.parse().unwrap_or(default)`. Instead, warn users about invalid configuration:
+```rust
+let value = match input.parse() {
+    Ok(v) => v,
+    Err(_) => {
+        eprintln!("Warning: Invalid value '{}', falling back to default", input);
+        default
+    }
+};
+```
+
+### Avoid Redundant Output
+Review startup messages to ensure each piece of information is shown only once. Don't print the same value in multiple places.
+
+### Config Fields Must Be Used or Validated
+If a config field is displayed but not used to control behavior, users will be misled. Either:
+- Remove the field if not needed
+- Validate and error on unsupported values
+- Actually use the field to control behavior
+
