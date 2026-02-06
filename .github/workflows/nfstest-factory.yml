@@ -45,8 +45,6 @@ jobs:
           sed -i '/imagePullPolicy/d' deploy/k8s/deployment.yaml
           # Add imagePullPolicy: Never for local image
           sed -i 's|image: arcticwolf:test|image: arcticwolf:test\n          imagePullPolicy: Never|g' deploy/k8s/deployment.yaml
-          # Set RUST_LOG to debug for testing
-          sed -i 's|value: "info"|value: "debug"|g' deploy/k8s/deployment.yaml
           kubectl apply -f deploy/k8s/deployment.yaml
           kubectl wait --for=condition=Ready pod -l app=arcticwolf --timeout=120s
 
