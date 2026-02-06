@@ -8,7 +8,36 @@ import time
 import shutil
 from pathlib import Path
 
+import tempfile
+
 from config import Config, CONTAINER_NAME, NFS_PORT, QEMU_MEMORY, VM_SSH_PORT, VM_PASSWORD, RUNNER_SCRIPT, PROJECT_ROOT
+
+# Config file paths
+EXAMPLE_CONFIG = PROJECT_ROOT / "arcticwolf.example.toml"
+
+
+def create_debug_config():
+    """Create a patched config file with debug logging enabled.
+
+    Returns the path to a temporary config file that should be mounted
+    into the container at /etc/arcticwolf/config.toml.
+    """
+    import re
+
+    # Read the example config
+    with open(EXAMPLE_CONFIG, 'r') as f:
+        content = f.read()
+
+    # Patch log level to debug using regex
+    # Matches: level = "info" (or any other level)
+    content = re.sub(r'^level\s*=\s*"[^"]*"', 'level = "debug"', content, flags=re.MULTILINE)
+
+    # Write to temp file (caller is responsible for cleanup)
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False)
+    tmp.write(content)
+    tmp.close()
+
+    return tmp.name
 
 
 def run_command(cmd, check=True, shell=False, cwd=None, silent=False, stream=False):
@@ -139,22 +168,32 @@ def start_server(cfg):
     print()
 
     # Check if container already running
-    print("[1/2] Checking container status...")
+    print("[1/3] Checking container status...")
     if is_container_running(CONTAINER_NAME):
         print("⚠ NFS server container already running - skipping start")
         print()
         return 0
 
+    # Create patched config with debug logging
+    print()
+    print("[2/3] Creating debug config...")
+    print(f"  Source: {EXAMPLE_CONFIG}")
+    config_path = create_debug_config()
+    print(f"  Patched config: {config_path}")
+    print("✓ Config patched with logging.level = 'debug'")
+
     # Start container
     print()
-    print(f"[2/2] Starting container '{CONTAINER_NAME}'...")
+    print(f"[3/3] Starting container '{CONTAINER_NAME}'...")
     print(f"  Image: {cfg.docker_image}")
     print(f"  Port mapping: {NFS_PORT}:{NFS_PORT}")
+    print(f"  Config mount: {config_path} -> /etc/arcticwolf/config.toml")
     run_command([
         "docker", "run", "-d",
         "--name", CONTAINER_NAME,
         "-p", f"{NFS_PORT}:{NFS_PORT}",
         "-v", "nfs_exports:/tmp/nfs_exports",
+        "-v", f"{config_path}:/etc/arcticwolf/config.toml:ro",
         cfg.docker_image
     ])
     print(f"✓ NFS server container started in background")
