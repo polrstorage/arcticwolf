@@ -7,6 +7,10 @@ Purpose: Test directory listing functionality
 import socket
 import struct
 import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -109,7 +113,9 @@ def test_nfs_readdir():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
+    print(f"  Discovered MOUNT port: {mount_port}")
 
     # Step 1: MOUNT to get root handle
     print("Step 1: MOUNT /")
@@ -117,7 +123,7 @@ def test_nfs_readdir():
     mount_xid = 800001
     mount_args = pack_string("/")
 
-    reply_data = rpc_call(host, port, mount_xid, 100005, 3, 1, mount_args)
+    reply_data = rpc_call(host, mount_port, mount_xid, 100005, 3, 1, mount_args)
 
     offset = parse_rpc_reply(reply_data)
 

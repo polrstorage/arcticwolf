@@ -10,9 +10,13 @@ This test validates:
 4. Test error handling for non-existent files
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -106,7 +110,8 @@ def test_nfs_lookup():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
 
     # Step 1: Call MOUNT to get root file handle
     print("Step 1: MOUNT to get root file handle")
@@ -124,7 +129,7 @@ def test_nfs_lookup():
     print(f"  Calling MOUNT MNT for path: {dirpath}")
 
     try:
-        reply_data = rpc_call(host, port, mount_xid, mount_prog, mount_vers, mount_proc, mount_args)
+        reply_data = rpc_call(host, mount_port, mount_xid, mount_prog, mount_vers, mount_proc, mount_args)
 
         # Parse RPC reply
         _, _, _, offset = parse_rpc_reply(reply_data)

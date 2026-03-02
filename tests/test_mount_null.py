@@ -9,9 +9,13 @@ This test validates:
 3. RPC response format for MOUNT protocol
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def test_mount_null():
@@ -23,7 +27,8 @@ def test_mount_null():
 
     # Server connection details
     host = "localhost"
-    port = 4000
+    port = portmap_getport(host, 100005, 3)
+    print(f"  Discovered MOUNT port via portmapper: {port}")
     xid = 67890  # Transaction ID
 
     print(f"Connecting to {host}:{port}")

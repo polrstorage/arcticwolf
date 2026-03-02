@@ -8,7 +8,8 @@ data:
   config.toml: |
     [server]
     bind_address = "0.0.0.0"
-    port = 4000
+    nfs_port = 2049
+    mount_port = 0
 
     [fsal]
     backend = "local"
@@ -33,11 +34,15 @@ spec:
       labels:
         app: arcticwolf
     spec:
+      hostNetwork: true
       containers:
         - name: arcticwolf
           image: freezevicente/arcticwolf:latest
           ports:
-            - containerPort: 4000
+            - containerPort: 111
+              name: portmap
+              protocol: TCP
+            - containerPort: 2049
               name: nfs
               protocol: TCP
           env:
@@ -76,20 +81,3 @@ spec:
   resources:
     requests:
       storage: 1Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: arcticwolf
-  labels:
-    app: arcticwolf
-spec:
-  type: NodePort
-  ports:
-    - port: 4000
-      targetPort: 4000
-      nodePort: 30400
-      protocol: TCP
-      name: nfs
-  selector:
-    app: arcticwolf

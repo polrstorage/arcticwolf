@@ -31,7 +31,8 @@ pub struct Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind_address: String,
-    pub port: u16,
+    pub nfs_port: u16,
+    pub mount_port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,7 +52,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0".to_string(),
-            port: 4000,
+            nfs_port: 2049,
+            mount_port: 0, // 0 = dynamic (OS-assigned)
         }
     }
 }
@@ -100,9 +102,9 @@ impl Config {
         }
     }
 
-    /// Get the server bind address with port
-    pub fn bind_addr(&self) -> String {
-        format!("{}:{}", self.server.bind_address, self.server.port)
+    /// Get the bind address for a specific port
+    pub fn bind_addr_for(&self, port: u16) -> String {
+        format!("{}:{}", self.server.bind_address, port)
     }
 }
 
@@ -114,7 +116,8 @@ mod tests {
     fn test_server_config_default() {
         let config = ServerConfig::default();
         assert_eq!(config.bind_address, "0.0.0.0");
-        assert_eq!(config.port, 4000);
+        assert_eq!(config.nfs_port, 2049);
+        assert_eq!(config.mount_port, 0);
     }
 
     #[test]
@@ -134,21 +137,22 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
         assert_eq!(config.server.bind_address, "0.0.0.0");
-        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.server.nfs_port, 2049);
+        assert_eq!(config.server.mount_port, 0);
         assert_eq!(config.fsal.backend, "local");
         assert_eq!(config.fsal.export_path, PathBuf::from("/tmp/nfs_exports"));
         assert!(config.logging.level.is_none());
     }
 
     #[test]
-    fn test_bind_addr() {
+    fn test_bind_addr_for() {
         let config = Config::default();
-        assert_eq!(config.bind_addr(), "0.0.0.0:4000");
+        assert_eq!(config.bind_addr_for(2049), "0.0.0.0:2049");
+        assert_eq!(config.bind_addr_for(111), "0.0.0.0:111");
 
         let mut custom = Config::default();
         custom.server.bind_address = "127.0.0.1".to_string();
-        custom.server.port = 2049;
-        assert_eq!(custom.bind_addr(), "127.0.0.1:2049");
+        assert_eq!(custom.bind_addr_for(2049), "127.0.0.1:2049");
     }
 
     #[test]
@@ -172,7 +176,8 @@ mod tests {
         let toml = r#"
             [server]
             bind_address = "192.168.1.100"
-            port = 2049
+            nfs_port = 2049
+            mount_port = 20048
 
             [fsal]
             backend = "local"
@@ -184,7 +189,8 @@ mod tests {
 
         let config: Config = toml::from_str(toml).expect("Failed to parse TOML");
         assert_eq!(config.server.bind_address, "192.168.1.100");
-        assert_eq!(config.server.port, 2049);
+        assert_eq!(config.server.nfs_port, 2049);
+        assert_eq!(config.server.mount_port, 20048);
         assert_eq!(config.fsal.backend, "local");
         assert_eq!(config.fsal.export_path, PathBuf::from("/data/exports"));
         assert_eq!(config.logging.level, Some("trace".to_string()));
@@ -195,12 +201,13 @@ mod tests {
         // Only specify server section, others should use defaults
         let toml = r#"
             [server]
-            port = 8000
+            nfs_port = 8000
         "#;
 
         let config: Config = toml::from_str(toml).expect("Failed to parse TOML");
         assert_eq!(config.server.bind_address, "0.0.0.0"); // default
-        assert_eq!(config.server.port, 8000); // custom
+        assert_eq!(config.server.nfs_port, 8000); // custom
+        assert_eq!(config.server.mount_port, 0); // default
         assert_eq!(config.fsal.backend, "local"); // default
         assert_eq!(config.fsal.export_path, PathBuf::from("/tmp/nfs_exports")); // default
         assert!(config.logging.level.is_none()); // default
@@ -210,7 +217,8 @@ mod tests {
     fn test_parse_empty_toml() {
         let config: Config = toml::from_str("").expect("Failed to parse empty TOML");
         assert_eq!(config.server.bind_address, "0.0.0.0");
-        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.server.nfs_port, 2049);
+        assert_eq!(config.server.mount_port, 0);
         assert_eq!(config.fsal.backend, "local");
     }
 

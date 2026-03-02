@@ -49,7 +49,7 @@ image:
     ARG IMAGE_TAG=latest
     FROM +common
     RUN cargo build --release
-    EXPOSE 4000
+    EXPOSE 111 2049
     ENTRYPOINT ["./target/release/arcticwolf"]
     SAVE IMAGE ${IMAGE_REPO}/arcticwolf:${IMAGE_TAG}
 
@@ -61,7 +61,7 @@ server-docker:
     FROM +common
     RUN cargo build
     ENV RUST_LOG=debug
-    EXPOSE 4000
+    EXPOSE 111 2049
     ENTRYPOINT ["./target/debug/arcticwolf"]
     SAVE IMAGE ${IMAGE_NAME}:${IMAGE_TAG}
 

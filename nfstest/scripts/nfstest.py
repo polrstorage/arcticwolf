@@ -10,7 +10,7 @@ from pathlib import Path
 
 import tempfile
 
-from config import Config, CONTAINER_NAME, NFS_PORT, QEMU_MEMORY, VM_SSH_PORT, VM_PASSWORD, RUNNER_SCRIPT, PROJECT_ROOT
+from config import Config, CONTAINER_NAME, PORTMAP_PORT, NFS_PORT, QEMU_MEMORY, VM_SSH_PORT, VM_PASSWORD, RUNNER_SCRIPT, PROJECT_ROOT
 
 # Config file paths
 EXAMPLE_CONFIG = PROJECT_ROOT / "arcticwolf.example.toml"
@@ -186,12 +186,12 @@ def start_server(cfg):
     print()
     print(f"[3/3] Starting container '{CONTAINER_NAME}'...")
     print(f"  Image: {cfg.docker_image}")
-    print(f"  Port mapping: {NFS_PORT}:{NFS_PORT}")
+    print(f"  Network: host")
     print(f"  Config mount: {config_path} -> /etc/arcticwolf/config.toml")
     run_command([
         "docker", "run", "-d",
         "--name", CONTAINER_NAME,
-        "-p", f"{NFS_PORT}:{NFS_PORT}",
+        "--network", "host",
         "-v", "nfs_exports:/tmp/nfs_exports",
         "-v", f"{config_path}:/etc/arcticwolf/config.toml:ro",
         cfg.docker_image

@@ -8,7 +8,7 @@ This script sends a simple RPC NULL procedure call and expects a success respons
 import socket
 import struct
 
-def send_rpc_null_call(host='localhost', port=4000):
+def send_rpc_null_call(host='localhost', port=2049):
     """Send an RPC NULL call and verify the response"""
 
     # Build RPC call message
@@ -123,7 +123,7 @@ def send_rpc_null_call(host='localhost', port=4000):
 if __name__ == '__main__':
     import sys
     host = sys.argv[1] if len(sys.argv) > 1 else 'localhost'
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 4000
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 2049
 
     success = send_rpc_null_call(host, port)
     sys.exit(0 if success else 1)

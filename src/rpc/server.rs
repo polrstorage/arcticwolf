@@ -14,33 +14,63 @@ use crate::portmap::Registry;
 use crate::protocol::v3::rpc::RpcMessage;
 
 /// RPC server handling TCP connections with record marking
+///
+/// Each server instance listens on a single port and only handles
+/// requests for the specified RPC programs (allowed_programs).
 pub struct RpcServer {
-    addr: String,
+    listener: TcpListener,
     registry: Registry,
     filesystem: Arc<dyn Filesystem>,
+    allowed_programs: Vec<u32>,
 }
 
 impl RpcServer {
-    pub fn new(addr: String, registry: Registry, filesystem: Arc<dyn Filesystem>) -> Self {
-        Self {
-            addr,
+    /// Bind to the given address and create an RPC server.
+    ///
+    /// The server only accepts RPC calls for programs in `allowed_programs`.
+    /// Use `local_port()` after binding to discover the actual port (useful when binding to port 0).
+    pub async fn bind(
+        addr: &str,
+        registry: Registry,
+        filesystem: Arc<dyn Filesystem>,
+        allowed_programs: Vec<u32>,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        info!("RPC server bound to {}", listener.local_addr()?);
+        Ok(Self {
+            listener,
             registry,
             filesystem,
-        }
+            allowed_programs,
+        })
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.addr).await?;
-        info!("RPC server listening on {}", self.addr);
+    /// Get the actual local port this server is bound to.
+    ///
+    /// Useful when binding to port 0 (dynamic allocation).
+    pub fn local_port(&self) -> Result<u16> {
+        Ok(self.listener.local_addr()?.port())
+    }
+
+    /// Start accepting connections and serving RPC requests.
+    pub async fn serve(&self) -> Result<()> {
+        info!(
+            "RPC server listening on {} for programs {:?}",
+            self.listener.local_addr()?,
+            self.allowed_programs
+        );
 
         loop {
-            let (socket, peer_addr) = listener.accept().await?;
+            let (socket, peer_addr) = self.listener.accept().await?;
             info!("New connection from {}", peer_addr);
 
             let registry = self.registry.clone();
             let filesystem = self.filesystem.clone();
+            let allowed_programs = self.allowed_programs.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, registry, filesystem).await {
+                if let Err(e) =
+                    handle_connection(socket, registry, filesystem, &allowed_programs).await
+                {
                     error!("Connection error from {}: {}", peer_addr, e);
                 }
             });
@@ -53,6 +83,7 @@ async fn handle_connection(
     mut socket: TcpStream,
     registry: Registry,
     filesystem: Arc<dyn Filesystem>,
+    allowed_programs: &[u32],
 ) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(8192);
 
@@ -82,32 +113,36 @@ async fn handle_connection(
         if is_last {
             debug!("Complete RPC message received ({} bytes)", buffer.len());
 
-            let response = match handle_rpc_message(&buffer, &registry, filesystem.as_ref()).await {
-                Ok(response) => response,
-                Err(e) => {
-                    error!("Failed to handle RPC message: {}", e);
+            let response =
+                match handle_rpc_message(&buffer, &registry, filesystem.as_ref(), allowed_programs)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("Failed to handle RPC message: {}", e);
 
-                    // Try to parse XID from buffer to send proper error response
-                    if buffer.len() >= 4 {
-                        let xid = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                        // Try to parse XID from buffer to send proper error response
+                        if buffer.len() >= 4 {
+                            let xid =
+                                u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
 
-                        // Send PROG_UNAVAIL error response
-                        match RpcMessage::create_prog_unavail_reply(xid) {
-                            Ok(error_response) => {
-                                warn!("Sending PROG_UNAVAIL error response for xid={}", xid);
-                                error_response
+                            // Send PROG_UNAVAIL error response
+                            match RpcMessage::create_prog_unavail_reply(xid) {
+                                Ok(error_response) => {
+                                    warn!("Sending PROG_UNAVAIL error response for xid={}", xid);
+                                    error_response
+                                }
+                                Err(serialize_err) => {
+                                    error!("Failed to create error response: {}", serialize_err);
+                                    continue; // Skip this message and wait for next one
+                                }
                             }
-                            Err(serialize_err) => {
-                                error!("Failed to create error response: {}", serialize_err);
-                                continue; // Skip this message and wait for next one
-                            }
+                        } else {
+                            error!("Buffer too short to extract XID");
+                            continue; // Skip this message and wait for next one
                         }
-                    } else {
-                        error!("Buffer too short to extract XID");
-                        continue; // Skip this message and wait for next one
                     }
-                }
-            };
+                };
 
             // Send response with record marking
             // IMPORTANT: Record mark and payload must be sent in a single write()
@@ -138,6 +173,7 @@ async fn handle_rpc_message(
     data: &[u8],
     registry: &Registry,
     filesystem: &dyn Filesystem,
+    allowed_programs: &[u32],
 ) -> Result<BytesMut> {
     // Debug: dump complete RPC message
     debug!(
@@ -153,6 +189,15 @@ async fn handle_rpc_message(
         "RPC call: xid={}, prog={}, vers={}, proc={}",
         call.xid, call.prog, call.vers, call.proc_
     );
+
+    // Check if this program is allowed on this server instance
+    if !allowed_programs.contains(&call.prog) {
+        warn!(
+            "Program {} not allowed on this port (allowed: {:?})",
+            call.prog, allowed_programs
+        );
+        return Err(anyhow!("Program {} not served on this port", call.prog));
+    }
 
     // Calculate where procedure arguments start (after RPC call header)
     // RPC call header: xid(4) + mtype(4) + rpcvers(4) + prog(4) + vers(4) + proc(4) = 24 bytes

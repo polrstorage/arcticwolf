@@ -23,7 +23,7 @@ def test_portmap_getport():
 
     # Server connection details
     host = "localhost"
-    port = 4000
+    port = 111
     xid = 55555
 
     print(f"Connecting to {host}:{port}")

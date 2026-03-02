@@ -4,9 +4,13 @@ Test: NFS REMOVE Procedure
 Purpose: Test file removal functionality
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -171,8 +175,9 @@ def test_remove(host, port):
 
     # Step 1: Mount to get root file handle
     print("\n1. Calling MOUNT...")
+    mount_port = portmap_getport(host, 100005, 3)
     mount_args = pack_string("/tmp/nfs_exports")
-    mount_reply = rpc_call(host, port, 1, 100005, 3, 1, mount_args)
+    mount_reply = rpc_call(host, mount_port, 1, 100005, 3, 1, mount_args)
     offset = parse_rpc_reply(mount_reply)
 
     # Parse MOUNT reply
@@ -299,8 +304,9 @@ def test_remove_nonexistent(host, port):
 
     # Step 1: Mount to get root file handle
     print("\n1. Calling MOUNT...")
+    mount_port = portmap_getport(host, 100005, 3)
     mount_args = pack_string("/tmp/nfs_exports")
-    mount_reply = rpc_call(host, port, 5, 100005, 3, 1, mount_args)
+    mount_reply = rpc_call(host, mount_port, 5, 100005, 3, 1, mount_args)
     offset = parse_rpc_reply(mount_reply)
 
     status = struct.unpack('>I', mount_reply[offset:offset+4])[0]

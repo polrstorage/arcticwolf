@@ -4,9 +4,13 @@ Test: NFS LOOKUP Procedure - Specific File Test
 Purpose: Test NFS LOOKUP with a specific known file
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -85,14 +89,15 @@ def test_lookup_specific_file():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
 
     # Step 1: MOUNT
     print("Step 1: MOUNT /")
     mount_xid = 300001
     mount_args = pack_string("/")
 
-    reply_data = rpc_call(host, port, mount_xid, 100005, 3, 1, mount_args)
+    reply_data = rpc_call(host, mount_port, mount_xid, 100005, 3, 1, mount_args)
 
     # Parse MOUNT reply
     root_fhandle, _ = unpack_opaque_flex(reply_data, 24)

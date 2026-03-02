@@ -48,14 +48,13 @@ jobs:
           kubectl apply -f deploy/k8s/deployment.yaml
           kubectl wait --for=condition=Ready pod -l app=arcticwolf --timeout=120s
 
-      - name: Get service info
+      - name: Get pod info
         run: |
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
           kubectl get pods -o wide
-          kubectl get svc arcticwolf
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           echo "NODE_IP=${NODE_IP}" >> $GITHUB_ENV
-          echo "NFS server available at ${NODE_IP}:30400"
+          echo "NFS server available at ${NODE_IP} (hostNetwork)"
 
       - name: Install NFS client tools
         run: |
@@ -65,7 +64,7 @@ jobs:
       - name: Mount NFS
         run: |
           sudo mkdir -p /mnt/nfs
-          sudo mount -t nfs -o port=30400,mountport=30400,nfsvers=3,tcp,nolock ${NODE_IP}:/ /mnt/nfs
+          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/ /mnt/nfs
           echo "NFS mounted successfully"
           ls -la /mnt/nfs/
 
@@ -75,8 +74,8 @@ jobs:
         run: |
           docker run --network host --privileged --rm \
             registry.opensuse.org/home/vcheng/containers/containers/nfstester:latest \
-            nfstest_posix -s localhost -p 30400 --nfsversion=3 \
-            -o mountport=30400,nolock,noresvport,nordirplus \
+            nfstest_posix -s localhost --nfsversion=3 \
+            -o nolock,noresvport \
             --runtest=read,write
 
       - name: Get pod logs
