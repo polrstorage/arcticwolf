@@ -10,9 +10,13 @@ This test validates:
 4. mountres3 union parsing
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_xdr_string(s):
@@ -48,7 +52,8 @@ def test_mount_mnt():
 
     # Server connection details
     host = "localhost"
-    port = 4000
+    port = portmap_getport(host, 100005, 3)
+    print(f"  Discovered MOUNT port via portmapper: {port}")
     xid = 99999  # Transaction ID
     mount_path = "/export/test"
 

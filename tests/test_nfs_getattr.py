@@ -31,7 +31,7 @@ def test_nfs_getattr():
 
     # Server connection details
     host = "localhost"
-    port = 4000
+    port = 2049
     xid = 99998
 
     print(f"Connecting to {host}:{port}")

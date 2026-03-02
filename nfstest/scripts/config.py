@@ -9,7 +9,8 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 # Docker configuration
 CONTAINER_NAME = "arcticwolf-server"
-NFS_PORT = 4000
+PORTMAP_PORT = 111
+NFS_PORT = 2049
 
 # VM configuration
 QEMU_MEMORY = "512M"

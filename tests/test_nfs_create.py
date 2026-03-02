@@ -13,6 +13,10 @@ This test validates:
 import socket
 import struct
 import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -202,7 +206,9 @@ def test_nfs_create():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
+    print(f"  Discovered MOUNT port: {mount_port}")
 
     # Test file
     test_filename = "test_create_new_file.txt"
@@ -215,7 +221,7 @@ def test_nfs_create():
     mount_xid = 600001
     mount_args = pack_string("/")
 
-    reply_data = rpc_call(host, port, mount_xid, 100005, 3, 1, mount_args)
+    reply_data = rpc_call(host, mount_port, mount_xid, 100005, 3, 1, mount_args)
     offset = parse_rpc_reply(reply_data)
 
     mount_status = struct.unpack('>I', reply_data[offset:offset+4])[0]

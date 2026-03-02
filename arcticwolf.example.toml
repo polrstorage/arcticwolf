@@ -4,8 +4,11 @@
 [server]
 # Listen address (default: "0.0.0.0")
 bind_address = "0.0.0.0"
-# Server port (default: 4000)
-port = 4000
+# NFS port (default: 2049)
+nfs_port = 2049
+# Mount daemon port (default: 0 = dynamic, OS-assigned)
+# Portmapper is always on port 111 (RFC 1833)
+mount_port = 0
 
 [fsal]
 # Filesystem backend type: "local" (default: "local")

@@ -9,9 +9,13 @@ This test validates the full workflow:
 3. Verify file attributes are valid
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -90,7 +94,8 @@ def test_nfs_getattr_with_mount():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
 
     # Step 1: Call MOUNT to get root file handle
     print("Step 1: MOUNT to get root file handle")
@@ -108,7 +113,7 @@ def test_nfs_getattr_with_mount():
     print(f"  Calling MOUNT MNT for path: {dirpath}")
 
     try:
-        reply_data = rpc_call(host, port, mount_xid, mount_prog, mount_vers, mount_proc, mount_args)
+        reply_data = rpc_call(host, mount_port, mount_xid, mount_prog, mount_vers, mount_proc, mount_args)
 
         # Parse MOUNT reply
         # Format: xid(4) + reply_stat(4) + verf_flavor(4) + verf_len(4) + accept_stat(4)

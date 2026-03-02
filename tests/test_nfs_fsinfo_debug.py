@@ -4,9 +4,13 @@ Test: NFS FSINFO Response Format Debug
 Purpose: Debug FSINFO response format to identify parsing issues
 """
 
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rpc_helpers import portmap_getport
 
 
 def pack_string(s):
@@ -97,7 +101,8 @@ def test_fsinfo_format():
     print()
 
     host = "localhost"
-    port = 4000
+    port = 2049
+    mount_port = portmap_getport(host, 100005, 3)
 
     # Step 1: MOUNT to get root handle
     print("Step 1: MOUNT /")
@@ -105,7 +110,7 @@ def test_fsinfo_format():
     mount_xid = 600001
     mount_args = pack_string("/")
 
-    reply_data = rpc_call(host, port, mount_xid, 100005, 3, 1, mount_args)
+    reply_data = rpc_call(host, mount_port, mount_xid, 100005, 3, 1, mount_args)
 
     print(f"  MOUNT response length: {len(reply_data)} bytes")
 

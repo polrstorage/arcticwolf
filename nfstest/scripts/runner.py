@@ -13,7 +13,8 @@ import time
 
 # Configuration
 NFS_SERVER = "10.0.2.2"  # Host via QEMU user networking
-NFS_PORT = 4000
+PORTMAP_PORT = 111
+NFS_PORT = 2049
 MOUNT_POINT = "/mnt/nfstest"
 NFSTEST_DIR = "/opt/nfstest"
 
@@ -63,9 +64,8 @@ def run_nfstest(testcase="read,write"):
         "--export", "/",
         "--mtpoint", MOUNT_POINT,
         "--nfsversion", "3",
-        "--port", str(NFS_PORT),
         f"--runtest={testcase}",
-        "--mtopts", f"vers=3,proto=tcp,port={NFS_PORT},mountport={NFS_PORT},nolock,noresvport"
+        "--mtopts", "vers=3,proto=tcp,nolock,noresvport"
     ]
 
     # Flush before subprocess to ensure ordering
