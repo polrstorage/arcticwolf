@@ -5,6 +5,7 @@
 
 pub mod handle;
 pub mod local;
+pub mod quota;
 
 // Future backends (uncomment when implemented)
 // #[cfg(feature = "s3")]
