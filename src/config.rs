@@ -6,6 +6,7 @@
 
 use clap::Parser;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/arcticwolf/config.toml";
@@ -57,6 +58,11 @@ pub struct QuotaConfig {
     pub enabled: bool,
     /// Path to the redb database file storing quota limits and usage
     pub db_path: PathBuf,
+    /// Declarative quota bootstrap: map of first-level subdirectory name
+    /// to a size string (e.g. "10GB"). Each entry is applied at startup
+    /// only when the directory has no existing quota entry, so the
+    /// bootstrap is idempotent and safe across restarts.
+    pub bootstrap: HashMap<String, String>,
 }
 
 impl Default for QuotaConfig {
@@ -64,6 +70,7 @@ impl Default for QuotaConfig {
         Self {
             enabled: false,
             db_path: PathBuf::from(DEFAULT_QUOTA_DB_PATH),
+            bootstrap: HashMap::new(),
         }
     }
 }
@@ -313,6 +320,31 @@ mod tests {
         let config: Config = toml::from_str(toml).expect("Failed to parse TOML");
         assert!(config.quota.enabled);
         assert_eq!(config.quota.db_path, PathBuf::from("/tmp/quota.db"));
+        assert!(config.quota.bootstrap.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quota_bootstrap_toml() {
+        let toml = r#"
+            [quota]
+            enabled = true
+            db_path = "/tmp/quota.db"
+
+            [quota.bootstrap]
+            "pvc-a" = "10GB"
+            "pvc-b" = "1MB"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("Failed to parse TOML");
+        assert_eq!(config.quota.bootstrap.len(), 2);
+        assert_eq!(
+            config.quota.bootstrap.get("pvc-a"),
+            Some(&"10GB".to_string())
+        );
+        assert_eq!(
+            config.quota.bootstrap.get("pvc-b"),
+            Some(&"1MB".to_string())
+        );
     }
 
     #[test]

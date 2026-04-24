@@ -19,3 +19,21 @@ export_path = "/tmp/nfs_exports"
 [logging]
 # Log level: "error", "warn", "info", "debug", "trace" (default: "info")
 level = "info"
+
+[quota]
+# Enable folder quota enforcement (default: false)
+# When enabled, first-level subdirectories under export_path may be
+# assigned a byte limit; writes past the limit return NFS3ERR_DQUOT.
+enabled = false
+# redb database storing quota limits and tracked usage.
+# The parent directory is created at startup if missing.
+db_path = "/var/lib/arcticwolf/quota.db"
+
+# Optional declarative bootstrap. Each entry sets a quota on the first-
+# level subdirectory at startup, but only if the directory has no quota
+# entry yet. This keeps the bootstrap idempotent: editing it after initial
+# rollout will not clobber the tracked usage.
+#
+# Sizes support suffixes B, KB, MB, GB, TB (1024-based).
+# [quota.bootstrap]
+# "pvc-example" = "10GB"

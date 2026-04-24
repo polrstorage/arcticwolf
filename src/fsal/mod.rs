@@ -18,6 +18,7 @@ pub mod quota;
 use crate::config::QuotaConfig;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -346,6 +347,17 @@ pub trait Filesystem: Send + Sync {
     /// The default implementation does nothing. Backends that support
     /// quotas override this to spawn their own task.
     fn start_quota_reconciliation(&self) {}
+
+    /// Apply a declarative quota bootstrap at startup. Entries install
+    /// a quota only when the target directory has none yet; already
+    /// tracked directories are left alone so the bootstrap is
+    /// idempotent across restarts.
+    ///
+    /// The default implementation does nothing. Backends that support
+    /// quotas override this.
+    async fn apply_quota_bootstrap(&self, _bootstrap: &HashMap<String, String>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Filesystem backend types

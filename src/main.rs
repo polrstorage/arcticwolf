@@ -130,6 +130,21 @@ async fn main() -> Result<()> {
     let root_handle = filesystem.root_handle().await;
     println!("  Root handle: {} bytes", root_handle.len());
 
+    // Apply any declarative bootstrap entries from config before taking
+    // traffic. The backend silently ignores bootstrap when quota is
+    // disabled, so gate the user-facing message on the same flag —
+    // otherwise operators see "applied N entries" even when nothing
+    // actually took effect.
+    if config.quota.enabled && !config.quota.bootstrap.is_empty() {
+        filesystem
+            .apply_quota_bootstrap(&config.quota.bootstrap)
+            .await?;
+        println!(
+            "  Quota bootstrap: applied {} entries",
+            config.quota.bootstrap.len()
+        );
+    }
+
     // Kick off a background pass that reconciles stored quota usage with
     // the actual on-disk size. The server starts accepting traffic
     // immediately; drift from out-of-band filesystem changes is corrected

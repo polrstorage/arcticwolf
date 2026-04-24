@@ -1118,6 +1118,22 @@ impl Filesystem for LocalFilesystem {
             tracing::info!("Quota reconciliation task finished");
         });
     }
+
+    async fn apply_quota_bootstrap(
+        &self,
+        bootstrap: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let Some(ref qm) = self.quota_manager else {
+            if !bootstrap.is_empty() {
+                tracing::warn!(
+                    "Quota bootstrap requested but quota is disabled; ignoring {} entries",
+                    bootstrap.len()
+                );
+            }
+            return Ok(());
+        };
+        qm.apply_bootstrap(bootstrap).await
+    }
 }
 
 /// Logically normalize a path: collapse `.` and `..` components and
@@ -1614,6 +1630,7 @@ mod tests {
         let quota_cfg = QuotaConfig {
             enabled: true,
             db_path: db_dir.path().join("quota.db"),
+            bootstrap: std::collections::HashMap::new(),
         };
         let fs = LocalFilesystem::new(export_dir.path(), Some(&quota_cfg))
             .expect("Failed to create filesystem with quota");
@@ -1636,6 +1653,7 @@ mod tests {
         let quota_cfg = QuotaConfig {
             enabled: false,
             db_path: db.path().join("quota.db"),
+            bootstrap: std::collections::HashMap::new(),
         };
         let fs = LocalFilesystem::new(export.path(), Some(&quota_cfg)).unwrap();
         assert!(
@@ -1659,6 +1677,7 @@ mod tests {
         let cfg = QuotaConfig {
             enabled: true,
             db_path: export.path().join("quota.db"),
+            bootstrap: std::collections::HashMap::new(),
         };
         match LocalFilesystem::new(export.path(), Some(&cfg)) {
             Ok(_) => panic!("LocalFilesystem::new should reject db inside export"),
@@ -1677,6 +1696,7 @@ mod tests {
         let cfg = QuotaConfig {
             enabled: true,
             db_path: nested.join("quota.db"),
+            bootstrap: std::collections::HashMap::new(),
         };
         match LocalFilesystem::new(export.path(), Some(&cfg)) {
             Ok(_) => panic!("nested-under-root db path should be rejected"),
@@ -1695,6 +1715,7 @@ mod tests {
         let cfg = QuotaConfig {
             enabled: true,
             db_path: db_dir.path().join("quota.db"),
+            bootstrap: std::collections::HashMap::new(),
         };
         let fs = LocalFilesystem::new(export.path(), Some(&cfg))
             .expect("db outside export should be accepted");
@@ -1712,6 +1733,7 @@ mod tests {
         let cfg = QuotaConfig {
             enabled: true,
             db_path: sneaky,
+            bootstrap: std::collections::HashMap::new(),
         };
         match LocalFilesystem::new(export.path(), Some(&cfg)) {
             Ok(_) => panic!("dotdot-relative db inside export should be rejected"),
@@ -2260,6 +2282,30 @@ mod tests {
         let (fs, _export) = create_test_fs();
         // Must not panic even though no quota manager is configured.
         fs.start_quota_reconciliation();
+    }
+
+    #[tokio::test]
+    async fn test_apply_quota_bootstrap_seeds_new_entries() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("pvc-a".to_string(), "1MB".to_string());
+
+        fs.apply_quota_bootstrap(&bootstrap).await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some((1024 * 1024, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_quota_bootstrap_noop_when_quota_disabled() {
+        let (fs, _export) = create_test_fs();
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("pvc-a".to_string(), "1MB".to_string());
+
+        // Should not error even though no quota manager is configured;
+        // the entries are logged and discarded.
+        fs.apply_quota_bootstrap(&bootstrap).await.unwrap();
     }
 
     #[tokio::test]

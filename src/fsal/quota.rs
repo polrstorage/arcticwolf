@@ -7,10 +7,6 @@
 // root (e.g. a PVC folder). Operations that cross into a quota directory
 // consult this manager before and after the underlying filesystem call.
 
-// API is exercised by unit tests; wiring into LocalFilesystem lands in a
-// later stage of the folder-quota rollout.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -222,6 +218,8 @@ impl QuotaManager {
     /// state (either the old limit, or removal of a freshly inserted
     /// entry).
     pub async fn set_quota(&self, quota_dir: &str, limit: u64) -> Result<()> {
+        validate_quota_dir(quota_dir)?;
+
         let mut entries = self.entries.write().await;
 
         let previous_limit = entries.get(quota_dir).map(|e| e.limit);
@@ -254,6 +252,11 @@ impl QuotaManager {
     ///
     /// The cache entry is reinstated if the redb removal fails so the
     /// in-memory and on-disk views stay in sync.
+    ///
+    /// Currently only exercised by unit tests — no runtime code path
+    /// removes a quota — but the API is kept ready for an admin tool
+    /// that needs to retire a PVC entry without restarting the server.
+    #[allow(dead_code)]
     pub async fn remove_quota(&self, quota_dir: &str) -> Result<()> {
         let mut entries = self.entries.write().await;
 
@@ -297,6 +300,34 @@ impl QuotaManager {
     pub async fn tracked_dirs(&self) -> Vec<String> {
         let entries = self.entries.read().await;
         entries.keys().cloned().collect()
+    }
+
+    /// Apply a declarative bootstrap map at startup.
+    ///
+    /// For each `(dir, size_str)` entry, installs a quota limit on `dir`
+    /// only when that directory does not already have a quota recorded.
+    /// This makes the bootstrap idempotent across restarts: changing the
+    /// config string after the first boot will not silently overwrite the
+    /// usage counter that is already being tracked.
+    pub async fn apply_bootstrap(&self, bootstrap: &HashMap<String, String>) -> Result<()> {
+        for (dir, size_str) in bootstrap {
+            // Validate up front so a bad config is reported as a startup
+            // error rather than silently creating an orphan redb entry
+            // that reconciliation might later try to scan with a path
+            // like `<root>/../escape`.
+            validate_quota_dir(dir)
+                .with_context(|| format!("Invalid bootstrap quota directory '{}'", dir))?;
+
+            if self.get_quota_info(dir).await.is_some() {
+                tracing::debug!("Quota bootstrap '{}': already present, skipped", dir);
+                continue;
+            }
+            let limit = crate::config::parse_size(size_str)
+                .with_context(|| format!("Invalid bootstrap size for '{}'", dir))?;
+            self.set_quota(dir, limit).await?;
+            tracing::info!("Quota bootstrap: installed '{}' = {} bytes", dir, limit);
+        }
+        Ok(())
     }
 
     /// Walk the named quota directory on disk, recompute its true byte
@@ -826,6 +857,95 @@ mod tests {
             qm.get_quota_info("pvc-b").await,
             Some((16 * BLOCK, 2 * BLOCK))
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_bootstrap_installs_new_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = make_manager(&tmp, root.path());
+
+        let mut bootstrap = HashMap::new();
+        bootstrap.insert("pvc-a".to_string(), "1MB".to_string());
+        bootstrap.insert("pvc-b".to_string(), "500KB".to_string());
+
+        qm.apply_bootstrap(&bootstrap).await.unwrap();
+
+        assert_eq!(qm.get_quota_info("pvc-a").await, Some((1024 * 1024, 0)));
+        assert_eq!(qm.get_quota_info("pvc-b").await, Some((500 * 1024, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_apply_bootstrap_skips_existing_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = make_manager(&tmp, root.path());
+
+        // Pre-existing entry with different limit and some usage.
+        qm.set_quota("pvc-a", 2048).await.unwrap();
+        qm.add_usage("pvc-a", 512).await.unwrap();
+
+        let mut bootstrap = HashMap::new();
+        bootstrap.insert("pvc-a".to_string(), "1MB".to_string());
+        qm.apply_bootstrap(&bootstrap).await.unwrap();
+
+        // Limit and usage must be preserved (bootstrap is no-op).
+        assert_eq!(qm.get_quota_info("pvc-a").await, Some((2048, 512)));
+    }
+
+    #[tokio::test]
+    async fn test_apply_bootstrap_rejects_invalid_size() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = make_manager(&tmp, root.path());
+
+        let mut bootstrap = HashMap::new();
+        bootstrap.insert("pvc-a".to_string(), "garbage".to_string());
+
+        let err = qm.apply_bootstrap(&bootstrap).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid bootstrap size"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_bootstrap_rejects_unsafe_keys() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = make_manager(&tmp, root.path());
+
+        for bad in ["", ".", "..", "a/b", "../escape", "/abs", "a\\b"] {
+            let mut bootstrap = HashMap::new();
+            bootstrap.insert(bad.to_string(), "1MB".to_string());
+            let err = qm
+                .apply_bootstrap(&bootstrap)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Invalid bootstrap quota directory"),
+                "key '{}' should be rejected, got: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_quota_rejects_unsafe_key() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = make_manager(&tmp, root.path());
+
+        let err = qm.set_quota("../escape", 1024).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must be a single path component"),
+            "got: {}",
+            err
+        );
+        assert!(qm.get_quota_info("../escape").await.is_none());
     }
 
     #[tokio::test]
