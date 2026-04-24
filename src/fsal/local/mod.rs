@@ -90,6 +90,39 @@ impl LocalFilesystem {
         self.quota_manager.as_ref()
     }
 
+    /// Resolve a path to its owning quota directory, if any. Returns the
+    /// quota manager together with the directory name so callers can run
+    /// check/add/sub without repeated plumbing.
+    ///
+    /// The path is canonicalised first so a symlink that crosses PVCs
+    /// (e.g. `pvc-a/link -> pvc-b/data`) is accounted to the PVC where
+    /// the data actually lives, not the one the link sits in. When the
+    /// path does not exist yet — the common case for `write()` on a
+    /// fresh file — canonicalisation fails and we fall back to the
+    /// literal path, which is also where the new file will land. There
+    /// is a small TOCTOU window between this lookup and the underlying
+    /// FS call, but exploiting it requires racing two NFS operations
+    /// to swap a regular file for a symlink at exactly the right
+    /// moment, which is bounded and benign for the PVC use case.
+    async fn quota_target(&self, path: &Path) -> Option<(&QuotaManager, String)> {
+        let qm = self.quota_manager.as_ref()?;
+        let canonical = tokio_fs::canonicalize(path).await.ok();
+        let lookup = canonical.as_deref().unwrap_or(path);
+        let dir = qm.resolve_quota_dir(lookup)?;
+        // Only return a target if a quota is actually configured for this dir.
+        qm.get_quota_info(&dir).await?;
+        Some((qm, dir))
+    }
+
+    /// Return the first-level quota-directory name for `path`, or `None`
+    /// when no quota manager is configured or the path sits at the export
+    /// root. Unlike [`quota_target`] this does not require the directory
+    /// to have an active quota entry — rename needs to compare both sides
+    /// even when only one side is tracked.
+    fn quota_dir_of(&self, path: &Path) -> Option<String> {
+        self.quota_manager.as_ref()?.resolve_quota_dir(path)
+    }
+
     /// Resolve a file handle to a full path
     fn resolve_handle(&self, handle: &FileHandle) -> Result<PathBuf> {
         self.handle_manager
@@ -385,6 +418,46 @@ impl Filesystem for LocalFilesystem {
 
     async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let path = self.resolve_handle(handle)?;
+        // File handles map to paths and are not invalidated when the
+        // path is replaced with a symlink. Re-validate the resolved
+        // path so a stale handle cannot be combined with a symlink
+        // swap to write outside the export root — `OpenOptions::open`
+        // below follows symlinks, so without this check a client
+        // could escape the exported tree via the resolved target.
+        self.validate_path(&path)?;
+
+        // Quota: charge by allocated bytes (st_blocks * 512), not by logical
+        // length. A client cannot bypass the quota by extending a file with
+        // setattr_size and then writing into the existing logical range,
+        // because hole-filling writes increase the on-disk footprint even
+        // when the logical size is unchanged.
+        let quota_target = self.quota_target(&path).await;
+        let old_alloc = if quota_target.is_some() {
+            // write() opens with `tokio_fs::OpenOptions` which follows
+            // symlinks, so account for the resolved target's footprint
+            // — otherwise a symlink in a quota dir lets the client
+            // bypass enforcement by writing through the link.
+            allocated_bytes_following(&path).await?
+        } else {
+            0
+        };
+        if let Some((qm, dir)) = quota_target.as_ref() {
+            // Pre-check is conservative: assume the entire write will land
+            // in freshly allocated blocks. We trade two things to keep
+            // the hot path simple:
+            //   * Overwrites in a near-full PVC may be rejected with
+            //     EDQUOT even though the actual on-disk usage would not
+            //     grow (e.g. rewriting an existing block with new data).
+            //     A precise check would need fiemap/SEEK_HOLE per
+            //     write, which is Linux-specific and slow.
+            //   * Concurrent writers can each pass this check against
+            //     the same usage snapshot — see the concurrency note
+            //     on `QuotaManager::check_quota`. The post-write
+            //     `add_usage` accounts for the real delta either way,
+            //     so over-shoot is bounded and reconciliation repairs
+            //     it.
+            qm.check_quota(dir, data.len() as u64).await?;
+        }
 
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
@@ -405,6 +478,37 @@ impl Filesystem for LocalFilesystem {
         // Flush to disk
         file.sync_all().await.context("Failed to sync file")?;
 
+        // Quota: apply the real delta in allocated bytes after the write.
+        // The data has already been written and synced; surfacing a quota
+        // bookkeeping error here would tell the client the WRITE failed
+        // even though bytes are on disk, and the QuotaManager rolls back
+        // its cache on persist failure so future checks would also be
+        // wrong. Log it as a degraded state instead and let background
+        // reconciliation repair the drift.
+        if let Some((qm, dir)) = quota_target.as_ref() {
+            match allocated_bytes_following(&path).await {
+                Ok(new_alloc) => {
+                    let delta = new_alloc.saturating_sub(old_alloc);
+                    if delta > 0
+                        && let Err(err) = qm.add_usage(dir, delta).await
+                    {
+                        warn!(
+                            "WRITE quota accounting failed after data was persisted: \
+                             path={:?} dir={} delta={} error={:#}",
+                            path, dir, delta, err
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "WRITE quota accounting skipped (stat failed) after \
+                         data was persisted: path={:?} dir={} error={:#}",
+                        path, dir, err
+                    );
+                }
+            }
+        }
+
         debug!(
             "WRITE: {:?} offset={} count={} -> {} bytes",
             path,
@@ -418,6 +522,24 @@ impl Filesystem for LocalFilesystem {
 
     async fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()> {
         let path = self.resolve_handle(handle)?;
+        // See `write()` for the rationale: validate the resolved path
+        // again so a stale handle + symlink swap cannot truncate or
+        // extend a file outside the export root.
+        self.validate_path(&path)?;
+
+        // Quota: track using allocated bytes, consistent with write().
+        // Truncating down releases blocks; sparse extension allocates
+        // none, so the delta is naturally zero — no special-case needed
+        // for the "extend" branch.
+        let quota_target = self.quota_target(&path).await;
+        let old_alloc = if quota_target.is_some() {
+            // setattr_size opens through the symlink (set_len follows),
+            // so quota tracking must look at the same target the kernel
+            // actually truncates.
+            allocated_bytes_following(&path).await?
+        } else {
+            0
+        };
 
         let file = tokio_fs::OpenOptions::new()
             .write(true)
@@ -428,6 +550,33 @@ impl Filesystem for LocalFilesystem {
         file.set_len(size)
             .await
             .context("Failed to set file size")?;
+
+        // Quota release is best-effort: the truncate has already taken
+        // effect on disk, so a redb error here must not propagate as a
+        // SETATTR failure (the client would re-issue and observe the new
+        // size anyway). See WRITE for the same rationale.
+        if let Some((qm, dir)) = quota_target {
+            match allocated_bytes_following(&path).await {
+                Ok(new_alloc) if new_alloc < old_alloc => {
+                    let freed = old_alloc - new_alloc;
+                    if let Err(err) = qm.sub_usage(&dir, freed).await {
+                        warn!(
+                            "SETATTR quota release failed after truncate: \
+                             path={:?} dir={} freed={} error={:#}",
+                            path, dir, freed, err
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        "SETATTR quota release skipped (stat failed) after \
+                         truncate: path={:?} dir={} error={:#}",
+                        path, dir, err
+                    );
+                }
+            }
+        }
 
         debug!("SETATTR: {:?} size={}", path, size);
 
@@ -511,12 +660,39 @@ impl Filesystem for LocalFilesystem {
         // Validate path is within export root
         self.validate_path(&full_path)?;
 
+        // Quota: figure out how many bytes this unlink will actually free.
+        // `refundable_bytes_on_unlink` accounts for symlinks (refund the
+        // link, not the target) and hard links (refund nothing while
+        // `nlink > 1`, otherwise a hard-linked file could be used to
+        // reclaim quota the data still occupies on disk).
+        let quota_target = self.quota_target(&full_path).await;
+        let freed_bytes = if quota_target.is_some() {
+            refundable_bytes_on_unlink(&full_path).await?
+        } else {
+            0
+        };
+
         // Remove file
         tokio_fs::remove_file(&full_path)
             .await
             .context(format!("Failed to remove file: {:?}", full_path))?;
 
-        debug!("REMOVE: {:?}", full_path);
+        // Quota release is best-effort: the file is already gone, so a
+        // redb error here must not propagate as a REMOVE failure (the
+        // client would re-issue and observe NOENT). See WRITE for the
+        // same rationale.
+        if let Some((qm, dir)) = quota_target
+            && freed_bytes > 0
+            && let Err(err) = qm.sub_usage(&dir, freed_bytes).await
+        {
+            warn!(
+                "REMOVE quota release failed after unlink: \
+                 path={:?} dir={} freed={} error={:#}",
+                full_path, dir, freed_bytes, err
+            );
+        }
+
+        debug!("REMOVE: {:?} (freed {} bytes)", full_path, freed_bytes);
 
         Ok(())
     }
@@ -601,6 +777,49 @@ impl Filesystem for LocalFilesystem {
         self.validate_path(&from_full_path)?;
         self.validate_path(&to_full_path)?;
 
+        // Quota: only need to do work when the rename crosses a quota
+        // boundary. Within the same quota directory (or between two
+        // untracked directories) the usage is unchanged. Even when the
+        // first-level names differ, skip the (potentially expensive)
+        // recursive size walk if neither side has an active quota
+        // entry — a rename between untracked PVCs should not pay for it.
+        let from_quota = self.quota_dir_of(&from_full_path);
+        let to_quota = self.quota_dir_of(&to_full_path);
+        let cross_quota = from_quota != to_quota;
+
+        let need_size = if cross_quota && let Some(ref qm) = self.quota_manager {
+            let from_tracked = match from_quota.as_ref() {
+                Some(d) => qm.get_quota_info(d).await.is_some(),
+                None => false,
+            };
+            let to_tracked = match to_quota.as_ref() {
+                Some(d) => qm.get_quota_info(d).await.is_some(),
+                None => false,
+            };
+            from_tracked || to_tracked
+        } else {
+            false
+        };
+
+        let size_bytes = if need_size {
+            // Compute the total byte footprint of the source before renaming.
+            let src = from_full_path.clone();
+            tokio::task::spawn_blocking(move || path_size(&src))
+                .await
+                .context("spawn_blocking failed")??
+        } else {
+            0
+        };
+
+        if cross_quota
+            && size_bytes > 0
+            && let Some(ref qm) = self.quota_manager
+            && let Some(ref dir) = to_quota
+            && qm.get_quota_info(dir).await.is_some()
+        {
+            qm.check_quota(dir, size_bytes).await?;
+        }
+
         // Rename/move the file or directory
         tokio_fs::rename(&from_full_path, &to_full_path)
             .await
@@ -608,6 +827,34 @@ impl Filesystem for LocalFilesystem {
                 "Failed to rename {:?} to {:?}",
                 from_full_path, to_full_path
             ))?;
+
+        // Quota transfer is best-effort: the rename has already taken
+        // place on disk, so a redb error here must not propagate as a
+        // RENAME failure (the client would re-issue and observe NOENT
+        // on the source). See WRITE for the same rationale.
+        if cross_quota
+            && size_bytes > 0
+            && let Some(ref qm) = self.quota_manager
+        {
+            if let Some(ref dir) = from_quota
+                && let Err(err) = qm.sub_usage(dir, size_bytes).await
+            {
+                warn!(
+                    "RENAME quota release on source failed after rename: \
+                     dir={} bytes={} error={:#}",
+                    dir, size_bytes, err
+                );
+            }
+            if let Some(ref dir) = to_quota
+                && let Err(err) = qm.add_usage(dir, size_bytes).await
+            {
+                warn!(
+                    "RENAME quota charge on target failed after rename: \
+                     dir={} bytes={} error={:#}",
+                    dir, size_bytes, err
+                );
+            }
+        }
 
         debug!("RENAME: {:?} -> {:?}", from_full_path, to_full_path);
 
@@ -973,6 +1220,106 @@ fn check_db_path_outside_root(db_path: &Path, root_path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Recursively sum the on-disk byte footprint (st_blocks * 512) of all
+/// regular files rooted at `path`. Used by cross-quota rename to compute
+/// the amount of usage to transfer between quota directories — the unit
+/// matches the allocated-bytes accounting used by `write()`/`remove()`.
+///
+/// Symlinks and other non-regular entries are not followed and do not
+/// contribute to the total — `symlink_metadata` is called per entry so
+/// the walk stays inside the export tree.
+fn path_size(path: &Path) -> Result<u64> {
+    let metadata =
+        fs::symlink_metadata(path).context(format!("Failed to stat path: {:?}", path))?;
+
+    if metadata.is_file() {
+        return Ok(metadata.blocks().saturating_mul(512));
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let rd = fs::read_dir(&current).context(format!(
+            "Failed to read dir while summing size: {:?}",
+            current
+        ))?;
+        for entry in rd {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let meta = fs::symlink_metadata(&entry_path).context(format!(
+                "Failed to stat path while summing size: {:?}",
+                entry_path
+            ))?;
+            if meta.is_dir() {
+                stack.push(entry_path);
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Return the on-disk byte footprint of the **symlink-resolved** path,
+/// computed from `st_blocks`. Used by content-mutating operations
+/// (`write`, `setattr_size`) where the kernel itself follows the link
+/// when opening — accounting must follow the same target so writes
+/// through a symlink in a quota directory still increase tracked usage.
+///
+/// `NotFound` maps to zero; other stat failures are propagated so a
+/// transient I/O error cannot silently undercount quota usage.
+async fn allocated_bytes_following(path: &Path) -> Result<u64> {
+    match tokio_fs::metadata(path).await {
+        Ok(m) => Ok(m.blocks().saturating_mul(512)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => {
+            Err(anyhow::Error::from(e)).context(format!("Failed to stat for quota: {:?}", path))
+        }
+    }
+}
+
+/// Return how many bytes the quota should refund when `path` is unlinked.
+///
+/// Quota is charged exclusively on operations that mutate regular-file
+/// content (`write`, `setattr_size`, cross-quota `rename`). Refunds must
+/// be the symmetric inverse of those charges, otherwise a client can
+/// drift the tracked usage below reality:
+///
+/// * **Regular file, last link (`nlink == 1`):** unlinking truly frees
+///   the inode's blocks → refund `blocks * 512`.
+/// * **Regular file with surviving hard link (`nlink > 1`):** the inode
+///   and its blocks remain reachable via another name (possibly in a
+///   different PVC, since `link()` bypasses quota_dir attribution).
+///   No bytes are freed → refund 0.
+/// * **Symlinks, FIFOs, sockets, devices:** these are *not* charged at
+///   creation time (the FSAL's `symlink`/`mknod` paths skip the quota
+///   accounting). Refunding their `st_blocks` would let a client
+///   create then remove long symlinks (each occupying a real block on
+///   most filesystems) to depress the usage counter and reclaim quota
+///   for data they never paid for. Refund 0 to keep the create/remove
+///   accounting symmetric.
+///
+/// There is a small TOCTOU between this stat and the actual `unlink`,
+/// but it cannot introduce a leak in the dangerous direction — at
+/// worst a refund-of-blocks gets skipped that should have been issued,
+/// which background reconciliation will repair.
+///
+/// `NotFound` maps to zero; other stat failures are propagated so a
+/// transient I/O error cannot silently undercount quota usage.
+async fn refundable_bytes_on_unlink(path: &Path) -> Result<u64> {
+    match tokio_fs::symlink_metadata(path).await {
+        Ok(m) if m.is_file() && m.nlink() == 1 => Ok(m.blocks().saturating_mul(512)),
+        Ok(_) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => {
+            Err(anyhow::Error::from(e)).context(format!("Failed to stat for quota: {:?}", path))
+        }
+    }
 }
 
 /// Call `libc::statvfs` on `path` and convert the result into `FsStats`.
@@ -1518,5 +1865,466 @@ mod tests {
         let stats = fs.statvfs(&file).await.unwrap();
         assert_eq!(stats.total_bytes, 5000);
         assert_eq!(stats.free_bytes, 4000);
+    }
+
+    // -- Stage 5: quota enforcement ---------------------------------------
+
+    // Quota usage is tracked in allocated bytes (st_blocks * 512). On
+    // tmpfs / ext4 the page size is 4 KiB, so the tests below use writes
+    // and limits in multiples of 4 KiB to keep expected values exact and
+    // independent of the underlying filesystem's rounding.
+    //
+    // Test-environment assumption: tempfile creates temp dirs on the
+    // OS default scratch filesystem (tmpfs on Linux CI, ext4 on most
+    // Linux distros) — both round 1-byte writes up to a 4 KiB block.
+    // If these tests are ever run on a filesystem with a different
+    // allocation unit (e.g. ZFS records, btrfs CoW, network FS) the
+    // exact comparisons below will need to be relaxed to ranges.
+    const BLOCK: usize = 4096;
+
+    #[tokio::test]
+    async fn test_write_within_quota_succeeds() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (4 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+
+        let payload = vec![0u8; BLOCK];
+        let written = fs.write(&file, 0, &payload).await.expect("write ok");
+        assert_eq!(written as usize, payload.len());
+
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_exceeds_quota_is_rejected() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", BLOCK as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+
+        let payload = vec![0u8; 2 * BLOCK];
+        let err = fs
+            .write(&file, 0, &payload)
+            .await
+            .expect_err("write over quota should fail");
+        assert!(err.to_string().contains("Quota exceeded"), "got: {}", err);
+
+        // Nothing was accounted (and nothing was written, since we check before).
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some((BLOCK as u64, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_overwriting_existing_data_does_not_double_count() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (4 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+        // Overwrite the same block; allocated footprint is unchanged.
+        fs.write(&file, 0, &vec![1u8; BLOCK]).await.unwrap();
+
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_releases_quota() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (4 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+
+        fs.remove(&dir, "data.bin").await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_hardlink_does_not_refund_quota_until_last_unlink() {
+        // Hard link bypass attack: create file -> hard-link it ->
+        // remove the original. Without the nlink check, the FSAL would
+        // refund the data's blocks on the first unlink even though
+        // those blocks remain reachable via the surviving link, and
+        // the client could rewrite the same volume of data, doubling
+        // their effective quota each round.
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (4 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+        // Sanity: one block was charged.
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+
+        // Add a second hard link to the same inode.
+        fs.link(&file, &dir, "data2.bin").await.unwrap();
+
+        // Removing the first name must NOT refund quota — the inode
+        // and its blocks survive via "data2.bin".
+        fs.remove(&dir, "data.bin").await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64)),
+            "quota must not be refunded while another hard link still exists"
+        );
+
+        // Removing the last name finally frees the blocks; quota refunds.
+        fs.remove(&dir, "data2.bin").await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, 0)),
+            "last unlink frees the blocks → quota refunds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_symlink_does_not_refund_quota() {
+        // Symlink bypass attack: symlink creation is *not* charged
+        // against quota, so refunding bytes on remove would let a
+        // client drift the usage counter below reality. The attacker
+        // writes legitimate data (charged), then creates and removes
+        // long symlinks repeatedly to claw back quota for storage
+        // they actually paid for, eventually doubling their effective
+        // budget.
+        let (fs, export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (8 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+        let charged = fs
+            .quota_manager()
+            .unwrap()
+            .get_quota_info("pvc-a")
+            .await
+            .unwrap();
+        assert_eq!(charged, ((8 * BLOCK) as u64, BLOCK as u64));
+
+        // Create a symlink with a long target so the kernel has to
+        // allocate at least one block for it on tmpfs/ext4 (fast
+        // symlinks fit inline, so a long target ensures st_blocks > 0).
+        // Note: the FSAL's `symlink` API does not charge quota, mirror
+        // that here by going through the host filesystem directly.
+        let long_target = "x".repeat(200);
+        std::os::unix::fs::symlink(&long_target, export.path().join("pvc-a/long-link")).unwrap();
+
+        // Remove the symlink via the FSAL — must NOT refund anything.
+        fs.remove(&dir, "long-link").await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(charged),
+            "removing a symlink must not refund quota — symlink \
+             creation is not charged, so refunding here would let a \
+             client drift the usage counter below reality"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_handle_after_symlink_swap_outside_export() {
+        // File handles map to paths and are not invalidated when the
+        // path is replaced. If a client gets a handle for a real file,
+        // then (out of band) replaces the file with a symlink pointing
+        // outside the export, the resolved path would still look fine
+        // to `resolve_handle` — but the kernel-level open follows the
+        // symlink. validate_path() must catch this so WRITE cannot
+        // escape the exported tree.
+        let (fs, _export) = create_test_fs();
+        let root = fs.root_handle().await;
+        let original_handle = fs.create(&root, "victim.bin", 0o644).await.unwrap();
+
+        // Pretend the file got swapped for a symlink to /etc/hostname,
+        // a path that is guaranteed to exist on Linux test runners and
+        // is definitely outside the temp export.
+        let victim_path = _export.path().join("victim.bin");
+        std::fs::remove_file(&victim_path).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &victim_path).unwrap();
+
+        let err = fs
+            .write(&original_handle, 0, b"pwned")
+            .await
+            .expect_err("WRITE through swapped symlink should be rejected");
+        assert!(
+            err.to_string().contains("outside export root"),
+            "got: {:#}",
+            err
+        );
+
+        // /etc/hostname must still contain its original content.
+        let hostname = std::fs::read_to_string("/etc/hostname").unwrap();
+        assert!(
+            !hostname.contains("pwned"),
+            "WRITE leaked outside export: /etc/hostname now contains the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_setattr_size_rejects_handle_after_symlink_swap_outside_export() {
+        // Same attack, exercised against SETATTR truncate: a stale
+        // handle plus a symlink swap could otherwise let a client
+        // truncate any file outside the export tree.
+        let (fs, _export) = create_test_fs();
+        let root = fs.root_handle().await;
+        let handle = fs.create(&root, "victim.bin", 0o644).await.unwrap();
+
+        let victim_path = _export.path().join("victim.bin");
+        std::fs::remove_file(&victim_path).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &victim_path).unwrap();
+
+        let err = fs
+            .setattr_size(&handle, 0)
+            .await
+            .expect_err("SETATTR size through swapped symlink should be rejected");
+        assert!(
+            err.to_string().contains("outside export root"),
+            "got: {:#}",
+            err
+        );
+
+        // /etc/hostname must still be a normal non-empty file.
+        let meta = std::fs::metadata("/etc/hostname").unwrap();
+        assert!(
+            meta.len() > 0,
+            "SETATTR leaked outside export: /etc/hostname was truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_down_releases_quota() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (8 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "data.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; 4 * BLOCK]).await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((8 * BLOCK) as u64, (4 * BLOCK) as u64))
+        );
+
+        // Truncate down to one block: 3 blocks worth of allocated bytes
+        // are released back to the quota.
+        fs.setattr_size(&file, BLOCK as u64).await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((8 * BLOCK) as u64, BLOCK as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_up_is_not_tracked() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", 1000)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "sparse.bin", 0o644).await.unwrap();
+
+        // Extend far beyond the quota limit: sparse files don't consume
+        // real bytes, so the usage counter should stay at zero. Real
+        // writes into those holes are still blocked by write().
+        fs.setattr_size(&file, 100_000).await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some((1000, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_within_same_quota_dir_does_not_change_usage() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.quota_manager()
+            .unwrap()
+            .set_quota("pvc-a", (4 * BLOCK) as u64)
+            .await
+            .unwrap();
+
+        let dir = fs.lookup(&root, "pvc-a").await.unwrap();
+        let file = fs.create(&dir, "a.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+
+        fs.rename(&dir, "a.bin", &dir, "b.bin").await.unwrap();
+        assert_eq!(
+            fs.quota_manager().unwrap().get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_across_quota_dirs_transfers_usage() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.mkdir(&root, "pvc-b", 0o755).await.unwrap();
+        let qm = fs.quota_manager().unwrap();
+        qm.set_quota("pvc-a", (4 * BLOCK) as u64).await.unwrap();
+        qm.set_quota("pvc-b", (4 * BLOCK) as u64).await.unwrap();
+
+        let dir_a = fs.lookup(&root, "pvc-a").await.unwrap();
+        let dir_b = fs.lookup(&root, "pvc-b").await.unwrap();
+
+        let file = fs.create(&dir_a, "f.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; BLOCK]).await.unwrap();
+
+        fs.rename(&dir_a, "f.bin", &dir_b, "f.bin").await.unwrap();
+
+        assert_eq!(
+            qm.get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, 0))
+        );
+        assert_eq!(
+            qm.get_quota_info("pvc-b").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_across_quota_dirs_rejected_when_target_full() {
+        let (fs, _export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.mkdir(&root, "pvc-b", 0o755).await.unwrap();
+        let qm = fs.quota_manager().unwrap();
+        qm.set_quota("pvc-a", (4 * BLOCK) as u64).await.unwrap();
+        qm.set_quota("pvc-b", BLOCK as u64).await.unwrap();
+
+        let dir_a = fs.lookup(&root, "pvc-a").await.unwrap();
+        let dir_b = fs.lookup(&root, "pvc-b").await.unwrap();
+
+        let file = fs.create(&dir_a, "f.bin", 0o644).await.unwrap();
+        fs.write(&file, 0, &vec![0u8; 2 * BLOCK]).await.unwrap();
+
+        // Target quota is one block; source file occupies two blocks —
+        // the cross-quota transfer must be rejected.
+        let err = fs
+            .rename(&dir_a, "f.bin", &dir_b, "f.bin")
+            .await
+            .expect_err("rename into full quota should fail");
+        assert!(err.to_string().contains("Quota exceeded"), "got: {}", err);
+
+        // Source unchanged; target still empty.
+        assert_eq!(
+            qm.get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, (2 * BLOCK) as u64))
+        );
+        assert_eq!(qm.get_quota_info("pvc-b").await, Some((BLOCK as u64, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_write_through_cross_pvc_symlink_charges_target_quota() {
+        let (fs, export, _db) = create_test_fs_with_quota();
+        let root = fs.root_handle().await;
+        fs.mkdir(&root, "pvc-a", 0o755).await.unwrap();
+        fs.mkdir(&root, "pvc-b", 0o755).await.unwrap();
+        let qm = fs.quota_manager().unwrap();
+        qm.set_quota("pvc-a", (4 * BLOCK) as u64).await.unwrap();
+        qm.set_quota("pvc-b", (4 * BLOCK) as u64).await.unwrap();
+
+        let dir_b = fs.lookup(&root, "pvc-b").await.unwrap();
+        // Create the real target file inside pvc-b.
+        let target = fs.create(&dir_b, "data.bin", 0o644).await.unwrap();
+
+        // Hand-create a cross-PVC symlink (the FSAL symlink op validates
+        // names but not targets, and we do not need to go through it for
+        // this test — point pvc-a/link at pvc-b/data.bin directly on the
+        // host filesystem to set up the scenario).
+        std::os::unix::fs::symlink(
+            export.path().join("pvc-b").join("data.bin"),
+            export.path().join("pvc-a").join("link"),
+        )
+        .unwrap();
+
+        // Look up the link via the FSAL so we get a handle for it.
+        let dir_a = fs.lookup(&root, "pvc-a").await.unwrap();
+        let link_handle = fs.lookup(&dir_a, "link").await.unwrap();
+
+        // Write through the link. The kernel will follow the symlink and
+        // mutate pvc-b/data.bin; quota_target now canonicalises first,
+        // so the bytes must be charged to pvc-b, not pvc-a.
+        fs.write(&link_handle, 0, &vec![0u8; BLOCK]).await.unwrap();
+        // Sanity: the target's blocks really did grow.
+        let target_alloc = fs.statvfs(&target).await.unwrap();
+        assert!(target_alloc.free_bytes < (4 * BLOCK) as u64);
+
+        assert_eq!(
+            qm.get_quota_info("pvc-a").await,
+            Some(((4 * BLOCK) as u64, 0))
+        );
+        assert_eq!(
+            qm.get_quota_info("pvc-b").await,
+            Some(((4 * BLOCK) as u64, BLOCK as u64))
+        );
     }
 }

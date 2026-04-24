@@ -95,7 +95,16 @@ pub async fn handle_rename(
 
             // Determine appropriate error code
             let error_string = e.to_string();
-            let status = if error_string.contains("not found") || error_string.contains("No such") {
+            let status = if error_string.contains("Quota exceeded")
+                || error_string.contains("Disk quota exceeded")
+            {
+                // Match both our QuotaManager error and the Linux
+                // EDQUOT rendering ("Disk quota exceeded") so a
+                // cross-quota rename hitting an OS-level quota is
+                // reported as NFS3ERR_DQUOT instead of falling through
+                // to NFS3ERR_IO.
+                nfsstat3::NFS3ERR_DQUOT
+            } else if error_string.contains("not found") || error_string.contains("No such") {
                 nfsstat3::NFS3ERR_NOENT
             } else if error_string.contains("already exists")
                 || error_string.contains("File exists")
