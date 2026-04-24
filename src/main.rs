@@ -129,6 +129,15 @@ async fn main() -> Result<()> {
 
     let root_handle = filesystem.root_handle().await;
     println!("  Root handle: {} bytes", root_handle.len());
+
+    // Kick off a background pass that reconciles stored quota usage with
+    // the actual on-disk size. The server starts accepting traffic
+    // immediately; drift from out-of-band filesystem changes is corrected
+    // while requests are being served.
+    if config.quota.enabled {
+        filesystem.start_quota_reconciliation();
+        println!("  Quota reconciliation: scheduled (background)");
+    }
     println!();
 
     // Create portmapper registry

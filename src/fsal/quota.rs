@@ -293,6 +293,89 @@ impl QuotaManager {
         entries.get(quota_dir).map(|e| (e.limit, e.usage))
     }
 
+    /// Return the list of tracked quota directory names.
+    pub async fn tracked_dirs(&self) -> Vec<String> {
+        let entries = self.entries.read().await;
+        entries.keys().cloned().collect()
+    }
+
+    /// Walk the named quota directory on disk, recompute its true byte
+    /// footprint, and reconcile the tracked usage with it. Non-existent
+    /// directories reconcile to zero usage.
+    ///
+    /// Returns `Some((before, after))` when the entry existed (useful for
+    /// logging drift) or `None` if the directory has no quota configured.
+    pub async fn scan_and_reconcile(&self, quota_dir: &str) -> Result<Option<(u64, u64)>> {
+        // Snapshot the entry under a short-lived read lock so we can return
+        // early when there is nothing to reconcile.
+        if self.entries.read().await.get(quota_dir).is_none() {
+            return Ok(None);
+        }
+
+        // Walk the directory without holding any quota lock — the scan is
+        // I/O-bound and we don't want to stall live writes.
+        let dir_path = self.root_path.join(quota_dir);
+        let scanned: u64 = tokio::task::spawn_blocking(move || allocated_path_size(&dir_path))
+            .await
+            .context("spawn_blocking failed for scan")??;
+
+        // Take the write lock and hold it across the redb commit. This
+        // prevents two races at once:
+        //   * an interleaving add_usage/sub_usage from being clobbered by
+        //     this reconciliation (lost-update);
+        //   * the cache showing the new scanned value while persistence
+        //     has actually failed (cache/DB drift).
+        let mut entries = self.entries.write().await;
+
+        let (old_usage, new_usage, limit) = match entries.get_mut(quota_dir) {
+            Some(entry) => {
+                let old = entry.usage;
+                entry.usage = scanned;
+                (old, entry.usage, entry.limit)
+            }
+            // The entry was removed while we were scanning — nothing to do.
+            None => return Ok(None),
+        };
+
+        if let Err(e) = self
+            .persist_entry(quota_dir.to_string(), limit, new_usage)
+            .await
+        {
+            if let Some(entry) = entries.get_mut(quota_dir) {
+                entry.usage = old_usage;
+            }
+            return Err(e);
+        }
+
+        Ok(Some((old_usage, new_usage)))
+    }
+
+    /// Reconcile every tracked quota directory. Errors on individual
+    /// directories are logged and skipped so one missing PVC does not
+    /// prevent others from being scanned.
+    pub async fn reconcile_all(&self) {
+        let dirs = self.tracked_dirs().await;
+        for dir in dirs {
+            match self.scan_and_reconcile(&dir).await {
+                Ok(Some((before, after))) if before != after => {
+                    tracing::info!(
+                        "Quota reconcile '{}': usage {} -> {} ({:+})",
+                        dir,
+                        before,
+                        after,
+                        after as i128 - before as i128
+                    );
+                }
+                Ok(_) => {
+                    tracing::debug!("Quota reconcile '{}': unchanged", dir);
+                }
+                Err(e) => {
+                    tracing::warn!("Quota reconcile '{}' failed: {}", dir, e);
+                }
+            }
+        }
+    }
+
     /// Persist a single entry to redb in a blocking task.
     async fn persist_entry(&self, key: String, limit: u64, usage: u64) -> Result<()> {
         let db = self.db.clone();
@@ -348,6 +431,60 @@ fn validate_quota_dir(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Recursively sum the on-disk byte footprint (st_blocks * 512) of all
+/// regular files rooted at `path`. The unit matches what `write()` and
+/// `remove()` charge against the quota, so callers — reconciliation
+/// (scanning a quota directory) and cross-quota rename (computing the
+/// usage to transfer) — get consistent numbers.
+///
+/// Behaviour:
+///   * Missing path → returns `0` (e.g. a PVC directory was deleted
+///     out of band before reconciliation runs).
+///   * Plain file → returns its allocated bytes.
+///   * Directory → recursive walk. `symlink_metadata` is used per entry
+///     so a malicious symlink cannot escape the subtree or trap the
+///     walk in a cycle.
+///   * Other types (symlink, fifo, …) → not followed, contribute 0.
+pub(crate) fn allocated_path_size(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let meta =
+        std::fs::symlink_metadata(path).context(format!("Failed to stat path: {:?}", path))?;
+    if meta.is_file() {
+        return Ok(meta.blocks().saturating_mul(512));
+    }
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let rd = std::fs::read_dir(&current).context(format!(
+            "Failed to read dir while summing size: {:?}",
+            current
+        ))?;
+        for entry in rd {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let m = std::fs::symlink_metadata(&entry_path).context(format!(
+                "Failed to stat path while summing size: {:?}",
+                entry_path
+            ))?;
+            if m.is_dir() {
+                stack.push(entry_path);
+            } else if m.is_file() {
+                total = total.saturating_add(m.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -596,5 +733,121 @@ mod tests {
         assert!(qm.get_quota_info("../escape").await.is_none());
         assert!(qm.get_quota_info("a/b").await.is_none());
         assert!(qm.get_quota_info("").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scan_and_reconcile_corrects_drift() {
+        // Reconciliation accounts in allocated bytes (st_blocks * 512) so
+        // it agrees with what write()/remove() charge against the quota.
+        // 4 KiB writes line up with the typical filesystem page size,
+        // making the expected value exact across tmpfs/ext4.
+        const BLOCK: u64 = 4096;
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let qm = QuotaManager::new(tmp.path().join("quota.db"), root_path.clone()).unwrap();
+
+        // Configure quota; tracked usage starts wrong (stale from a crash).
+        qm.set_quota("pvc-a", 1024 * 1024).await.unwrap();
+        qm.add_usage("pvc-a", 9999).await.unwrap();
+
+        // Create real files under the PVC directory totaling 3 blocks.
+        let pvc_dir = root_path.join("pvc-a");
+        std::fs::create_dir_all(&pvc_dir).unwrap();
+        std::fs::write(pvc_dir.join("a.bin"), vec![0u8; BLOCK as usize]).unwrap();
+        std::fs::write(pvc_dir.join("b.bin"), vec![0u8; (2 * BLOCK) as usize]).unwrap();
+
+        let result = qm.scan_and_reconcile("pvc-a").await.unwrap();
+        assert_eq!(result, Some((9999, 3 * BLOCK)));
+        assert_eq!(
+            qm.get_quota_info("pvc-a").await,
+            Some((1024 * 1024, 3 * BLOCK))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_and_reconcile_returns_none_for_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = QuotaManager::new(
+            tmp.path().join("quota.db"),
+            root.path().canonicalize().unwrap(),
+        )
+        .unwrap();
+
+        let result = qm.scan_and_reconcile("nonexistent").await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_scan_and_reconcile_missing_directory_is_zero() {
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let qm = QuotaManager::new(
+            tmp.path().join("quota.db"),
+            root.path().canonicalize().unwrap(),
+        )
+        .unwrap();
+
+        qm.set_quota("pvc-missing", 1000).await.unwrap();
+        qm.add_usage("pvc-missing", 500).await.unwrap();
+
+        let result = qm.scan_and_reconcile("pvc-missing").await.unwrap();
+        assert_eq!(result, Some((500, 0)));
+        assert_eq!(qm.get_quota_info("pvc-missing").await, Some((1000, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_all_processes_every_tracked_dir() {
+        const BLOCK: u64 = 4096;
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let qm = QuotaManager::new(tmp.path().join("quota.db"), root_path.clone()).unwrap();
+
+        qm.set_quota("pvc-a", 16 * BLOCK).await.unwrap();
+        qm.set_quota("pvc-b", 16 * BLOCK).await.unwrap();
+        qm.add_usage("pvc-a", 9999).await.unwrap();
+        qm.add_usage("pvc-b", 9999).await.unwrap();
+
+        std::fs::create_dir_all(root_path.join("pvc-a")).unwrap();
+        std::fs::write(root_path.join("pvc-a/f.bin"), vec![0u8; BLOCK as usize]).unwrap();
+        std::fs::create_dir_all(root_path.join("pvc-b")).unwrap();
+        std::fs::write(
+            root_path.join("pvc-b/f.bin"),
+            vec![0u8; (2 * BLOCK) as usize],
+        )
+        .unwrap();
+
+        qm.reconcile_all().await;
+
+        assert_eq!(qm.get_quota_info("pvc-a").await, Some((16 * BLOCK, BLOCK)));
+        assert_eq!(
+            qm.get_quota_info("pvc-b").await,
+            Some((16 * BLOCK, 2 * BLOCK))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_values_survive_reopen() {
+        const BLOCK: u64 = 4096;
+        let tmp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let db_path = tmp.path().join("quota.db");
+
+        {
+            let qm = QuotaManager::new(&db_path, root_path.clone()).unwrap();
+            qm.set_quota("pvc-a", 8 * BLOCK).await.unwrap();
+            qm.add_usage("pvc-a", 4_000).await.unwrap();
+
+            std::fs::create_dir_all(root_path.join("pvc-a")).unwrap();
+            std::fs::write(root_path.join("pvc-a/f.bin"), vec![0u8; BLOCK as usize]).unwrap();
+
+            qm.scan_and_reconcile("pvc-a").await.unwrap();
+        }
+
+        let qm = QuotaManager::new(&db_path, root_path).unwrap();
+        assert_eq!(qm.get_quota_info("pvc-a").await, Some((8 * BLOCK, BLOCK)));
     }
 }

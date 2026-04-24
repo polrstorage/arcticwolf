@@ -339,6 +339,13 @@ pub trait Filesystem: Send + Sync {
     /// when applicable; inode counts always come from the underlying
     /// filesystem.
     async fn statvfs(&self, handle: &FileHandle) -> Result<FsStats>;
+
+    /// Start a background reconciliation task that scans tracked quota
+    /// directories and corrects usage drift.
+    ///
+    /// The default implementation does nothing. Backends that support
+    /// quotas override this to spawn their own task.
+    fn start_quota_reconciliation(&self) {}
 }
 
 /// Filesystem backend types

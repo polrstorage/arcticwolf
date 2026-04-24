@@ -11,8 +11,10 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
+use std::sync::Arc;
+
 use super::handle::{FileHandle, HandleManager};
-use super::quota::QuotaManager;
+use super::quota::{QuotaManager, allocated_path_size};
 use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats};
 use crate::config::QuotaConfig;
 
@@ -25,7 +27,7 @@ pub struct LocalFilesystem {
     /// Root file handle
     root_handle: FileHandle,
     /// Optional folder quota manager (present when quota is enabled in config)
-    quota_manager: Option<QuotaManager>,
+    quota_manager: Option<Arc<QuotaManager>>,
 }
 
 impl LocalFilesystem {
@@ -69,7 +71,7 @@ impl LocalFilesystem {
                     cfg.db_path
                 ))?;
                 debug!("LocalFilesystem: quota enabled, db={:?}", cfg.db_path);
-                Some(qm)
+                Some(Arc::new(qm))
             }
             _ => None,
         };
@@ -87,7 +89,7 @@ impl LocalFilesystem {
     /// Access the quota manager, if one is configured.
     #[allow(dead_code)]
     pub fn quota_manager(&self) -> Option<&QuotaManager> {
-        self.quota_manager.as_ref()
+        self.quota_manager.as_deref()
     }
 
     /// Resolve a path to its owning quota directory, if any. Returns the
@@ -804,7 +806,7 @@ impl Filesystem for LocalFilesystem {
         let size_bytes = if need_size {
             // Compute the total byte footprint of the source before renaming.
             let src = from_full_path.clone();
-            tokio::task::spawn_blocking(move || path_size(&src))
+            tokio::task::spawn_blocking(move || allocated_path_size(&src))
                 .await
                 .context("spawn_blocking failed")??
         } else {
@@ -1105,6 +1107,17 @@ impl Filesystem for LocalFilesystem {
 
         Ok(real_stats)
     }
+
+    fn start_quota_reconciliation(&self) {
+        let Some(qm) = self.quota_manager.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tracing::info!("Quota reconciliation task started");
+            qm.reconcile_all().await;
+            tracing::info!("Quota reconciliation task finished");
+        });
+    }
 }
 
 /// Logically normalize a path: collapse `.` and `..` components and
@@ -1220,49 +1233,6 @@ fn check_db_path_outside_root(db_path: &Path, root_path: &Path) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Recursively sum the on-disk byte footprint (st_blocks * 512) of all
-/// regular files rooted at `path`. Used by cross-quota rename to compute
-/// the amount of usage to transfer between quota directories — the unit
-/// matches the allocated-bytes accounting used by `write()`/`remove()`.
-///
-/// Symlinks and other non-regular entries are not followed and do not
-/// contribute to the total — `symlink_metadata` is called per entry so
-/// the walk stays inside the export tree.
-fn path_size(path: &Path) -> Result<u64> {
-    let metadata =
-        fs::symlink_metadata(path).context(format!("Failed to stat path: {:?}", path))?;
-
-    if metadata.is_file() {
-        return Ok(metadata.blocks().saturating_mul(512));
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-
-    let mut total: u64 = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let rd = fs::read_dir(&current).context(format!(
-            "Failed to read dir while summing size: {:?}",
-            current
-        ))?;
-        for entry in rd {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let meta = fs::symlink_metadata(&entry_path).context(format!(
-                "Failed to stat path while summing size: {:?}",
-                entry_path
-            ))?;
-            if meta.is_dir() {
-                stack.push(entry_path);
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.blocks().saturating_mul(512));
-            }
-        }
-    }
-    Ok(total)
 }
 
 /// Return the on-disk byte footprint of the **symlink-resolved** path,
@@ -2248,6 +2218,48 @@ mod tests {
             qm.get_quota_info("pvc-b").await,
             Some(((4 * BLOCK) as u64, BLOCK as u64))
         );
+    }
+
+    #[tokio::test]
+    async fn test_start_quota_reconciliation_runs_scan() {
+        let (fs, export, _db) = create_test_fs_with_quota();
+        let qm = fs.quota_manager().unwrap();
+        qm.set_quota("pvc-a", 1_000_000).await.unwrap();
+        // Stale usage recorded in redb/in-memory.
+        qm.add_usage("pvc-a", 9999).await.unwrap();
+
+        // Put real files on disk totaling two blocks. Reconciliation now
+        // accounts in allocated bytes (st_blocks * 512), so block-aligned
+        // writes give a deterministic expected value.
+        let pvc_dir = export.path().join("pvc-a");
+        std::fs::create_dir_all(&pvc_dir).unwrap();
+        std::fs::write(pvc_dir.join("a.bin"), vec![0u8; BLOCK]).unwrap();
+        std::fs::write(pvc_dir.join("b.bin"), vec![0u8; BLOCK]).unwrap();
+        let expected_usage = (2 * BLOCK) as u64;
+
+        fs.start_quota_reconciliation();
+
+        // Poll until the background task has reconciled. Use a short loop
+        // with a cap to avoid hanging a broken test.
+        let mut waited = 0u64;
+        loop {
+            let info = fs.quota_manager().unwrap().get_quota_info("pvc-a").await;
+            if info == Some((1_000_000, expected_usage)) {
+                break;
+            }
+            if waited > 2000 {
+                panic!("Reconciliation did not complete, last={:?}", info);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            waited += 20;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_quota_reconciliation_no_quota_is_noop() {
+        let (fs, _export) = create_test_fs();
+        // Must not panic even though no quota manager is configured.
+        fs.start_quota_reconciliation();
     }
 
     #[tokio::test]
