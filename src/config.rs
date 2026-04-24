@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/arcticwolf/config.toml";
+const DEFAULT_QUOTA_DB_PATH: &str = "/var/lib/arcticwolf/quota.db";
 
 #[derive(Parser, Debug)]
 #[command(name = "arcticwolf")]
@@ -25,6 +26,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub fsal: FsalConfig,
     pub logging: LoggingConfig,
+    pub quota: QuotaConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +48,65 @@ pub struct FsalConfig {
 pub struct LoggingConfig {
     /// Log level. If not set, falls back to RUST_LOG env var, then "info"
     pub level: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QuotaConfig {
+    /// Enable quota enforcement
+    pub enabled: bool,
+    /// Path to the redb database file storing quota limits and usage
+    pub db_path: PathBuf,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: PathBuf::from(DEFAULT_QUOTA_DB_PATH),
+        }
+    }
+}
+
+/// Parse a human-readable size string into bytes
+///
+/// Supported suffixes (case-insensitive): B, KB, MB, GB, TB
+/// Uses 1024-based units (KiB/MiB/GiB/TiB semantics). Plain numbers are treated as bytes.
+///
+/// # Examples
+/// - "1024" -> 1024
+/// - "10KB" -> 10240
+/// - "5MB" -> 5242880
+/// - "2GB" -> 2147483648
+#[allow(dead_code)]
+pub fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Empty size string");
+    }
+
+    let upper = trimmed.to_uppercase();
+    let (num_part, multiplier): (&str, u64) = if let Some(prefix) = upper.strip_suffix("TB") {
+        (prefix, 1024u64.pow(4))
+    } else if let Some(prefix) = upper.strip_suffix("GB") {
+        (prefix, 1024u64.pow(3))
+    } else if let Some(prefix) = upper.strip_suffix("MB") {
+        (prefix, 1024u64.pow(2))
+    } else if let Some(prefix) = upper.strip_suffix("KB") {
+        (prefix, 1024)
+    } else if let Some(prefix) = upper.strip_suffix('B') {
+        (prefix, 1)
+    } else {
+        (upper.as_str(), 1)
+    };
+
+    let num_str = num_part.trim();
+    let num: u64 = num_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid size '{}': {}", s, e))?;
+
+    num.checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("Size overflow: {}", s))
 }
 
 impl Default for ServerConfig {
@@ -226,5 +287,83 @@ mod tests {
     fn test_parse_invalid_toml() {
         let result: Result<Config, _> = toml::from_str("this is not valid toml [[[");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quota_config_default() {
+        let config = QuotaConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.db_path, PathBuf::from(DEFAULT_QUOTA_DB_PATH));
+    }
+
+    #[test]
+    fn test_config_default_includes_quota() {
+        let config = Config::default();
+        assert!(!config.quota.enabled);
+    }
+
+    #[test]
+    fn test_parse_quota_toml() {
+        let toml = r#"
+            [quota]
+            enabled = true
+            db_path = "/tmp/quota.db"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("Failed to parse TOML");
+        assert!(config.quota.enabled);
+        assert_eq!(config.quota.db_path, PathBuf::from("/tmp/quota.db"));
+    }
+
+    #[test]
+    fn test_parse_size_bytes() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("1").unwrap(), 1);
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("512B").unwrap(), 512);
+    }
+
+    #[test]
+    fn test_parse_size_kb() {
+        assert_eq!(parse_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_size("10KB").unwrap(), 10 * 1024);
+        assert_eq!(parse_size("1kb").unwrap(), 1024); // case-insensitive
+    }
+
+    #[test]
+    fn test_parse_size_mb() {
+        assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("5MB").unwrap(), 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_gb() {
+        assert_eq!(parse_size("1GB").unwrap(), 1024u64.pow(3));
+        assert_eq!(parse_size("10GB").unwrap(), 10 * 1024u64.pow(3));
+    }
+
+    #[test]
+    fn test_parse_size_tb() {
+        assert_eq!(parse_size("1TB").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_size("2TB").unwrap(), 2 * 1024u64.pow(4));
+    }
+
+    #[test]
+    fn test_parse_size_whitespace() {
+        assert_eq!(parse_size("  10MB  ").unwrap(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_invalid() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("10XB").is_err());
+        assert!(parse_size("-5MB").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_overflow() {
+        // u64::MAX / 1024^4 is ~16 million TB
+        assert!(parse_size("99999999999999999TB").is_err());
     }
 }
