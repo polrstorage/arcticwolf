@@ -155,7 +155,7 @@ mod tests {
         fs::write(&test_file, "test content").unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_remove".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_remove".to_string(), None).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -194,7 +194,8 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
 
         // Create filesystem (file does NOT exist)
-        let fs = LocalFilesystem::new("/tmp/nfs_test_remove_nonexistent".to_string()).unwrap();
+        let fs =
+            LocalFilesystem::new("/tmp/nfs_test_remove_nonexistent".to_string(), None).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;

@@ -15,6 +15,7 @@ pub mod quota;
 // #[cfg(test)]
 // pub mod memory;
 
+use crate::config::QuotaConfig;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -363,6 +364,8 @@ pub struct BackendConfig {
     pub backend_type: BackendType,
     /// Root path for local backend
     pub local_root: Option<PathBuf>,
+    /// Quota configuration (applied to the local backend when enabled)
+    pub quota: Option<QuotaConfig>,
     /// S3 configuration (future)
     #[allow(dead_code)]
     pub s3_config: Option<S3Config>,
@@ -395,9 +398,16 @@ impl BackendConfig {
         Self {
             backend_type: BackendType::Local,
             local_root: Some(root.into()),
+            quota: None,
             s3_config: None,
             ceph_config: None,
         }
+    }
+
+    /// Attach quota configuration to this backend configuration.
+    pub fn with_quota(mut self, quota: QuotaConfig) -> Self {
+        self.quota = Some(quota);
+        self
     }
 
     /// Create filesystem instance from configuration
@@ -408,7 +418,7 @@ impl BackendConfig {
                     .local_root
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Local root path not configured"))?;
-                let fs = LocalFilesystem::new(root)?;
+                let fs = LocalFilesystem::new(root, self.quota.as_ref())?;
                 Ok(Box::new(fs))
             }
             BackendType::S3 => {
