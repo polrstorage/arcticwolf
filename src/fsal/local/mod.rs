@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use super::handle::{FileHandle, HandleManager};
-use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem};
+use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats};
 
 /// Local filesystem implementation
 pub struct LocalFilesystem {
@@ -796,6 +796,52 @@ impl Filesystem for LocalFilesystem {
         let handle = self.handle_manager.create_handle(file_path.clone());
         Ok(handle)
     }
+
+    async fn statvfs(&self, handle: &FileHandle) -> Result<FsStats> {
+        let path = self.resolve_handle(handle)?;
+        let path_owned = path.clone();
+
+        tokio::task::spawn_blocking(move || statvfs_on_path(&path_owned))
+            .await
+            .context("spawn_blocking failed")?
+    }
+}
+
+/// Call `libc::statvfs` on `path` and convert the result into `FsStats`.
+fn statvfs_on_path(path: &Path) -> Result<FsStats> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path =
+        CString::new(path.as_os_str().as_bytes()).context("Path contains interior NUL byte")?;
+
+    // Safety: zero-initializing libc::statvfs is valid; the struct is a POD
+    // descriptor that the kernel fills in.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("statvfs failed for {:?}: {}", path, err));
+    }
+
+    // f_frsize is the fragment size used for f_blocks/f_bfree/f_bavail.
+    // Linux always populates it, but some exotic backends report 0; fall
+    // back to the logical block size (f_bsize) so FSSTAT never returns
+    // a bogus 0-byte filesystem. Multiplications use saturating_mul as a
+    // belt-and-braces guard against overflow on huge filesystems.
+    let block_size = if stat.f_frsize == 0 {
+        stat.f_bsize
+    } else {
+        stat.f_frsize
+    };
+    Ok(FsStats {
+        total_bytes: stat.f_blocks.saturating_mul(block_size),
+        free_bytes: stat.f_bfree.saturating_mul(block_size),
+        avail_bytes: stat.f_bavail.saturating_mul(block_size),
+        total_files: stat.f_files,
+        free_files: stat.f_ffree,
+        avail_files: stat.f_favail,
+    })
 }
 
 #[cfg(test)]
@@ -1045,5 +1091,32 @@ mod tests {
             handle1, handle2,
             "Multiple lookups should return same handle"
         );
+    }
+
+    #[tokio::test]
+    async fn test_statvfs_returns_real_stats() {
+        let (fs, _temp_dir) = create_test_fs();
+        let root = fs.root_handle().await;
+
+        let stats = fs.statvfs(&root).await.expect("statvfs should succeed");
+
+        // We can't predict exact values across different hosts, but a real
+        // filesystem will report non-zero totals and some non-zero inode
+        // capacity; available <= free <= total.
+        assert!(stats.total_bytes > 0, "total_bytes should be non-zero");
+        assert!(stats.free_bytes <= stats.total_bytes);
+        assert!(stats.avail_bytes <= stats.free_bytes);
+        assert!(stats.total_files > 0, "total_files should be non-zero");
+        assert!(stats.free_files <= stats.total_files);
+        assert!(stats.avail_files <= stats.free_files);
+    }
+
+    #[tokio::test]
+    async fn test_statvfs_invalid_handle() {
+        let (fs, _temp_dir) = create_test_fs();
+        let bogus: FileHandle = vec![0xAA; 32];
+
+        let result = fs.statvfs(&bogus).await;
+        assert!(result.is_err(), "statvfs with invalid handle should fail");
     }
 }

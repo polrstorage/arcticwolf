@@ -51,14 +51,24 @@ pub async fn handle_fsstat(
         }
     };
 
-    // Get filesystem statistics
-    // For now, use hardcoded values - in production this would query the actual filesystem
-    let tbytes = 1024 * 1024 * 1024 * 100u64; // 100 GB total
-    let fbytes = 1024 * 1024 * 1024 * 50u64; // 50 GB free
-    let abytes = 1024 * 1024 * 1024 * 50u64; // 50 GB available to non-root
-    let tfiles = 1000000u64; // 1M total inodes
-    let ffiles = 500000u64; // 500k free inodes
-    let afiles = 500000u64; // 500k available inodes to non-root
+    // Query filesystem statistics via the FSAL. The backend returns real
+    // statvfs values; a later stage folds quota-aware byte counts into this
+    // same path.
+    let stats = match filesystem.statvfs(&args.fsroot.0).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("FSSTAT statvfs failed: {}", e);
+            let res_data = NfsMessage::create_fsstat_error_response(nfsstat3::NFS3ERR_IO)?;
+            return RpcMessage::create_success_reply_with_data(xid, res_data);
+        }
+    };
+
+    let tbytes = stats.total_bytes;
+    let fbytes = stats.free_bytes;
+    let abytes = stats.avail_bytes;
+    let tfiles = stats.total_files;
+    let ffiles = stats.free_files;
+    let afiles = stats.avail_files;
     let invarsec = 0u32; // filesystem not expected to change without client intervention
 
     debug!(

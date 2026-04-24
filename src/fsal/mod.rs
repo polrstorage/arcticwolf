@@ -90,6 +90,27 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
+/// Filesystem space statistics
+///
+/// Mirrors the fields returned by NFSv3 FSSTAT (procedure 18).
+/// Byte counts may reflect a folder quota when one applies; inode counts
+/// always come from the underlying filesystem.
+#[derive(Debug, Clone, Copy)]
+pub struct FsStats {
+    /// Total bytes available (from quota or underlying FS)
+    pub total_bytes: u64,
+    /// Free bytes
+    pub free_bytes: u64,
+    /// Bytes available to non-privileged users
+    pub avail_bytes: u64,
+    /// Total number of inodes
+    pub total_files: u64,
+    /// Free inodes
+    pub free_files: u64,
+    /// Inodes available to non-privileged users
+    pub avail_files: u64,
+}
+
 /// Filesystem trait
 ///
 /// This trait defines the interface that all filesystem backends must implement.
@@ -310,6 +331,13 @@ pub trait Filesystem: Send + Sync {
         mode: u32,
         rdev: (u32, u32),
     ) -> Result<FileHandle>;
+
+    /// Return filesystem space statistics for the subtree identified by `handle`.
+    ///
+    /// Used by NFS FSSTAT. Byte counts reflect a configured folder quota
+    /// when applicable; inode counts always come from the underlying
+    /// filesystem.
+    async fn statvfs(&self, handle: &FileHandle) -> Result<FsStats>;
 }
 
 /// Filesystem backend types
