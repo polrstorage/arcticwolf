@@ -160,7 +160,7 @@ mod tests {
         fs::create_dir(&target_dir).unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir".to_string(), None).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -199,7 +199,7 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
 
         // Create filesystem (directory does NOT exist)
-        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_nonexistent".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_nonexistent".to_string(), None).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -237,7 +237,7 @@ mod tests {
         fs::write(target_dir.join("somefile.txt"), "data").unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_notempty".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_rmdir_notempty".to_string(), None).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;

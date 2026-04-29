@@ -50,22 +50,33 @@ pub async fn handle_write(
         Ok(count) => count,
         Err(e) => {
             debug!("WRITE failed: {}", e);
+            // Bind the error string once: it is otherwise reformatted on
+            // every `contains` arm and the cost adds up on the hot path.
+            let error_string = e.to_string();
             // Return appropriate NFS error
-            let error_status = if e.to_string().contains("not found")
-                || e.to_string().contains("Invalid handle")
-            {
-                nfsstat3::NFS3ERR_STALE
-            } else if e.to_string().contains("Not a file") {
-                nfsstat3::NFS3ERR_ISDIR
-            } else if e.to_string().contains("Permission denied") {
-                nfsstat3::NFS3ERR_ACCES
-            } else if e.to_string().contains("No space") {
-                nfsstat3::NFS3ERR_NOSPC
-            } else if e.to_string().contains("Read-only") {
-                nfsstat3::NFS3ERR_ROFS
-            } else {
-                nfsstat3::NFS3ERR_IO
-            };
+            let error_status =
+                if error_string.contains("not found") || error_string.contains("Invalid handle") {
+                    nfsstat3::NFS3ERR_STALE
+                } else if error_string.contains("Not a file") {
+                    nfsstat3::NFS3ERR_ISDIR
+                } else if error_string.contains("Permission denied") {
+                    nfsstat3::NFS3ERR_ACCES
+                } else if error_string.contains("Quota exceeded")
+                    || error_string.contains("Disk quota exceeded")
+                {
+                    // Two cases: our own QuotaManager prefixes errors with
+                    // "Quota exceeded ...", and Linux's EDQUOT (which the
+                    // underlying filesystem may return when an OS-level
+                    // project/user quota is in effect) renders as
+                    // "Disk quota exceeded".
+                    nfsstat3::NFS3ERR_DQUOT
+                } else if error_string.contains("No space") {
+                    nfsstat3::NFS3ERR_NOSPC
+                } else if error_string.contains("Read-only") {
+                    nfsstat3::NFS3ERR_ROFS
+                } else {
+                    nfsstat3::NFS3ERR_IO
+                };
 
             let res_data = NfsMessage::create_write_error_response(error_status)?;
             return RpcMessage::create_success_reply_with_data(xid, res_data);

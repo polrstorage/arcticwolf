@@ -5,6 +5,7 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 //
 // This library provides the core components for building an NFSv3 server
 
+pub mod config;
 pub mod fsal;
 pub mod mount;
 pub mod nfs;

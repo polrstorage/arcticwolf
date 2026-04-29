@@ -61,11 +61,21 @@ pub async fn handle_setattr(
 
         if let Err(e) = filesystem.setattr_size(&args.object.0, *new_size).await {
             debug!("SETATTR: failed to set size: {}", e);
-            let error_status = if e.to_string().contains("not found") {
+            // Bind once and reuse for every classification arm.
+            let error_string = e.to_string();
+            let error_status = if error_string.contains("not found") {
                 nfsstat3::NFS3ERR_STALE
-            } else if e.to_string().contains("Permission denied") {
+            } else if error_string.contains("Permission denied") {
                 nfsstat3::NFS3ERR_ACCES
-            } else if e.to_string().contains("Read-only") {
+            } else if error_string.contains("Quota exceeded")
+                || error_string.contains("Disk quota exceeded")
+            {
+                // Cover both our QuotaManager's "Quota exceeded" and the
+                // OS-level EDQUOT formatting "Disk quota exceeded" that
+                // an underlying filesystem (e.g. XFS project quotas)
+                // may surface during a SETATTR truncate.
+                nfsstat3::NFS3ERR_DQUOT
+            } else if error_string.contains("Read-only") {
                 nfsstat3::NFS3ERR_ROFS
             } else {
                 nfsstat3::NFS3ERR_IO
@@ -81,9 +91,10 @@ pub async fn handle_setattr(
 
         if let Err(e) = filesystem.setattr_mode(&args.object.0, *mode).await {
             debug!("SETATTR: failed to set mode: {}", e);
-            let error_status = if e.to_string().contains("not found") {
+            let error_string = e.to_string();
+            let error_status = if error_string.contains("not found") {
                 nfsstat3::NFS3ERR_STALE
-            } else if e.to_string().contains("Permission denied") {
+            } else if error_string.contains("Permission denied") {
                 nfsstat3::NFS3ERR_ACCES
             } else {
                 nfsstat3::NFS3ERR_IO
@@ -108,9 +119,10 @@ pub async fn handle_setattr(
 
         if let Err(e) = filesystem.setattr_owner(&args.object.0, uid, gid).await {
             debug!("SETATTR: failed to set owner: {}", e);
-            let error_status = if e.to_string().contains("not found") {
+            let error_string = e.to_string();
+            let error_status = if error_string.contains("not found") {
                 nfsstat3::NFS3ERR_STALE
-            } else if e.to_string().contains("Permission denied") {
+            } else if error_string.contains("Permission denied") {
                 nfsstat3::NFS3ERR_ACCES
             } else {
                 nfsstat3::NFS3ERR_IO

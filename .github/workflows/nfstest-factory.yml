@@ -45,6 +45,27 @@ jobs:
           sed -i '/imagePullPolicy/d' deploy/k8s/deployment.yaml
           # Add imagePullPolicy: Never for local image
           sed -i 's|image: arcticwolf:test|image: arcticwolf:test\n          imagePullPolicy: Never|g' deploy/k8s/deployment.yaml
+          # Enable folder quota with a bootstrap entry so the quota smoke
+          # test below has something to enforce against. The entry matches
+          # tests/test_nfs_quota.sh defaults (PVC_NAME=pvc-quota-test,
+          # QUOTA_BYTES=1048576).
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("deploy/k8s/deployment.yaml")
+          text = p.read_text()
+          marker = '    [logging]\n    level = "debug"'
+          addition = (
+              '\n'
+              '    [quota]\n'
+              '    enabled = true\n'
+              '    db_path = "/tmp/.arcticwolf-quota.db"\n'
+              '\n'
+              '    [quota.bootstrap]\n'
+              '    "pvc-quota-test" = "1MB"\n'
+          )
+          assert marker in text, "deployment.yaml logging block not found"
+          p.write_text(text.replace(marker, marker + addition))
+          PY
           kubectl apply -f deploy/k8s/deployment.yaml
           kubectl wait --for=condition=Ready pod -l app=arcticwolf --timeout=120s
 
@@ -67,6 +88,18 @@ jobs:
           sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/ /mnt/nfs
           echo "NFS mounted successfully"
           ls -la /mnt/nfs/
+
+      # Exercise folder quota against the live mount before running the
+      # broader POSIX suite. The quota directory (pvc-quota-test) is
+      # isolated from the paths nfstest_posix touches, so the two suites
+      # do not interfere.
+      - name: Run folder quota smoke test
+        run: |
+          sudo env \
+            MOUNT_POINT=/mnt/nfs \
+            PVC_NAME=pvc-quota-test \
+            QUOTA_BYTES=1048576 \
+            bash tests/test_nfs_quota.sh
 
       # skip test open until we start to review the failures
       # read/write tests are mandatory and must pass

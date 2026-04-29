@@ -101,6 +101,14 @@ async fn main() -> Result<()> {
     println!("  NFS port: {}", config.server.nfs_port);
     println!("  FSAL backend: {}", config.fsal.backend);
     println!("  Export path: {}", config.fsal.export_path.display());
+    println!(
+        "  Quota: {}",
+        if config.quota.enabled {
+            format!("enabled (db={})", config.quota.db_path.display())
+        } else {
+            "disabled".to_string()
+        }
+    );
     println!("  Log level: {}", log_level_str);
     println!();
 
@@ -115,11 +123,36 @@ async fn main() -> Result<()> {
         );
     }
 
-    let fsal_config = BackendConfig::local(&config.fsal.export_path);
+    let fsal_config =
+        BackendConfig::local(&config.fsal.export_path).with_quota(config.quota.clone());
     let filesystem: Arc<dyn fsal::Filesystem> = Arc::from(fsal_config.create_filesystem()?);
 
     let root_handle = filesystem.root_handle().await;
     println!("  Root handle: {} bytes", root_handle.len());
+
+    // Apply any declarative bootstrap entries from config before taking
+    // traffic. The backend silently ignores bootstrap when quota is
+    // disabled, so gate the user-facing message on the same flag —
+    // otherwise operators see "applied N entries" even when nothing
+    // actually took effect.
+    if config.quota.enabled && !config.quota.bootstrap.is_empty() {
+        filesystem
+            .apply_quota_bootstrap(&config.quota.bootstrap)
+            .await?;
+        println!(
+            "  Quota bootstrap: applied {} entries",
+            config.quota.bootstrap.len()
+        );
+    }
+
+    // Kick off a background pass that reconciles stored quota usage with
+    // the actual on-disk size. The server starts accepting traffic
+    // immediately; drift from out-of-band filesystem changes is corrected
+    // while requests are being served.
+    if config.quota.enabled {
+        filesystem.start_quota_reconciliation();
+        println!("  Quota reconciliation: scheduled (background)");
+    }
     println!();
 
     // Create portmapper registry

@@ -5,6 +5,7 @@
 
 pub mod handle;
 pub mod local;
+pub mod quota;
 
 // Future backends (uncomment when implemented)
 // #[cfg(feature = "s3")]
@@ -14,8 +15,10 @@ pub mod local;
 // #[cfg(test)]
 // pub mod memory;
 
+use crate::config::QuotaConfig;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -87,6 +90,27 @@ pub struct DirEntry {
     pub name: String,
     /// File type
     pub file_type: FileType,
+}
+
+/// Filesystem space statistics
+///
+/// Mirrors the fields returned by NFSv3 FSSTAT (procedure 18).
+/// Byte counts may reflect a folder quota when one applies; inode counts
+/// always come from the underlying filesystem.
+#[derive(Debug, Clone, Copy)]
+pub struct FsStats {
+    /// Total bytes available (from quota or underlying FS)
+    pub total_bytes: u64,
+    /// Free bytes
+    pub free_bytes: u64,
+    /// Bytes available to non-privileged users
+    pub avail_bytes: u64,
+    /// Total number of inodes
+    pub total_files: u64,
+    /// Free inodes
+    pub free_files: u64,
+    /// Inodes available to non-privileged users
+    pub avail_files: u64,
 }
 
 /// Filesystem trait
@@ -309,6 +333,31 @@ pub trait Filesystem: Send + Sync {
         mode: u32,
         rdev: (u32, u32),
     ) -> Result<FileHandle>;
+
+    /// Return filesystem space statistics for the subtree identified by `handle`.
+    ///
+    /// Used by NFS FSSTAT. Byte counts reflect a configured folder quota
+    /// when applicable; inode counts always come from the underlying
+    /// filesystem.
+    async fn statvfs(&self, handle: &FileHandle) -> Result<FsStats>;
+
+    /// Start a background reconciliation task that scans tracked quota
+    /// directories and corrects usage drift.
+    ///
+    /// The default implementation does nothing. Backends that support
+    /// quotas override this to spawn their own task.
+    fn start_quota_reconciliation(&self) {}
+
+    /// Apply a declarative quota bootstrap at startup. Entries install
+    /// a quota only when the target directory has none yet; already
+    /// tracked directories are left alone so the bootstrap is
+    /// idempotent across restarts.
+    ///
+    /// The default implementation does nothing. Backends that support
+    /// quotas override this.
+    async fn apply_quota_bootstrap(&self, _bootstrap: &HashMap<String, String>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Filesystem backend types
@@ -334,6 +383,8 @@ pub struct BackendConfig {
     pub backend_type: BackendType,
     /// Root path for local backend
     pub local_root: Option<PathBuf>,
+    /// Quota configuration (applied to the local backend when enabled)
+    pub quota: Option<QuotaConfig>,
     /// S3 configuration (future)
     #[allow(dead_code)]
     pub s3_config: Option<S3Config>,
@@ -366,9 +417,16 @@ impl BackendConfig {
         Self {
             backend_type: BackendType::Local,
             local_root: Some(root.into()),
+            quota: None,
             s3_config: None,
             ceph_config: None,
         }
+    }
+
+    /// Attach quota configuration to this backend configuration.
+    pub fn with_quota(mut self, quota: QuotaConfig) -> Self {
+        self.quota = Some(quota);
+        self
     }
 
     /// Create filesystem instance from configuration
@@ -379,7 +437,7 @@ impl BackendConfig {
                     .local_root
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Local root path not configured"))?;
-                let fs = LocalFilesystem::new(root)?;
+                let fs = LocalFilesystem::new(root, self.quota.as_ref())?;
                 Ok(Box::new(fs))
             }
             BackendType::S3 => {
