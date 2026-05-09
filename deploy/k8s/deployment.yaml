@@ -11,9 +11,12 @@ data:
     nfs_port = 2049
     mount_port = 0
 
-    [fsal]
+    [[exports]]
+    name = "/data"
+    uid = 1
+    read_only = false
     backend = "local"
-    export_path = "/tmp/nfs_exports"
+    path = "/tmp/nfs_exports"
 
     [logging]
     level = "debug"

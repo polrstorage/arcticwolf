@@ -65,6 +65,86 @@ Using structs for optional fields causes "failed to fill whole buffer" errors wi
 5. Implement in `src/fsal/local.rs`
 6. Add test: `tests/test_nfs_operation.py`
 
+## Configuration Schema
+
+Server configuration is loaded from `/etc/arcticwolf/config.toml` (or `--config <path>`).
+The schema is enforced by three layers:
+
+- `#[serde(deny_unknown_fields)]` on the top-level `Config` and on the tagged
+  `BackendConfig` enum rejects unknown keys at the outer and backend layers. The
+  `ExportConfig` struct itself cannot carry the attribute (it uses
+  `#[serde(flatten)]` for `backend`), but typos at the export level still fail
+  fast via cascade: serde routes any key not matched by `ExportConfig`'s direct
+  fields through the flatten buffer into `BackendConfig`, whose
+  `deny_unknown_fields` then errors out.
+- `Config::load()` additionally wraps deserialization in `serde_ignored` to
+  catch unknown keys in the non-flattened sections (`[server]`, `[logging]`)
+  whose structs intentionally allow `#[serde(default)]`-style partial overrides
+  and so cannot use `deny_unknown_fields`. `serde_ignored` cannot see flatten
+  leftovers, so it complements rather than replaces the cascade above.
+- `Config::validate()` then enforces invariants (uid != 0, unique uid, unique
+  name, name starts with `/`, local backend path is absolute) before the server
+  starts.
+
+Any of these layers rejecting input causes a fail-fast startup error rather
+than silent fallback.
+
+### `[[exports]]`
+
+Each NFS export is one entry in the `exports` array. At least one entry is required.
+
+Required fields:
+
+- `name` — export path advertised to clients (e.g. `"/data"`). Must start with `/` and
+  be unique across all exports.
+- `uid` — `u32` in the range `1..=u32::MAX` (i.e. non-zero). Must be unique across
+  exports. The value is encoded into the first 4 bytes of every file handle this
+  export hands out, so collisions would make handles ambiguous. `0` is reserved as an
+  invalid sentinel and is rejected.
+- `backend` — storage backend discriminator. Currently only `"local"` is supported.
+  The field is deserialized as a tagged enum (`#[serde(tag = "backend")]`) so adding
+  S3/Ceph/etc. later only requires a new enum variant — the TOML shape stays the same.
+- backend-specific keys — sit alongside the keys above. For `backend = "local"`:
+  - `path` — absolute path on the server's local filesystem.
+
+Optional fields:
+
+- `read_only` — if `true`, deny writes against this export. Defaults to `false`.
+
+### Startup validation (fail-fast)
+
+`Config::validate()` rejects:
+
+- empty `exports` list
+- any `uid == 0`
+- duplicate `uid` across exports
+- duplicate `name` across exports
+- `name` not starting with `/`
+
+### Removed: `[fsal]`
+
+The single-export `[fsal]` section from earlier versions has been removed. Because the
+top-level `Config` carries `#[serde(deny_unknown_fields)]`, a config file that still
+contains `[fsal]` will fail to parse with an "unknown field" error rather than being
+silently ignored.
+
+### Minimal example
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+nfs_port = 2049
+mount_port = 0
+
+[[exports]]
+name = "/data"
+uid = 1
+backend = "local"
+path = "/srv/nfs/data"
+```
+
+See `arcticwolf.example.toml` for a fuller annotated example.
+
 ## Code Quality Guidelines
 
 ### Logging Initialization Order
