@@ -81,7 +81,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
- "getrandom 0.2.17",
+ "getrandom",
  "libc",
  "serde",
  "serde_ignored",
@@ -220,17 +220,6 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
-name = "getrandom"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
-dependencies = [
- "cfg-if",
- "libc",
- "wasi",
-]
 
 [[package]]
 name = "getrandom"
@@ -561,7 +550,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d31c77bdf42a745371d260a26ca7163f1e0924b64afa0b688e61b5a9fa02f16"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

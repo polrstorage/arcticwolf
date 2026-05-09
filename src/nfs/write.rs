@@ -139,8 +139,10 @@ mod tests {
     async fn test_write_file() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Create a test file
         let test_file = temp_dir.path().join("writetest.txt");
@@ -180,8 +182,10 @@ mod tests {
     async fn test_write_with_offset() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Create a test file with initial content
         let test_file = temp_dir.path().join("offset.txt");
@@ -221,8 +225,10 @@ mod tests {
     async fn test_write_nonexistent_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Use invalid file handle
         use crate::protocol::v3::nfs::{WRITE3args, fhandle3, stable_how};

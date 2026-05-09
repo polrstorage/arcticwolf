@@ -207,7 +207,7 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir".to_string(), 1).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -269,7 +269,7 @@ mod tests {
         fs::create_dir(test_dir.join("existingdir")).unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir_exists".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir_exists".to_string(), 1).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;

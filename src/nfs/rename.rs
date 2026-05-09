@@ -233,7 +233,7 @@ mod tests {
         file.write_all(b"test content").unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_rename".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_rename".to_string(), 1).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -286,7 +286,7 @@ mod tests {
         fs::create_dir(test_dir.join("olddir")).unwrap();
 
         // Create filesystem
-        let fs = LocalFilesystem::new("/tmp/nfs_test_rename_dir".to_string()).unwrap();
+        let fs = LocalFilesystem::new("/tmp/nfs_test_rename_dir".to_string(), 1).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;

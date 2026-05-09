@@ -2,6 +2,10 @@
 //
 // File handles are opaque identifiers used by NFS to reference files/directories.
 // This module manages the bidirectional mapping between file handles and paths.
+//
+// Handle layout (32 bytes):
+//   bytes 0..4   : export uid (big-endian u32) — see issue #26
+//   bytes 4..32  : random opaque id
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,34 +14,71 @@ use std::sync::{Arc, RwLock};
 /// File handle type (opaque bytes)
 pub type FileHandle = Vec<u8>;
 
+/// Total handle size in bytes.
+pub const HANDLE_LEN: usize = 32;
+/// Length of the export-uid prefix.
+pub const EXPORT_UID_LEN: usize = 4;
+/// Length of the random opaque tail.
+#[allow(dead_code)]
+pub const OPAQUE_LEN: usize = HANDLE_LEN - EXPORT_UID_LEN;
+
+/// Extension trait for parsing the export-uid prefix from a [`FileHandle`].
+///
+/// Used in Phase 3 by the multi-export router to dispatch handles to the
+/// owning backend; defined here so handle construction and inspection live
+/// next to each other.
+#[allow(dead_code)]
+pub trait FileHandleExt {
+    /// Decode the export uid stored in the first 4 bytes (big-endian).
+    ///
+    /// Returns `None` for slices shorter than [`EXPORT_UID_LEN`] so the
+    /// Phase 3 router can feed untrusted wire bytes through this without
+    /// panicking on malformed handles.
+    fn export_uid(&self) -> Option<u32>;
+}
+
+impl FileHandleExt for [u8] {
+    fn export_uid(&self) -> Option<u32> {
+        if self.len() < EXPORT_UID_LEN {
+            return None;
+        }
+        let bytes: [u8; EXPORT_UID_LEN] = self[..EXPORT_UID_LEN].try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
+}
+
 /// File handle manager
 ///
 /// Maintains the mapping between file handles and filesystem paths.
-/// Thread-safe for concurrent access.
+/// Thread-safe for concurrent access. Each manager is bound to a single
+/// export uid; every handle it produces carries that uid in its prefix
+/// so the multi-export router (Phase 3) can dispatch by parsing the
+/// first 4 bytes of an incoming handle.
 #[derive(Clone)]
 pub struct HandleManager {
+    /// Export uid embedded in every handle produced by this manager.
+    export_uid: u32,
     /// Map from file handle to path
     handle_to_path: Arc<RwLock<HashMap<FileHandle, PathBuf>>>,
     /// Map from path to file handle (for quick lookups)
     path_to_handle: Arc<RwLock<HashMap<PathBuf, FileHandle>>>,
-    /// Counter for generating unique handles
-    next_id: Arc<RwLock<u64>>,
 }
 
 impl HandleManager {
-    /// Create a new handle manager
-    pub fn new() -> Self {
+    /// Create a new handle manager bound to `export_uid`.
+    pub fn new(export_uid: u32) -> Self {
         Self {
+            export_uid,
             handle_to_path: Arc::new(RwLock::new(HashMap::new())),
             path_to_handle: Arc::new(RwLock::new(HashMap::new())),
-            next_id: Arc::new(RwLock::new(1)), // Start from 1 (0 could be reserved)
         }
     }
 
     /// Generate a new file handle for a path
     ///
     /// If the path already has a handle, return the existing one.
-    /// Otherwise, create a new handle.
+    /// Otherwise, create a new handle whose first 4 bytes encode the
+    /// manager's export uid and whose remaining 28 bytes are random.
     pub fn create_handle(&self, path: PathBuf) -> FileHandle {
         // Check if path already has a handle
         {
@@ -47,25 +88,9 @@ impl HandleManager {
             }
         }
 
-        // Generate new handle
-        let id = {
-            let mut next_id = self.next_id.write().unwrap();
-            let current = *next_id;
-            *next_id += 1;
-            current
-        };
-
-        // Create handle from ID (32 bytes with ID in first 8 bytes)
-        let mut handle = vec![0u8; 32];
-        handle[0..8].copy_from_slice(&id.to_be_bytes());
-
-        // Store path hash in bytes 8-16 for verification
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        let path_hash = hasher.finish();
-        handle[8..16].copy_from_slice(&path_hash.to_be_bytes());
+        let mut handle = vec![0u8; HANDLE_LEN];
+        handle[..EXPORT_UID_LEN].copy_from_slice(&self.export_uid.to_be_bytes());
+        fill_random(&mut handle[EXPORT_UID_LEN..]);
 
         // Store mappings
         {
@@ -116,10 +141,13 @@ impl HandleManager {
     }
 }
 
-impl Default for HandleManager {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Fill `dst` with cryptographically random bytes.
+///
+/// Backed by the `getrandom` crate, which on Linux is the `getrandom(2)`
+/// syscall — no per-call file descriptor is allocated, so the NFS hot path
+/// does not pay an `open("/dev/urandom")` for every handle creation.
+fn fill_random(dst: &mut [u8]) {
+    getrandom::fill(dst).expect("getrandom failed");
 }
 
 #[cfg(test)]
@@ -128,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_create_and_lookup() {
-        let manager = HandleManager::new();
+        let manager = HandleManager::new(1);
         let path = PathBuf::from("/test/file.txt");
 
         let handle = manager.create_handle(path.clone());
@@ -137,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_idempotent_create() {
-        let manager = HandleManager::new();
+        let manager = HandleManager::new(1);
         let path = PathBuf::from("/test/file.txt");
 
         let handle1 = manager.create_handle(path.clone());
@@ -148,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_remove_handle() {
-        let manager = HandleManager::new();
+        let manager = HandleManager::new(1);
         let path = PathBuf::from("/test/file.txt");
 
         let handle = manager.create_handle(path.clone());
@@ -157,5 +185,50 @@ mod tests {
         let removed_path = manager.remove_handle(&handle);
         assert_eq!(removed_path, Some(path));
         assert!(!manager.is_valid(&handle));
+    }
+
+    #[test]
+    fn test_handle_layout_round_trip() {
+        let manager = HandleManager::new(5);
+        let handle = manager.create_handle(PathBuf::from("/x"));
+        assert_eq!(handle.len(), HANDLE_LEN);
+        assert_eq!(handle.export_uid().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_distinct_uids_distinct_prefix() {
+        let m1 = HandleManager::new(1);
+        let m2 = HandleManager::new(2);
+        let h1 = m1.create_handle(PathBuf::from("/a"));
+        let h2 = m2.create_handle(PathBuf::from("/a"));
+        assert_ne!(&h1[..EXPORT_UID_LEN], &h2[..EXPORT_UID_LEN]);
+        assert_eq!(h1.export_uid().unwrap(), 1);
+        assert_eq!(h2.export_uid().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_same_uid_shared_prefix_distinct_tail() {
+        // Two paths within one export get the same uid prefix but different
+        // (random) tails — collision probability is 2^-224.
+        let manager = HandleManager::new(7);
+        let h1 = manager.create_handle(PathBuf::from("/a"));
+        let h2 = manager.create_handle(PathBuf::from("/b"));
+        assert_eq!(&h1[..EXPORT_UID_LEN], &h2[..EXPORT_UID_LEN]);
+        assert_ne!(&h1[EXPORT_UID_LEN..], &h2[EXPORT_UID_LEN..]);
+    }
+
+    #[test]
+    fn test_export_uid_extension_on_raw_bytes() {
+        let mut bytes = [0u8; HANDLE_LEN];
+        bytes[..EXPORT_UID_LEN].copy_from_slice(&42u32.to_be_bytes());
+        assert_eq!(bytes.export_uid().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_export_uid_short_slice_returns_none() {
+        let short: &[u8] = &[0u8; 3];
+        assert!(short.export_uid().is_none());
+        let empty: &[u8] = &[];
+        assert!(empty.export_uid().is_none());
     }
 }
