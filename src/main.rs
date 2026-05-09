@@ -12,7 +12,7 @@ mod portmap;
 mod protocol;
 mod rpc;
 
-use config::Config;
+use config::{BackendConfig as ExportBackend, Config};
 use fsal::BackendConfig;
 use protocol::v3::portmap::mapping;
 
@@ -99,23 +99,41 @@ async fn main() -> Result<()> {
         }
     );
     println!("  NFS port: {}", config.server.nfs_port);
-    println!("  FSAL backend: {}", config.fsal.backend);
-    println!("  Export path: {}", config.fsal.export_path.display());
     println!("  Log level: {}", log_level_str);
     println!();
 
     // Initialize FSAL (File System Abstraction Layer)
+    //
+    // Phase 1 of the multi-export migration (#26) only refactors the *config*
+    // surface — the FSAL/MOUNT/NFS layers still serve a single root, so we
+    // pick the first configured export here as a placeholder. Subsequent
+    // phases will replace this with a per-export FSAL registry.
     println!("Initializing FSAL:");
 
-    // Validate backend - currently only "local" is supported
-    if config.fsal.backend != "local" {
-        anyhow::bail!(
-            "Unsupported FSAL backend '{}'. Currently only 'local' is supported.",
-            config.fsal.backend
+    let primary_export = config
+        .exports
+        .first()
+        .expect("Config::validate guarantees at least one export");
+    let ExportBackend::Local { path: export_path } = &primary_export.backend;
+
+    println!(
+        "  Export: {} (uid {})",
+        primary_export.name, primary_export.uid
+    );
+    println!("  Read-only: {}", primary_export.read_only);
+    println!("  FSAL backend: {}", primary_export.backend.name());
+    println!("  Export path: {}", export_path.display());
+
+    if config.exports.len() > 1 {
+        eprintln!(
+            "Warning: {} exports configured but Phase 1 only serves the first ('{}'). \
+             Multi-export support lands in a later phase (#26).",
+            config.exports.len(),
+            primary_export.name,
         );
     }
 
-    let fsal_config = BackendConfig::local(&config.fsal.export_path);
+    let fsal_config = BackendConfig::local(export_path);
     let filesystem: Arc<dyn fsal::Filesystem> = Arc::from(fsal_config.create_filesystem()?);
 
     let root_handle = filesystem.root_handle().await;

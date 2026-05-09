@@ -10,11 +10,32 @@ nfs_port = 2049
 # Portmapper is always on port 111 (RFC 1833)
 mount_port = 0
 
-[fsal]
-# Filesystem backend type: "local" (default: "local")
+# Each [[exports]] entry defines one NFS export.
+#
+# Required keys:
+#   name       - export path advertised to clients; must start with '/'
+#   uid        - non-zero, unique per-export identifier (used in file handles)
+#   backend    - storage backend type; currently only "local"
+#
+# Optional keys:
+#   read_only  - if true, deny writes against this export (default: false)
+#
+# Backend-specific keys (sit alongside the keys above):
+#   local backend: path - absolute path on the server's local filesystem
+
+[[exports]]
+name = "/data"
+uid = 1
+read_only = false
 backend = "local"
-# NFS export root directory (default: "/tmp/nfs_exports")
-export_path = "/tmp/nfs_exports"
+path = "/srv/nfs/data"
+
+[[exports]]
+name = "/backup"
+uid = 2
+read_only = true
+backend = "local"
+path = "/srv/nfs/backup"
 
 [logging]
 # Log level: "error", "warn", "info", "debug", "trace" (default: "info")
