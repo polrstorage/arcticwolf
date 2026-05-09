@@ -172,8 +172,10 @@ mod tests {
     async fn test_setattr_truncate() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Create a test file with content
         let test_file = temp_dir.path().join("truncate_test.txt");
@@ -230,8 +232,10 @@ mod tests {
     async fn test_setattr_mode() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Create a test file
         let test_file = temp_dir.path().join("mode_test.txt");

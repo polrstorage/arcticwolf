@@ -182,8 +182,10 @@ mod tests {
     async fn test_create_file() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         let root_handle = fs.root_handle().await;
 
@@ -231,8 +233,10 @@ mod tests {
     async fn test_create_existing_file_unchecked() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Create an existing file
         let test_file = temp_dir.path().join("existing.txt");

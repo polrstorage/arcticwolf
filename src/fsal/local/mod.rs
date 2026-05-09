@@ -29,7 +29,10 @@ impl LocalFilesystem {
     ///
     /// # Arguments
     /// * `root_path` - Root directory to export (e.g., "/export")
-    pub fn new<P: AsRef<Path>>(root_path: P) -> Result<Self> {
+    /// * `export_uid` - Non-zero export uid embedded in every file handle this
+    ///   filesystem produces. The Phase-3 multi-export router uses the prefix
+    ///   to dispatch operations to the right backend.
+    pub fn new<P: AsRef<Path>>(root_path: P, export_uid: u32) -> Result<Self> {
         let root_path = root_path.as_ref().canonicalize().context(format!(
             "Failed to canonicalize root path: {:?}",
             root_path.as_ref()
@@ -43,7 +46,7 @@ impl LocalFilesystem {
             return Err(anyhow!("Root path is not a directory: {:?}", root_path));
         }
 
-        let handle_manager = HandleManager::new();
+        let handle_manager = HandleManager::new(export_uid);
 
         // Create root handle
         let root_handle = handle_manager.create_handle(root_path.clone());
@@ -806,7 +809,7 @@ mod tests {
     /// Helper: Create a test filesystem with a temporary directory
     fn create_test_fs() -> (LocalFilesystem, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let fs = LocalFilesystem::new(temp_dir.path()).expect("Failed to create filesystem");
+        let fs = LocalFilesystem::new(temp_dir.path(), 1).expect("Failed to create filesystem");
         (fs, temp_dir)
     }
 

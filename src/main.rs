@@ -12,8 +12,7 @@ mod portmap;
 mod protocol;
 mod rpc;
 
-use config::{BackendConfig as ExportBackend, Config};
-use fsal::BackendConfig;
+use config::Config;
 use protocol::v3::portmap::mapping;
 
 /// Portmapper port is fixed at 111 per RFC 1833
@@ -104,17 +103,18 @@ async fn main() -> Result<()> {
 
     // Initialize FSAL (File System Abstraction Layer)
     //
-    // Phase 1 of the multi-export migration (#26) only refactors the *config*
-    // surface — the FSAL/MOUNT/NFS layers still serve a single root, so we
-    // pick the first configured export here as a placeholder. Subsequent
-    // phases will replace this with a per-export FSAL registry.
+    // Phases 1 and 2 of the multi-export migration (#26) refactor the config
+    // surface and start threading the export uid into the FSAL handle layer.
+    // The MOUNT/NFS dispatchers still operate against a single FSAL instance,
+    // so we pick the first configured export here as a placeholder. Phase 3
+    // introduces the MultiExportFilesystem wrapper that replaces this.
     println!("Initializing FSAL:");
 
     let primary_export = config
         .exports
         .first()
         .expect("Config::validate guarantees at least one export");
-    let ExportBackend::Local { path: export_path } = &primary_export.backend;
+    let config::BackendConfig::Local { path: export_path } = &primary_export.backend;
 
     println!(
         "  Export: {} (uid {})",
@@ -126,15 +126,21 @@ async fn main() -> Result<()> {
 
     if config.exports.len() > 1 {
         eprintln!(
-            "Warning: {} exports configured but Phase 1 only serves the first ('{}'). \
-             Multi-export support lands in a later phase (#26).",
+            "Warning: {} exports configured but Phase 2 still only serves the first ('{}'). \
+             Multi-export routing lands in Phase 3 (#26).",
             config.exports.len(),
             primary_export.name,
         );
     }
 
-    let fsal_config = BackendConfig::local(export_path);
-    let filesystem: Arc<dyn fsal::Filesystem> = Arc::from(fsal_config.create_filesystem()?);
+    // Translate the public config enum into the FSAL-side enum. The two are
+    // kept separate so backend-specific fields (e.g. future S3 credentials)
+    // don't bleed into the deserialized config surface.
+    let fsal_backend = match &primary_export.backend {
+        config::BackendConfig::Local { path } => fsal::BackendConfig::Local { path: path.clone() },
+    };
+    let filesystem: Arc<dyn fsal::Filesystem> =
+        Arc::from(fsal_backend.create_filesystem(primary_export.uid)?);
 
     let root_handle = filesystem.root_handle().await;
     println!("  Root handle: {} bytes", root_handle.len());

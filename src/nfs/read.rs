@@ -130,8 +130,10 @@ mod tests {
         let test_content = b"Hello, NFS World! This is a test file.";
         fs::write(&test_file, test_content).unwrap();
 
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle and lookup the file
         let root_handle = fs.root_handle().await;
@@ -167,8 +169,10 @@ mod tests {
         let test_content = b"0123456789ABCDEFGHIJ"; // 20 bytes
         fs::write(&test_file, test_content).unwrap();
 
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Get file handle
         let root_handle = fs.root_handle().await;
@@ -197,8 +201,10 @@ mod tests {
     async fn test_read_nonexistent_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Use invalid file handle
         use crate::protocol::v3::nfs::READ3args;

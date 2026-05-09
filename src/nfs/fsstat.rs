@@ -105,8 +105,10 @@ mod tests {
     async fn test_fsstat_root() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle
         let root_handle = fs.root_handle().await;
@@ -135,8 +137,10 @@ mod tests {
     async fn test_fsstat_invalid_handle() {
         // Create temp filesystem
         let temp_dir = TempDir::new().unwrap();
-        let config = BackendConfig::local(temp_dir.path());
-        let fs = config.create_filesystem().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
 
         // Use invalid file handle
         use crate::protocol::v3::nfs::FSSTAT3args;

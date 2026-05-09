@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
-pub use handle::{FileHandle, HandleManager};
+pub use handle::{FileHandle, FileHandleExt, HandleManager};
 pub use local::LocalFilesystem;
 
 /// File attributes
@@ -311,88 +311,25 @@ pub trait Filesystem: Send + Sync {
     ) -> Result<FileHandle>;
 }
 
-/// Filesystem backend types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendType {
-    /// Local filesystem backend
-    Local,
-    /// S3 backend (future)
-    #[allow(dead_code)]
-    S3,
-    /// Ceph backend (future)
-    #[allow(dead_code)]
-    Ceph,
-    /// In-memory backend (testing)
-    #[allow(dead_code)]
-    Memory,
-}
-
-/// Filesystem backend configuration
+/// FSAL-side backend configuration.
+///
+/// Mirrors [`crate::config::BackendConfig`] one variant at a time. v1 only ships the
+/// `Local` variant; future S3/Ceph backends gain their own variants here so
+/// [`BackendConfig::create_filesystem`] can dispatch by `match self`.
 #[derive(Debug, Clone)]
-pub struct BackendConfig {
-    /// Backend type
-    pub backend_type: BackendType,
-    /// Root path for local backend
-    pub local_root: Option<PathBuf>,
-    /// S3 configuration (future)
-    #[allow(dead_code)]
-    pub s3_config: Option<S3Config>,
-    /// Ceph configuration (future)
-    #[allow(dead_code)]
-    pub ceph_config: Option<CephConfig>,
-}
-
-/// S3 backend configuration (placeholder for future)
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct S3Config {
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-}
-
-/// Ceph backend configuration (placeholder for future)
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct CephConfig {
-    pub monitors: Vec<String>,
-    pub pool: String,
+pub enum BackendConfig {
+    /// Local filesystem backend rooted at `path`.
+    Local { path: PathBuf },
 }
 
 impl BackendConfig {
-    /// Create a local filesystem backend configuration
-    pub fn local<P: Into<PathBuf>>(root: P) -> Self {
-        Self {
-            backend_type: BackendType::Local,
-            local_root: Some(root.into()),
-            s3_config: None,
-            ceph_config: None,
-        }
-    }
-
-    /// Create filesystem instance from configuration
-    pub fn create_filesystem(&self) -> Result<Box<dyn Filesystem>> {
-        match self.backend_type {
-            BackendType::Local => {
-                let root = self
-                    .local_root
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Local root path not configured"))?;
-                let fs = LocalFilesystem::new(root)?;
+    /// Build a [`Filesystem`] for this backend, binding it to `export_uid` so
+    /// every file handle it produces carries that uid in its prefix.
+    pub fn create_filesystem(&self, export_uid: u32) -> Result<Box<dyn Filesystem>> {
+        match self {
+            BackendConfig::Local { path } => {
+                let fs = LocalFilesystem::new(path, export_uid)?;
                 Ok(Box::new(fs))
-            }
-            BackendType::S3 => {
-                // TODO: Implement S3 backend
-                Err(anyhow::anyhow!("S3 backend not yet implemented"))
-            }
-            BackendType::Ceph => {
-                // TODO: Implement Ceph backend
-                Err(anyhow::anyhow!("Ceph backend not yet implemented"))
-            }
-            BackendType::Memory => {
-                // TODO: Implement memory backend
-                Err(anyhow::anyhow!("Memory backend not yet implemented"))
             }
         }
     }
