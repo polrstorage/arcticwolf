@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_write(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS WRITE called (xid={})", xid);
 
@@ -38,6 +38,13 @@ pub async fn handle_write(
         args.count,
         args.stable
     );
+
+    // Reject writes against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.file.0) {
+        debug!("WRITE denied: handle belongs to a read-only export");
+        let res_data = NfsMessage::create_write_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Get file attributes before write (for wcc_data)
     let _before_attrs = filesystem.getattr(&args.file.0).await.ok();
@@ -131,7 +138,7 @@ pub async fn handle_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::BackendConfig;
+    use crate::fsal::{BackendConfig, Filesystem};
     use std::fs;
     use tempfile::TempDir;
 

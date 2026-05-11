@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -25,7 +25,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_setattr(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS SETATTR called (xid={})", xid);
 
@@ -33,6 +33,13 @@ pub async fn handle_setattr(
     let args = NfsMessage::deserialize_setattr3args(args_data)?;
 
     debug!("SETATTR: file_handle={} bytes", args.object.0.len(),);
+
+    // Reject mutations against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.object.0) {
+        debug!("SETATTR denied: handle belongs to a read-only export");
+        let res_data = NfsMessage::create_setattr_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Get file attributes before setattr (for wcc_data)
     let before_attrs = filesystem.getattr(&args.object.0).await.ok();
@@ -164,7 +171,7 @@ pub async fn handle_setattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::BackendConfig;
+    use crate::fsal::{BackendConfig, Filesystem};
     use std::fs;
     use tempfile::TempDir;
 

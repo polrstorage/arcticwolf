@@ -11,7 +11,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::{FileType, Filesystem};
+use crate::fsal::{FileType, NfsBackend};
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -29,7 +29,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_mknod(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS MKNOD: xid={}", xid);
 
@@ -42,6 +42,12 @@ pub async fn handle_mknod(
         args.name.0,
         args.what
     );
+
+    // Reject mknod against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
+        debug!("MKNOD denied: parent dir belongs to a read-only export");
+        return create_mknod_response(xid, status, None, None, None);
+    }
 
     // Get directory attributes before operation (for wcc_data)
     let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();

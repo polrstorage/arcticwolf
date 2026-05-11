@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_mkdir(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS MKDIR: xid={}", xid);
 
@@ -36,6 +36,12 @@ pub async fn handle_mkdir(
         args.where_dir.0.len(),
         args.name.0
     );
+
+    // Reject mkdir against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
+        debug!("MKDIR denied: parent dir belongs to a read-only export");
+        return create_mkdir_response(xid, status, None, None, None);
+    }
 
     // Get parent directory attributes before operation (for wcc_data)
     let _dir_before = filesystem.getattr(&args.where_dir.0).await.ok();

@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -30,7 +30,7 @@ const FSF3_CANSETTIME: u32 = 0x0010; // Server can set time on server
 pub async fn handle_fsinfo(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS FSINFO called (xid={})", xid);
 

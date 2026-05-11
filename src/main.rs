@@ -4,7 +4,17 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 use anyhow::Result;
 use std::sync::Arc;
 
-mod config;
+// `config` is intentionally NOT redeclared with `mod config;` here. It lives
+// in the library crate (see `src/lib.rs`) and is consumed from the binary
+// via `arcticwolf::config`. This avoids the dual-compilation issue that
+// happens when both `lib.rs` and `main.rs` declare the same module (the
+// module gets compiled twice into separate types).
+//
+// The other modules (fsal/mount/nfs/portmap/protocol/rpc) are still
+// declared below for backward compatibility — they are the binary's own
+// view of the same sources. Migrating those is a separate cleanup; the
+// `config` consolidation is what mattered for #26 because the new
+// `Config` / `ExportConfig` types crossed the lib boundary.
 mod fsal;
 mod mount;
 mod nfs;
@@ -12,7 +22,7 @@ mod portmap;
 mod protocol;
 mod rpc;
 
-use config::Config;
+use arcticwolf::config::{self, Config};
 use protocol::v3::portmap::mapping;
 
 /// Portmapper port is fixed at 111 per RFC 1833

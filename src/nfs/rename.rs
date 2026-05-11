@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_rename(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS RENAME: xid={}", xid);
 
@@ -41,6 +41,20 @@ pub async fn handle_rename(
         args.to_dir.0.len(),
         args.to_name.0
     );
+
+    // Reject renames where either side belongs to a read-only export.
+    // POSIX rename(2) writes both source and target directories, so a
+    // read-only source export must reject the operation even when the
+    // target export would accept the write — matches the kernel NFS
+    // server's behavior and avoids partial-state surprises.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.from_dir.0) {
+        debug!("RENAME denied: source dir belongs to a read-only export");
+        return create_rename_response(xid, status, None, None);
+    }
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.to_dir.0) {
+        debug!("RENAME denied: target dir belongs to a read-only export");
+        return create_rename_response(xid, status, None, None);
+    }
 
     // Get source directory attributes before operation (for wcc_data)
     let _fromdir_before = filesystem.getattr(&args.from_dir.0).await.ok();

@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-use crate::fsal::{ExportRegistry, Filesystem, NfsBackend};
+use crate::fsal::{ExportRegistry, NfsBackend};
 use crate::portmap::Registry;
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -270,7 +270,7 @@ async fn handle_rpc_message(
         100003 => {
             // NFS protocol (program 100003)
             debug!("Routing to NFS protocol handler");
-            crate::nfs::dispatch(&call, args_data, filesystem as &dyn Filesystem).await
+            crate::nfs::dispatch(&call, args_data, filesystem).await
         }
         _ => {
             warn!("Unknown program number: {}", call.prog);

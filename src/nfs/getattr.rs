@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::NfsMessage;
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_getattr(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS GETATTR called (xid={})", xid);
 

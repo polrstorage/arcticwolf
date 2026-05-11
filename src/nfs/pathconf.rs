@@ -7,7 +7,8 @@ use bytes::BytesMut;
 use tracing::debug;
 use xdr_codec::Pack;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
+use crate::nfs::error::classify_handle_error;
 use crate::protocol::v3::nfs::{NfsMessage, fattr3, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -23,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_pathconf(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS PATHCONF: xid={}", xid);
 
@@ -40,18 +41,34 @@ pub async fn handle_pathconf(
         Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
         Err(e) => {
             debug!("PATHCONF failed: {}", e);
-            return create_pathconf_error(xid, nfsstat3::NFS3ERR_STALE);
+            let error_status = classify_handle_error(&e);
+            return create_pathconf_error(xid, error_status);
         }
     };
 
-    // Create PATHCONF response with typical Unix values
+    // Query the export's underlying filesystem so the pathconf reply is
+    // per-export (linkmax / name_max vary between e.g. ext4 and xfs).
+    let stats = match filesystem.fs_stats(&object.0).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("PATHCONF failed (fs_stats): {}", e);
+            let error_status = classify_handle_error(&e);
+            return create_pathconf_error(xid, error_status);
+        }
+    };
+
+    // chown_restricted=true matches Linux default — only privileged users
+    // can transfer file ownership. We don't expose a pathconf query for
+    // this (it's a process-capability question, not a filesystem one), so
+    // hardcode the conservative answer.
     let response = create_pathconf_ok(
-        obj_attrs, 255,   // linkmax - maximum number of hard links
-        255,   // name_max - maximum filename length
-        true,  // no_trunc - server will reject names longer than name_max
-        true,  // chown_restricted - only privileged user can change file ownership
-        false, // case_insensitive - filenames are case-sensitive
-        true,  // case_preserving - filenames preserve case
+        obj_attrs,
+        stats.link_max,
+        stats.max_name_len,
+        stats.no_truncate,
+        true,
+        stats.case_insensitive,
+        stats.case_preserving,
     )?;
 
     debug!("PATHCONF OK: response size: {} bytes", response.len());

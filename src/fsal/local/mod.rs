@@ -12,7 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use super::handle::{FileHandle, HandleManager};
-use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem};
+use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats};
+
+#[cfg(test)]
+use super::handle::FileHandleExt;
+#[cfg(test)]
+use super::{ExportInfo, ExportRegistry};
 
 /// Local filesystem implementation
 pub struct LocalFilesystem {
@@ -738,6 +743,16 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
+    async fn fs_stats(&self, handle: &FileHandle) -> Result<FsStats> {
+        let path = self.resolve_handle(handle)?;
+
+        // statvfs/pathconf are synchronous syscalls; run them on the blocking
+        // pool so they don't stall the tokio reactor under load.
+        tokio::task::spawn_blocking(move || query_fs_stats(&path))
+            .await
+            .context("spawn_blocking failed")?
+    }
+
     async fn mknod(
         &self,
         dir_handle: &FileHandle,
@@ -810,6 +825,121 @@ impl Filesystem for LocalFilesystem {
         // Create handle for the new special file
         let handle = self.handle_manager.create_handle(file_path.clone());
         Ok(handle)
+    }
+}
+
+/// Query `statvfs(2)` and `pathconf(2)` to assemble [`FsStats`] for `path`.
+///
+/// Runs entirely from synchronous syscalls so callers can dispatch it on the
+/// blocking pool. The fallback defaults for `_PC_*` queries match what NFSv3
+/// servers typically advertise when the underlying filesystem doesn't expose
+/// a meaningful value (255 char names, 32k hard links).
+fn query_fs_stats(path: &Path) -> Result<FsStats> {
+    use std::ffi::CString;
+
+    let c_path =
+        CString::new(path.as_os_str().as_encoded_bytes()).context("Path contains interior NUL")?;
+
+    // SAFETY: zero-initialized libc::statvfs is a valid POD per POSIX; the
+    // syscall fills it on success and the caller only reads fields on rc==0.
+    let mut sv: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut sv) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "statvfs({:?}) failed: {}",
+            path,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // statvfs reports block counts in units of f_frsize; multiply through so
+    // FsStats fields are always raw bytes regardless of the underlying fs.
+    // The fsblkcnt_t / fsfilcnt_t fields are already u64 on the Linux
+    // targets we compile for, so no `as u64` cast is needed.
+    // POSIX permits f_frsize == 0; fall back to f_bsize and then 4096
+    // so total/free/avail never silently collapse to 0 and break df.
+    let frsize = if sv.f_frsize > 0 {
+        sv.f_frsize
+    } else if sv.f_bsize > 0 {
+        sv.f_bsize
+    } else {
+        4096
+    };
+    let total_bytes = sv.f_blocks * frsize;
+    let free_bytes = sv.f_bfree * frsize;
+    let avail_bytes = sv.f_bavail * frsize;
+    let block_size = if sv.f_bsize > 0 {
+        sv.f_bsize as u32
+    } else {
+        4096
+    };
+
+    // pathconf returns -1 for "unknown / no limit"; substitute a sensible
+    // default so wire reply fields are never garbage.
+    let name_max = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_NAME_MAX) };
+    let max_name_len = if name_max > 0 { name_max as u32 } else { 255 };
+
+    let link_max = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_LINK_MAX) };
+    let link_max = if link_max > 0 { link_max as u32 } else { 32000 };
+
+    // _PC_NO_TRUNC > 0 means the filesystem rejects oversize names. Treat
+    // an "unknown" answer (-1) as "rejects" — matches Linux ext4 default
+    // and is the safer fsstat advertisement.
+    let no_truncate_pc = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_NO_TRUNC) };
+    let no_truncate = no_truncate_pc != 0;
+
+    Ok(FsStats {
+        total_bytes,
+        free_bytes,
+        avail_bytes,
+        total_files: sv.f_files,
+        free_files: sv.f_ffree,
+        avail_files: sv.f_favail,
+        block_size,
+        max_name_len,
+        link_max,
+        no_truncate,
+        // POSIX filesystems on Linux are case-sensitive and case-preserving.
+        // The pathconf table doesn't carry case behavior, so hardcode the
+        // common-case answer; a future case-insensitive backend would
+        // override this on its own ExportRegistry impl.
+        case_insensitive: false,
+        case_preserving: true,
+    })
+}
+
+/// Degenerate [`ExportRegistry`] impl so a bare `LocalFilesystem` satisfies
+/// [`NfsBackend`] in unit tests that don't bother wiring up a full
+/// [`MultiExportFilesystem`]. A real server always goes through the router,
+/// which provides the meaningful per-export answers.
+///
+/// Gated to `#[cfg(test)]` so production code cannot accidentally reach the
+/// degenerate "always rw, no exports" answers — anything serving real clients
+/// must go through `MultiExportFilesystem`.
+///
+/// - `root_handle_for` / `list_exports`: return empty — there is no
+///   advertised name for a bare LocalFilesystem; MOUNT MNT against one
+///   would correctly fail with NOENT.
+/// - `is_read_only`: always `false`, since LocalFilesystem itself carries no
+///   read-only flag. `check_writable` therefore always allows mutations
+///   through a bare LocalFilesystem (which is what the per-op tests want).
+/// - `export_for_handle`: decode the uid prefix straight from the handle.
+#[cfg(test)]
+impl ExportRegistry for LocalFilesystem {
+    fn root_handle_for(&self, _name: &str) -> Option<FileHandle> {
+        None
+    }
+
+    fn list_exports(&self) -> Vec<ExportInfo> {
+        Vec::new()
+    }
+
+    fn is_read_only(&self, _handle: &FileHandle) -> bool {
+        false
+    }
+
+    fn export_for_handle(&self, handle: &FileHandle) -> Option<u32> {
+        handle.as_slice().export_uid()
     }
 }
 
@@ -1034,6 +1164,51 @@ mod tests {
 
         let result = fs.lookup(&root, "nonexistent.txt").await;
         assert!(result.is_err(), "Lookup should fail for nonexistent file");
+    }
+
+    #[tokio::test]
+    async fn fs_stats_returns_sensible_values_for_tempdir() {
+        // Validate the values reported by statvfs/pathconf round-trip into
+        // FsStats with no negative coercion / off-by-blocksize errors. We
+        // don't assert exact numbers (those vary by host filesystem) but
+        // check the invariants every NFS reply will depend on.
+        let (fs, _temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+
+        let stats = fs.fs_stats(&root).await.expect("fs_stats must succeed");
+
+        assert!(
+            stats.total_bytes > 0,
+            "tempdir backing fs must have capacity"
+        );
+        assert!(
+            stats.free_bytes <= stats.total_bytes,
+            "free <= total invariant"
+        );
+        assert!(
+            stats.avail_bytes <= stats.free_bytes,
+            "avail <= free invariant (non-root sees no more than root)"
+        );
+        assert!(stats.block_size > 0, "block_size must be non-zero");
+        assert!(stats.max_name_len > 0, "name_max must be non-zero");
+        assert!(stats.link_max > 0, "link_max must be non-zero");
+        // POSIX filesystems on Linux are case-sensitive and case-preserving.
+        assert!(!stats.case_insensitive);
+        assert!(stats.case_preserving);
+    }
+
+    #[tokio::test]
+    async fn fs_stats_rejects_unknown_handle() {
+        let (fs, _temp_dir) = create_test_fs();
+        // Random 32-byte handle that was never registered.
+        let bogus: FileHandle = vec![0xAA; 32];
+        let err = fs
+            .fs_stats(&bogus)
+            .await
+            .expect_err("unknown handle must error");
+        // The "Invalid handle" prefix is what the NFS fsstat/fsinfo handlers
+        // key on to return NFS3ERR_STALE.
+        assert!(err.to_string().contains("Invalid handle"), "got: {err}");
     }
 
     #[tokio::test]

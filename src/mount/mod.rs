@@ -39,9 +39,10 @@ pub mod procedures {
 ///
 /// MOUNT only needs the `ExportRegistry` slice of the backend: MNT resolves
 /// a dirpath to a root handle, EXPORT enumerates configured exports, and
-/// NULL/UMNT/UMNTALL don't touch the backend at all. Keeping the dispatcher
-/// at this narrower trait lets the NFS dispatcher hold onto `Filesystem`
-/// without one leaking into the other.
+/// NULL/UMNT/UMNTALL don't touch the backend at all. The NFS dispatcher
+/// uses the wider `NfsBackend` (Filesystem + ExportRegistry) so write-class
+/// handlers can consult export metadata; keeping MOUNT on `ExportRegistry`
+/// stops new `Filesystem` methods from accidentally widening MOUNT's surface.
 pub async fn handle_mount_call(
     call: &rpc_call_msg,
     args_data: &[u8],

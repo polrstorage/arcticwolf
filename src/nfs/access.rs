@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -32,7 +32,7 @@ const ACCESS3_EXECUTE: u32 = 0x0020;
 pub async fn handle_access(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS ACCESS called (xid={})", xid);
 
@@ -130,7 +130,7 @@ pub async fn handle_access(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::BackendConfig;
+    use crate::fsal::{BackendConfig, Filesystem};
     use std::fs;
     use tempfile::TempDir;
 

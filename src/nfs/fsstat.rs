@@ -6,7 +6,8 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
+use crate::nfs::error::classify_handle_error;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +25,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_fsstat(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS FSSTAT called (xid={})", xid);
 
@@ -38,28 +39,36 @@ pub async fn handle_fsstat(
         Ok(attrs) => attrs,
         Err(e) => {
             debug!("FSSTAT failed: {}", e);
-            let error_status = if e.to_string().contains("not found")
-                || e.to_string().contains("Invalid handle")
-            {
-                nfsstat3::NFS3ERR_STALE
-            } else {
-                nfsstat3::NFS3ERR_IO
-            };
-
+            let error_status = classify_handle_error(&e);
             let res_data = NfsMessage::create_fsstat_error_response(error_status)?;
             return RpcMessage::create_success_reply_with_data(xid, res_data);
         }
     };
 
-    // Get filesystem statistics
-    // For now, use hardcoded values - in production this would query the actual filesystem
-    let tbytes = 1024 * 1024 * 1024 * 100u64; // 100 GB total
-    let fbytes = 1024 * 1024 * 1024 * 50u64; // 50 GB free
-    let abytes = 1024 * 1024 * 1024 * 50u64; // 50 GB available to non-root
-    let tfiles = 1000000u64; // 1M total inodes
-    let ffiles = 500000u64; // 500k free inodes
-    let afiles = 500000u64; // 500k available inodes to non-root
-    let invarsec = 0u32; // filesystem not expected to change without client intervention
+    // Query the export's underlying filesystem for live capacity / inode
+    // counts. The FsStats are per-export: a multi-export wrapper routes by
+    // the uid prefix in `args.fsroot`, so two exports backed by different
+    // mount points report different numbers from the same server.
+    let stats = match filesystem.fs_stats(&args.fsroot.0).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("FSSTAT failed (fs_stats): {}", e);
+            let error_status = classify_handle_error(&e);
+            let res_data = NfsMessage::create_fsstat_error_response(error_status)?;
+            return RpcMessage::create_success_reply_with_data(xid, res_data);
+        }
+    };
+
+    let tbytes = stats.total_bytes;
+    let fbytes = stats.free_bytes;
+    let abytes = stats.avail_bytes;
+    let tfiles = stats.total_files;
+    let ffiles = stats.free_files;
+    let afiles = stats.avail_files;
+    // invarsec=0 advertises "filesystem may change at any time"; we have no
+    // better estimate for a live export, so leave it at the spec-suggested
+    // safe default.
+    let invarsec = 0u32;
 
     debug!(
         "FSSTAT success: tbytes={}, fbytes={}, tfiles={}",

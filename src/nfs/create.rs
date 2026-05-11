@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::debug;
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -24,7 +24,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_create(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS CREATE called (xid={})", xid);
     debug!(
@@ -42,6 +42,13 @@ pub async fn handle_create(
         args.where_dir.0.len(),
         filename
     );
+
+    // Reject creates against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
+        debug!("CREATE denied: parent dir belongs to a read-only export");
+        let res_data = NfsMessage::create_create_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Get directory attributes before create (for wcc_data)
     let _before_dir_attrs = filesystem.getattr(&args.where_dir.0).await.ok();

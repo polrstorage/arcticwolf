@@ -58,6 +58,42 @@ pub struct FileAttributes {
     pub ctime: FileTime,
 }
 
+/// Filesystem-wide statistics for a single export.
+///
+/// Maps to the union of NFSv3 `fsstat3` / `fsinfo3` / `pathconf3` reply fields
+/// that vary per backend (the static, server-wide constants in `fsinfo3` —
+/// `rtmax`, `wtmax`, `dtpref`, etc. — stay in their handler since they don't
+/// depend on the export). The values here are derived from `statvfs(2)` plus
+/// the `pathconf(2)` `_PC_*` queries on the export's root path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsStats {
+    /// Total bytes of storage in the filesystem.
+    pub total_bytes: u64,
+    /// Free bytes (visible to root).
+    pub free_bytes: u64,
+    /// Bytes available to non-privileged users.
+    pub avail_bytes: u64,
+    /// Total inode count.
+    pub total_files: u64,
+    /// Free inodes (visible to root).
+    pub free_files: u64,
+    /// Inodes available to non-privileged users.
+    pub avail_files: u64,
+    /// Preferred I/O block size in bytes.
+    pub block_size: u32,
+    /// Maximum length of a single path component (`_PC_NAME_MAX`).
+    pub max_name_len: u32,
+    /// Maximum number of hard links to a single file (`_PC_LINK_MAX`).
+    pub link_max: u32,
+    /// If true, the server rejects names longer than `max_name_len` rather
+    /// than silently truncating them (`_PC_NO_TRUNC`).
+    pub no_truncate: bool,
+    /// True if filename lookups ignore case.
+    pub case_insensitive: bool,
+    /// True if the server stores filenames with their original case.
+    pub case_preserving: bool,
+}
+
 /// File type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -310,6 +346,15 @@ pub trait Filesystem: Send + Sync {
         mode: u32,
         rdev: (u32, u32),
     ) -> Result<FileHandle>;
+
+    /// Report filesystem-wide statistics for the export that owns `handle`.
+    ///
+    /// Backs the NFS `FSSTAT` / `FSINFO` / `PATHCONF` procedures: each one
+    /// needs values that depend on the underlying filesystem (free space,
+    /// inode counts, name length limits, etc.) rather than server-wide
+    /// constants. A multi-export wrapper dispatches by the uid prefix
+    /// embedded in `handle`, so the answer is per-export, not per-server.
+    async fn fs_stats(&self, handle: &FileHandle) -> Result<FsStats>;
 }
 
 /// Metadata describing a single configured export.
@@ -328,14 +373,11 @@ pub struct ExportInfo {
 
 /// Registry of NFS exports, decoupled from per-handle filesystem operations.
 ///
-/// MOUNT MNT and MOUNT EXPORT operate against this view; NFS write paths
-/// will use [`is_read_only`](Self::is_read_only) to gate mutating operations
-/// once Phase 5 lands. [`export_for_handle`](Self::export_for_handle) is
+/// MOUNT MNT and MOUNT EXPORT operate against this view; the NFS write-class
+/// handlers consult [`is_read_only`](Self::is_read_only) via
+/// [`crate::nfs::access_check::check_writable`] to short-circuit mutations against
+/// read-only exports. [`export_for_handle`](Self::export_for_handle) is
 /// exposed mostly for diagnostics and tests.
-///
-/// `is_read_only` and `export_for_handle` are not wired into the NFS write
-/// path yet — they carry `#[allow(dead_code)]` so the trait shape stays
-/// stable through Phase 5 without producing build warnings now.
 pub trait ExportRegistry: Send + Sync {
     /// Look up the root file handle for the export advertised as `name`.
     ///
@@ -350,7 +392,6 @@ pub trait ExportRegistry: Send + Sync {
     /// Returns `false` for handles whose export uid prefix is unknown or
     /// missing — write paths should treat that as a stale-handle error
     /// elsewhere; this method only answers the read-only question.
-    #[allow(dead_code)]
     fn is_read_only(&self, handle: &FileHandle) -> bool;
 
     /// Decode the export uid embedded in `handle`'s prefix, if present.
