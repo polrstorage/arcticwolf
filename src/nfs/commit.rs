@@ -11,7 +11,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -29,7 +29,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_commit(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS COMMIT: xid={}", xid);
 

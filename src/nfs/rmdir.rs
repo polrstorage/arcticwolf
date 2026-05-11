@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -25,7 +25,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_rmdir(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS RMDIR: xid={}", xid);
 
@@ -37,6 +37,12 @@ pub async fn handle_rmdir(
         args.dir.0.len(),
         args.name.0
     );
+
+    // Reject rmdir against handles whose export is configured read_only.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.dir.0) {
+        debug!("RMDIR denied: parent dir belongs to a read-only export");
+        return create_rmdir_response(xid, status, None);
+    }
 
     // Get parent directory attributes before removal (for wcc_data)
     let _dir_before = filesystem.getattr(&args.dir.0).await.ok();

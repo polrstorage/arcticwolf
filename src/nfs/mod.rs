@@ -4,9 +4,11 @@
 // See RFC 1813 for the complete specification.
 
 mod access;
+mod access_check;
 mod commit;
 mod create;
 pub mod dispatcher;
+mod error;
 mod fsinfo;
 mod fsstat;
 mod getattr;

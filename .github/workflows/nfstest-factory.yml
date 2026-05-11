@@ -85,23 +85,68 @@ jobs:
 
       - name: Verify per-export isolation
         run: |
-          # Files written through one export must not appear in the other —
+          # Files written through /data must not show up in /backup —
           # the multi-export router dispatches by the uid prefix in each
           # file handle, so /data and /backup own disjoint trees even
-          # though they share a single NFS server.
+          # though they share a single NFS server. /backup is read_only
+          # in Phase 5 of #26, so we only seed /data and check that the
+          # filename doesn't leak into the other mount.
           sudo bash -c 'echo data-only > /mnt/nfs_data/hello-data.txt'
-          sudo bash -c 'echo backup-only > /mnt/nfs_backup/hello-backup.txt'
           sudo test -f /mnt/nfs_data/hello-data.txt
-          sudo test -f /mnt/nfs_backup/hello-backup.txt
-          if sudo test -e /mnt/nfs_data/hello-backup.txt; then
-            echo "ISOLATION FAILURE: /backup file visible in /data mount" >&2
-            exit 1
-          fi
           if sudo test -e /mnt/nfs_backup/hello-data.txt; then
             echo "ISOLATION FAILURE: /data file visible in /backup mount" >&2
             exit 1
           fi
           echo "per-export isolation verified"
+
+      # Phase 5 of #26: every write-class NFS procedure short-circuits to
+      # NFS3ERR_ROFS when the handle's export is configured read_only=true.
+      # The kernel client surfaces that as EROFS, so any write against
+      # /mnt/nfs_backup must fail at the syscall layer while reads still
+      # succeed.
+      - name: Verify /backup rejects writes with EROFS
+        run: |
+          set +e
+          sudo bash -c 'echo nope > /mnt/nfs_backup/ro-write.txt' 2> /tmp/rofs.err
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "FAILURE: write to read-only /backup unexpectedly succeeded" >&2
+            exit 1
+          fi
+          # NFS3ERR_ROFS → EROFS → "Read-only file system" in shell error.
+          # Match loosely so locale variations don't break the assertion.
+          if ! grep -qi "read-only" /tmp/rofs.err; then
+            echo "FAILURE: expected EROFS, got:" >&2
+            cat /tmp/rofs.err >&2
+            exit 1
+          fi
+          # mkdir against the ro export must also fail.
+          if sudo mkdir /mnt/nfs_backup/ro-dir 2>/dev/null; then
+            echo "FAILURE: mkdir on read-only /backup unexpectedly succeeded" >&2
+            exit 1
+          fi
+          # Reads must still work — only write-class ops are gated.
+          sudo ls /mnt/nfs_backup/ >/dev/null
+          echo "read-only export correctly rejects writes"
+
+      # Phase 5 of #26: fsstat now consults statvfs(2) on the export's
+      # root rather than returning hardcoded values. df should report
+      # numbers consistent with the underlying mount on the pod (a PVC
+      # for /data, an emptyDir for /backup); we don't pin exact figures
+      # because the host filesystem varies between CI runs, but the
+      # values must be non-zero and df must succeed for both mounts.
+      - name: Show per-export df stats
+        run: |
+          df -h /mnt/nfs_data /mnt/nfs_backup
+          data_total=$(df --output=size /mnt/nfs_data | tail -n1 | tr -d ' ')
+          backup_total=$(df --output=size /mnt/nfs_backup | tail -n1 | tr -d ' ')
+          if [ "$data_total" = "0" ] || [ "$backup_total" = "0" ]; then
+            echo "FAILURE: fsstat reports zero size for an export" >&2
+            df --output=source,size,used,avail /mnt/nfs_data /mnt/nfs_backup >&2
+            exit 1
+          fi
+          echo "per-export fsstat stats look sane"
 
       - name: Verify MNT NOENT for unknown dirpath
         run: |

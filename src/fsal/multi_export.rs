@@ -4,8 +4,9 @@
 // `Filesystem` operation to the inner backend identified by the export uid
 // embedded in the file handle prefix (see `fsal::handle`).
 //
-// MOUNT consumes this type via `ExportRegistry`; the NFS dispatcher still
-// consumes it via `Filesystem` (Phase 5 of issue #26 will split that).
+// MOUNT consumes this type via `ExportRegistry`; the NFS dispatcher consumes
+// it via the `NfsBackend` super-trait, which combines `Filesystem` and
+// `ExportRegistry` (see #26).
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use crate::config::{BackendConfig as ConfigBackend, ExportConfig};
 
 use super::handle::{FileHandle, FileHandleExt};
 use super::local::LocalFilesystem;
-use super::{DirEntry, ExportInfo, ExportRegistry, FileAttributes, FileType, Filesystem};
+use super::{DirEntry, ExportInfo, ExportRegistry, FileAttributes, FileType, Filesystem, FsStats};
 
 /// Internal record for one configured export.
 struct ExportEntry {
@@ -105,9 +106,13 @@ impl MultiExportFilesystem {
     /// Look up the entry that owns `handle`, decoding the uid prefix.
     ///
     /// Error strings start with `"Invalid handle"` so the per-operation NFS
-    /// handlers in `src/nfs/{read,write,access,fsstat,fsinfo}.rs` map them to
-    /// `NFS3ERR_STALE` via their substring matchers; without that prefix they
-    /// would fall through to `NFS3ERR_IO`.
+    /// handlers map them to `NFS3ERR_STALE`: `fsstat` and `pathconf` go
+    /// through [`crate::nfs::error::classify_handle_error`] (which also walks
+    /// the error chain for `io::ErrorKind::NotFound`), while `read`, `write`,
+    /// `access`, and `fsinfo` still substring-match `"Invalid handle"`
+    /// directly. Without that prefix they would fall through to
+    /// `NFS3ERR_IO`. The wider unification of error mapping is tracked in
+    /// the FSAL typed-error issue (#28).
     fn entry_for_handle(&self, handle: &FileHandle) -> Result<&ExportEntry> {
         let uid = handle
             .as_slice()
@@ -357,6 +362,10 @@ impl Filesystem for MultiExportFilesystem {
             .mknod(dir_handle, name, file_type, mode, rdev)
             .await
     }
+
+    async fn fs_stats(&self, handle: &FileHandle) -> Result<FsStats> {
+        self.entry_for_handle(handle)?.fs.fs_stats(handle).await
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +565,51 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(err.to_string().contains("cross-device"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fs_stats_routes_to_the_handles_export() {
+        // Two exports rooted at different tempdirs; the router must call
+        // fs_stats on the backend that owns the handle's uid prefix.
+        // We can't directly check which backend was called, but each
+        // tempdir lives on the same filesystem in CI, so we settle for
+        // verifying both routes return populated stats with the same
+        // shape — and that a third, bogus handle errors out.
+        let (router, _data, _backup) = build_two_export_router();
+
+        let data_root = router.root_handle_for("/data").unwrap();
+        let backup_root = router.root_handle_for("/backup").unwrap();
+
+        let s_data = router.fs_stats(&data_root).await.expect("data fs_stats");
+        let s_backup = router
+            .fs_stats(&backup_root)
+            .await
+            .expect("backup fs_stats");
+
+        assert!(s_data.total_bytes > 0);
+        assert!(s_backup.total_bytes > 0);
+        assert!(s_data.block_size > 0);
+        assert!(s_backup.block_size > 0);
+    }
+
+    #[tokio::test]
+    async fn fs_stats_with_short_handle_returns_stale_error() {
+        let (router, _data, _backup) = build_two_export_router();
+        let short: FileHandle = vec![0u8; 3];
+        let err = router.fs_stats(&short).await.expect_err("must fail");
+        // Same "Invalid handle" substring contract every other handle-keyed
+        // op satisfies — the fsstat/fsinfo/pathconf handlers map it to STALE.
+        assert!(err.to_string().contains("Invalid handle"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fs_stats_with_unknown_uid_returns_stale_error() {
+        let (router, _data, _backup) = build_two_export_router();
+        let mut bogus = vec![0u8; HANDLE_LEN];
+        bogus[..4].copy_from_slice(&999u32.to_be_bytes());
+        let err = router.fs_stats(&bogus).await.expect_err("must fail");
+        assert!(err.to_string().contains("Invalid handle"), "got: {err}");
+        assert!(err.to_string().contains("stale export uid"), "got: {err}");
     }
 
     #[test]

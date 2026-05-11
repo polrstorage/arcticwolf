@@ -11,7 +11,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use tracing::{debug, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -29,7 +29,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub async fn handle_link(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     debug!("NFS LINK: xid={}", xid);
 
@@ -42,6 +42,17 @@ pub async fn handle_link(
         args.link_dir.0.len(),
         args.name.0
     );
+
+    // LINK writes a new directory entry into `link_dir` and bumps `file`'s
+    // nlink. Reject the call if either handle belongs to a read-only export.
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.file.0) {
+        debug!("LINK denied: source file belongs to a read-only export");
+        return create_link_response(xid, status, None, None);
+    }
+    if let Err(status) = super::access_check::check_writable(filesystem, &args.link_dir.0) {
+        debug!("LINK denied: target dir belongs to a read-only export");
+        return create_link_response(xid, status, None, None);
+    }
 
     // Get source file attributes before operation (for post_op_attr)
     let file_before = filesystem.getattr(&args.file.0).await.ok();

@@ -69,8 +69,11 @@ arcticwolf/
 │   │   └── pathconf.rs         # PATHCONF (proc 20)
 │   │
 │   ├── fsal/                   # Filesystem Abstraction Layer
-│   │   ├── mod.rs              # FSAL trait definition
-│   │   └── local.rs            # Local filesystem backend
+│   │   ├── mod.rs              # Filesystem trait, ExportRegistry trait, NfsBackend
+│   │   ├── handle.rs           # FileHandle (with export uid prefix)
+│   │   ├── local/              # Local filesystem backend
+│   │   │   └── mod.rs
+│   │   └── multi_export.rs     # MultiExportFilesystem: routes by handle uid prefix
 │   │
 │   └── main.rs                 # Server entry point
 │
@@ -265,28 +268,31 @@ async fn handle_connection(mut socket: TcpStream) -> Result<()> {
 **Example** (`src/nfs/dispatcher.rs`):
 ```rust
 pub async fn dispatch(
-    xid: u32,
-    proc: u32,
+    call: &rpc_call_msg,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    backend: &dyn NfsBackend,
 ) -> Result<BytesMut> {
-    match proc {
-        0 => null::handle_null(xid),
-        1 => getattr::handle_getattr(xid, args_data, filesystem),
-        2 => setattr::handle_setattr(xid, args_data, filesystem),
-        3 => lookup::handle_lookup(xid, args_data, filesystem),
-        4 => access::handle_access(xid, args_data, filesystem),
-        6 => read::handle_read(xid, args_data, filesystem),
-        7 => write::handle_write(xid, args_data, filesystem),
-        8 => create::handle_create(xid, args_data, filesystem),
-        16 => readdir::handle_readdir(xid, args_data, filesystem),
-        18 => fsstat::handle_fsstat(xid, args_data, filesystem),
-        19 => fsinfo::handle_fsinfo(xid, args_data, filesystem),
-        20 => pathconf::handle_pathconf(xid, args_data, filesystem),
-        _ => Err(anyhow!("Unknown NFS procedure: {}", proc)),
+    let xid = call.xid;
+    match call.proc_ {
+        0 => null::handle_null(xid).await,
+        1 => getattr::handle_getattr(xid, args_data, backend).await,
+        2 => setattr::handle_setattr(xid, args_data, backend).await,
+        3 => lookup::handle_lookup(xid, args_data, backend).await,
+        // ... 4–17 elided ...
+        18 => fsstat::handle_fsstat(xid, args_data, backend).await,
+        19 => fsinfo::handle_fsinfo(xid, args_data, backend).await,
+        20 => pathconf::handle_pathconf(xid, args_data, backend).await,
+        21 => commit::handle_commit(xid, args_data, backend).await,
+        _ => create_notsupp_response(xid),
     }
 }
 ```
+
+Dispatchers now take `&dyn NfsBackend` (a trait combining `Filesystem +
+ExportRegistry`). MOUNT receives the `ExportRegistry` view to resolve
+`dirpath → root handle`; NFS handlers get both views from the same `Arc`
+so write-class handlers can call `check_writable(backend, handle)` before
+mutating an export.
 
 ### Layer 5: Protocol Handlers (`src/portmap/`, `src/mount/`, `src/nfs/`)
 
@@ -296,16 +302,16 @@ pub async fn dispatch(
 
 **Example** (`src/nfs/getattr.rs`):
 ```rust
-pub fn handle_getattr(
+pub async fn handle_getattr(
     xid: u32,
     args_data: &[u8],
-    filesystem: &dyn Filesystem,
+    backend: &dyn NfsBackend,
 ) -> Result<BytesMut> {
     // 1. Deserialize arguments
     let args = NfsMessage::deserialize_getattr3args(args_data)?;
 
-    // 2. Call FSAL to get attributes
-    let attrs = filesystem.getattr(&args.object.0)?;
+    // 2. Call FSAL to get attributes (routes by handle uid prefix)
+    let attrs = backend.getattr(&args.object.0).await?;
 
     // 3. Convert FSAL attributes to NFS format
     let nfs_attrs = NfsMessage::fsal_to_fattr3(&attrs);
@@ -330,44 +336,87 @@ pub fn handle_getattr(
 
 **Purpose**: Abstract different filesystem backends behind a common interface.
 
-**FSAL Trait**:
+**FSAL Trait** (abbreviated — see `src/fsal/mod.rs` for full docs):
 ```rust
+#[async_trait]
 pub trait Filesystem: Send + Sync {
-    // Metadata operations
-    fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes>;
-    fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()>;
-    fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()>;
-    fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
+    // Metadata
+    async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes>;
+    async fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()>;
+    async fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()>;
+    async fn setattr_owner(&self, handle: &FileHandle, uid: Option<u32>, gid: Option<u32>)
+        -> Result<()>;
 
     // Lookup and navigation
-    fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
+    async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle>;
+    async fn readlink(&self, handle: &FileHandle) -> Result<String>;
 
-    // Data operations
-    fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>>;
-    fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32>;
+    // Data
+    async fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>>;
+    async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32>;
+    async fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()>;
 
-    // Directory operations
-    fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32)
-        -> Result<Vec<DirEntry>>;
+    // Directory listing
+    async fn readdir(&self, dir_handle: &FileHandle, cookie: u64, count: u32)
+        -> Result<(Vec<DirEntry>, bool)>;
 
-    // File creation
-    fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32)
+    // Namespace mutation
+    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
+    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()>;
+    async fn rename(&self, from_dir: &FileHandle, from_name: &str,
+                    to_dir: &FileHandle, to_name: &str) -> Result<()>;
+    async fn symlink(&self, dir_handle: &FileHandle, name: &str, target: &str)
         -> Result<FileHandle>;
+    async fn link(&self, file_handle: &FileHandle, dir_handle: &FileHandle, name: &str)
+        -> Result<FileHandle>;
+    async fn mknod(&self, dir_handle: &FileHandle, name: &str,
+                   file_type: FileType, mode: u32, rdev: (u32, u32)) -> Result<FileHandle>;
 
-    // Filesystem info
-    fn fsstat(&self) -> Result<FsStats>;
-    fn fsinfo(&self) -> FsInfo;
-    fn pathconf(&self) -> PathConf;
+    // Per-export filesystem stats — backs FSSTAT/FSINFO/PATHCONF
+    // (the static, server-wide fields stay in the handlers)
+    async fn fs_stats(&self, handle: &FileHandle) -> Result<FsStats>;
 }
 ```
 
-Per-export root handles do not live on `Filesystem` — a multi-export backend
-has no single "the" root. The MOUNT path obtains them through
-`ExportRegistry::root_handle_for(name)` (see `src/fsal/mod.rs`), which
-resolves the dirpath supplied by the client to the matching export's root.
+Note: `fsstat` / `fsinfo` / `pathconf` are **NFS handlers**, not FSAL trait
+methods. The trait exposes a single `fs_stats(handle)` that returns the
+per-export bits (free space, name-max, link-max, …); the handlers combine
+that with server-wide constants (`rtmax`, `wtmax`, etc.) to assemble the
+NFSv3 replies.
+
+Per-export root handles also do not live on `Filesystem` — a multi-export
+backend has no single "the" root. MOUNT obtains them via the separate
+`ExportRegistry` trait below.
+
+**ExportRegistry Trait**:
+```rust
+pub trait ExportRegistry: Send + Sync {
+    /// Resolve the dirpath advertised to clients to that export's root handle.
+    fn root_handle_for(&self, name: &str) -> Option<FileHandle>;
+
+    /// Enumerate every configured export (used by MOUNT EXPORT + banners).
+    fn list_exports(&self) -> Vec<ExportInfo>;
+
+    /// True if the export that owns `handle` is read-only.
+    fn is_read_only(&self, handle: &FileHandle) -> bool;
+
+    /// Decode the export uid embedded in `handle`'s prefix.
+    fn export_for_handle(&self, handle: &FileHandle) -> Option<u32>;
+}
+
+/// Combined trait used by `RpcServer`: one `Arc<dyn NfsBackend>` hands
+/// MOUNT the `ExportRegistry` view and NFS the `Filesystem` view.
+pub trait NfsBackend: Filesystem + ExportRegistry {}
+impl<T: Filesystem + ExportRegistry> NfsBackend for T {}
+```
 
 **Current Implementation**:
-- `local.rs`: Local filesystem backend using std::fs
+- `local/mod.rs`: Local filesystem backend (one instance per export, std::fs)
+- `multi_export.rs`: `MultiExportFilesystem` wraps a set of backends and
+  dispatches `Filesystem` calls by the uid prefix in each `FileHandle`;
+  it also implements `ExportRegistry` for the MOUNT path
 
 **Future Backends**:
 - `memory.rs`: In-memory filesystem (testing)
@@ -732,44 +781,10 @@ make build
 
 ## Implementation Status
 
-### Completed NFSv3 Procedures (13/22)
-
-| Procedure | Number | Status | Description |
-|-----------|--------|--------|-------------|
-| NULL | 0 | ✅ | Null procedure (ping) |
-| GETATTR | 1 | ✅ | Get file attributes |
-| SETATTR | 2 | ✅ | Set file attributes (truncate, chmod, chown) |
-| LOOKUP | 3 | ✅ | Lookup filename |
-| ACCESS | 4 | ✅ | Check access permissions |
-| READ | 6 | ✅ | Read from file |
-| WRITE | 7 | ✅ | Write to file |
-| CREATE | 8 | ✅ | Create file |
-| READDIR | 16 | ✅ | Read directory entries |
-| READDIRPLUS | 17 | ✅ | Read directory with attributes and handles |
-| FSSTAT | 18 | ✅ | Get filesystem statistics |
-| FSINFO | 19 | ✅ | Get filesystem info |
-| PATHCONF | 20 | ✅ | Get POSIX path configuration |
-
-**Key Features Working:**
-- Basic file operations (read, write, create)
-- File attribute management (getattr, setattr)
-- Directory listing (readdir, readdirplus)
-- Shell redirection (`echo "hello" > file.txt`)
-- Real Linux NFS client compatibility
-
-### Not Yet Implemented (9/22)
-
-| Procedure | Number | Priority | Description |
-|-----------|--------|----------|-------------|
-| READLINK | 5 | Medium | Read symbolic link |
-| MKDIR | 9 | High | Create directory |
-| SYMLINK | 10 | Medium | Create symbolic link |
-| MKNOD | 11 | Low | Create special device |
-| REMOVE | 12 | High | Remove file |
-| RMDIR | 13 | High | Remove directory |
-| RENAME | 14 | High | Rename file/directory |
-| LINK | 15 | Medium | Create hard link |
-| COMMIT | 21 | Medium | Commit cached data to stable storage |
+All 22 NFSv3 procedures are implemented — see the
+[Procedure Implementation](#procedure-implementation) table above for the
+authoritative per-procedure status. The remaining work tracked here is
+testing, security, and production-readiness rather than new procedures.
 
 ### Python Test Improvements Needed
 
@@ -809,9 +824,8 @@ The current Python integration tests (`tests/test_nfs_*.py`) need the following 
 - Validate file handle security
 
 **Configuration:**
-- Support multiple export points (currently hardcoded to `/tmp/nfs_exports`)
-- Add configuration file support (export paths, permissions, etc.)
-- Add runtime configuration reload
+- Add runtime configuration reload (TOML config + multi-export are already
+  in place — see `src/config.rs` and `src/fsal/multi_export.rs`)
 
 **Production Readiness:**
 - Add metrics and monitoring (Prometheus, etc.)
@@ -843,4 +857,4 @@ The current Python integration tests (`tests/test_nfs_*.py`) need the following 
 
 ---
 
-**Last Updated**: 2025-12-05
+**Last Updated**: 2026-05-11 (refreshed for multi-export feature, #26)

@@ -12,9 +12,10 @@ data:
     mount_port = 0
 
     # Two exports so the multi-export wiring is exercised end-to-end in
-    # CI: /data is the read-write export the POSIX suite drives against,
-    # /backup is a second rw export used to verify per-export isolation
-    # and showmount listing.
+    # CI: /data is the read-write export the POSIX suite drives against;
+    # /backup is mounted read_only so the Phase 5 enforcement path (every
+    # write-class NFS procedure short-circuits to NFS3ERR_ROFS) gets
+    # covered against a real Linux NFS client.
     [[exports]]
     name = "/data"
     uid = 1
@@ -25,7 +26,7 @@ data:
     [[exports]]
     name = "/backup"
     uid = 2
-    read_only = false
+    read_only = true
     backend = "local"
     path = "/tmp/nfs_backup"
 
