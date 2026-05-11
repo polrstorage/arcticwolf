@@ -333,9 +333,6 @@ pub fn handle_getattr(
 **FSAL Trait**:
 ```rust
 pub trait Filesystem: Send + Sync {
-    // File handle operations
-    fn root_handle(&self) -> FileHandle;
-
     // Metadata operations
     fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes>;
     fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()>;
@@ -363,6 +360,11 @@ pub trait Filesystem: Send + Sync {
     fn pathconf(&self) -> PathConf;
 }
 ```
+
+Per-export root handles do not live on `Filesystem` — a multi-export backend
+has no single "the" root. The MOUNT path obtains them through
+`ExportRegistry::root_handle_for(name)` (see `src/fsal/mod.rs`), which
+resolves the dirpath supplied by the client to the matching export's root.
 
 **Current Implementation**:
 - `local.rs`: Local filesystem backend using std::fs

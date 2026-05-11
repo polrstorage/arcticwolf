@@ -61,20 +61,67 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nfs-common
 
-      - name: Mount NFS
+      # Phase 4 of #26: MOUNT MNT now routes the client dirpath against
+      # ExportRegistry, and MOUNT EXPORT (proc 5) enumerates configured
+      # exports. Verify both protocol pieces against the two exports
+      # defined in deploy/k8s/deployment.yaml.
+      - name: Verify MOUNT EXPORT lists both exports
         run: |
-          sudo mkdir -p /mnt/nfs
-          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/ /mnt/nfs
-          echo "NFS mounted successfully"
-          ls -la /mnt/nfs/
+          showmount -e ${NODE_IP}
+          showmount -e ${NODE_IP} | grep -E '^/data\b'
+          showmount -e ${NODE_IP} | grep -E '^/backup\b'
+
+      - name: Mount /data export
+        run: |
+          sudo mkdir -p /mnt/nfs_data
+          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/data /mnt/nfs_data
+          ls -la /mnt/nfs_data/
+
+      - name: Mount /backup export
+        run: |
+          sudo mkdir -p /mnt/nfs_backup
+          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/backup /mnt/nfs_backup
+          ls -la /mnt/nfs_backup/
+
+      - name: Verify per-export isolation
+        run: |
+          # Files written through one export must not appear in the other —
+          # the multi-export router dispatches by the uid prefix in each
+          # file handle, so /data and /backup own disjoint trees even
+          # though they share a single NFS server.
+          sudo bash -c 'echo data-only > /mnt/nfs_data/hello-data.txt'
+          sudo bash -c 'echo backup-only > /mnt/nfs_backup/hello-backup.txt'
+          sudo test -f /mnt/nfs_data/hello-data.txt
+          sudo test -f /mnt/nfs_backup/hello-backup.txt
+          if sudo test -e /mnt/nfs_data/hello-backup.txt; then
+            echo "ISOLATION FAILURE: /backup file visible in /data mount" >&2
+            exit 1
+          fi
+          if sudo test -e /mnt/nfs_backup/hello-data.txt; then
+            echo "ISOLATION FAILURE: /data file visible in /backup mount" >&2
+            exit 1
+          fi
+          echo "per-export isolation verified"
+
+      - name: Verify MNT NOENT for unknown dirpath
+        run: |
+          sudo mkdir -p /mnt/nfs_missing
+          # A bogus dirpath must fail at mount time — MNT3ERR_NOENT
+          # surfaces to the client as ENOENT and mount(8) exits non-zero.
+          if sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/nonexistent /mnt/nfs_missing 2>&1; then
+            sudo umount /mnt/nfs_missing || true
+            echo "ERROR: mounting an unknown export should have failed" >&2
+            exit 1
+          fi
+          echo "unknown dirpath correctly rejected"
 
       # skip test open until we start to review the failures
       # read/write tests are mandatory and must pass
-      - name: Run NFS POSIX tests
+      - name: Run NFS POSIX tests against /data
         run: |
           docker run --network host --privileged --rm \
             registry.opensuse.org/home/vcheng/containers/containers/nfstester:latest \
-            nfstest_posix -s localhost --nfsversion=3 \
+            nfstest_posix -s localhost --export=/data --nfsversion=3 \
             -o nolock,noresvport \
             --runtest=read,write
 
@@ -91,6 +138,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          sudo umount /mnt/nfs || true
+          sudo umount /mnt/nfs_data || true
+          sudo umount /mnt/nfs_backup || true
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
           kubectl delete -f deploy/k8s/deployment.yaml || true

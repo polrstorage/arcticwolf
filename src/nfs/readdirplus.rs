@@ -187,7 +187,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_readdirplus".to_string(), 1).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Create READDIRPLUS3args manually
         use xdr_codec::Pack;

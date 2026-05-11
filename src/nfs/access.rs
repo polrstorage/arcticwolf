@@ -147,7 +147,7 @@ mod tests {
         let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle and lookup the file
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
         let file_handle = fs.lookup(&root_handle, "access_test.txt").await.unwrap();
 
         // Serialize ACCESS3args
@@ -181,7 +181,7 @@ mod tests {
         let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle (which is a directory)
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Serialize ACCESS3args with LOOKUP permission
         use crate::protocol::v3::nfs::ACCESS3args;

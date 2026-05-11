@@ -4,10 +4,8 @@
 // `Filesystem` operation to the inner backend identified by the export uid
 // embedded in the file handle prefix (see `fsal::handle`).
 //
-// Phase 3 of issue #26 — MOUNT/NFS dispatcher signatures still take
-// `&dyn Filesystem`, so this type implements both `Filesystem` (for the
-// existing call sites) and `ExportRegistry` (for the new call sites
-// landing in Phase 4/5).
+// MOUNT consumes this type via `ExportRegistry`; the NFS dispatcher still
+// consumes it via `Filesystem` (Phase 5 of issue #26 will split that).
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -39,11 +37,6 @@ struct ExportEntry {
 ///   root handle.
 pub struct MultiExportFilesystem {
     exports: HashMap<u32, ExportEntry>,
-    /// Read by [`ExportRegistry::root_handle_for`], which MOUNT MNT will start
-    /// calling in Phase 4. Until then main.rs only walks `exports`, so the
-    /// binary build doesn't see a reader — silenced here rather than at every
-    /// call site.
-    #[allow(dead_code)]
     name_index: HashMap<String, u32>,
 }
 
@@ -165,20 +158,6 @@ impl ExportRegistry for MultiExportFilesystem {
 
 #[async_trait]
 impl Filesystem for MultiExportFilesystem {
-    async fn root_handle(&self) -> FileHandle {
-        // Phase 3 transitional shim: MOUNT MNT still calls Filesystem::root_handle
-        // with no name argument, so we hand back the lowest-uid export's root.
-        // Phase 4 removes this method from the trait once MOUNT MNT switches to
-        // ExportRegistry::root_handle_for(name). build_from_config rejects
-        // empty `exports`, so the unwrap is sound.
-        let mut uids: Vec<u32> = self.exports.keys().copied().collect();
-        uids.sort_unstable();
-        let first_uid = uids
-            .first()
-            .expect("build_from_config rejects empty exports");
-        self.exports[first_uid].fs.root_file_handle()
-    }
-
     async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
         self.entry_for_handle(dir_handle)?
             .fs
@@ -553,23 +532,6 @@ mod tests {
             .expect_err("must fail");
         assert!(err.to_string().contains("Invalid handle"), "got: {err}");
         assert!(err.to_string().contains("stale export uid"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn root_handle_returns_lowest_uid_export() {
-        // Filesystem::root_handle is the Phase 3 transitional shim used by
-        // MOUNT MNT before it learns to route by dirpath. The contract is
-        // "lowest uid wins" — verify a router built with uids out of
-        // numeric order still picks uid 3 over uid 5.
-        let data_dir = TempDir::new().unwrap();
-        let backup_dir = TempDir::new().unwrap();
-        let exports = vec![
-            export("/high", 5, data_dir.path().to_path_buf(), false),
-            export("/low", 3, backup_dir.path().to_path_buf(), false),
-        ];
-        let router = MultiExportFilesystem::build_from_config(&exports).unwrap();
-        let handle = <MultiExportFilesystem as Filesystem>::root_handle(&router).await;
-        assert_eq!(handle.as_slice().export_uid(), Some(3));
     }
 
     #[tokio::test]

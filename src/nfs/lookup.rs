@@ -142,7 +142,7 @@ mod tests {
         let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Serialize LOOKUP3args
         use crate::protocol::v3::nfs::{LOOKUP3args, fhandle3, filename3};
@@ -175,7 +175,7 @@ mod tests {
         let fs = config.create_filesystem(1).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Serialize LOOKUP3args for non-existent file
         use crate::protocol::v3::nfs::{LOOKUP3args, fhandle3, filename3};

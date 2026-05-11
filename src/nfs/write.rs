@@ -149,7 +149,7 @@ mod tests {
         fs::write(&test_file, b"").unwrap();
 
         // Get file handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
         let file_handle = fs.lookup(&root_handle, "writetest.txt").await.unwrap();
 
         // Serialize WRITE3args
@@ -192,7 +192,7 @@ mod tests {
         fs::write(&test_file, b"0123456789").unwrap();
 
         // Get file handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
         let file_handle = fs.lookup(&root_handle, "offset.txt").await.unwrap();
 
         // Write at offset 5

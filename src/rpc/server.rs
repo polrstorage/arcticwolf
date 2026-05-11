@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-use crate::fsal::{Filesystem, NfsBackend};
+use crate::fsal::{ExportRegistry, Filesystem, NfsBackend};
 use crate::portmap::Registry;
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -168,12 +168,11 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Handle a complete RPC message
+/// Handle a complete RPC message.
 ///
-/// Takes `&dyn NfsBackend` so future dispatcher splits can ask for the
-/// `ExportRegistry` slice; today's MOUNT and NFS handlers are still
-/// `&dyn Filesystem`-shaped, so we upcast at the call site (stable since
-/// Rust 1.86).
+/// Takes `&dyn NfsBackend` so each dispatcher can be handed the trait view
+/// it actually needs: MOUNT only touches `ExportRegistry`, while NFS still
+/// needs the full `Filesystem`. Trait upcasting is stable since Rust 1.86.
 async fn handle_rpc_message(
     data: &[u8],
     registry: &Registry,
@@ -265,7 +264,8 @@ async fn handle_rpc_message(
         100005 => {
             // MOUNT protocol (program 100005)
             debug!("Routing to MOUNT protocol handler");
-            crate::mount::handle_mount_call(&call, args_data, filesystem as &dyn Filesystem).await
+            crate::mount::handle_mount_call(&call, args_data, filesystem as &dyn ExportRegistry)
+                .await
         }
         100003 => {
             // NFS protocol (program 100003)
