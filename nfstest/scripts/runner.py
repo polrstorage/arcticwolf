@@ -61,7 +61,11 @@ def run_nfstest(testcase="read,write"):
     cmd = [
         nfstest_posix,
         "--server", NFS_SERVER,
-        "--export", "/",
+        # Match the rw export defined in arcticwolf.example.toml. MOUNT MNT
+        # now resolves the client dirpath against ExportRegistry, so the
+        # client must mount a configured export (e.g. /data) rather than
+        # bare "/".
+        "--export", "/data",
         "--mtpoint", MOUNT_POINT,
         "--nfsversion", "3",
         f"--runtest={testcase}",

@@ -62,11 +62,11 @@ impl LocalFilesystem {
 
     /// Return the root file handle for this export.
     ///
-    /// Inherent (synchronous) twin of [`Filesystem::root_handle`]; lets
-    /// `MultiExportFilesystem` fetch each export's root without paying for an
-    /// `async fn` round-trip and without colliding with the trait method's
-    /// async signature. Renamed from `root_handle` so callers — and future
-    /// readers — never have to wonder which one they're invoking.
+    /// Inherent (synchronous) accessor used by [`MultiExportFilesystem`] to
+    /// fetch each export's root without going through `async fn` trait
+    /// dispatch. The `Filesystem` trait deliberately does not expose a
+    /// `root_handle` method — a multi-export router has no single root, so
+    /// callers go through [`ExportRegistry::root_handle_for`] by name.
     pub fn root_file_handle(&self) -> FileHandle {
         self.root_handle.clone()
     }
@@ -201,10 +201,6 @@ impl LocalFilesystem {
 
 #[async_trait]
 impl Filesystem for LocalFilesystem {
-    async fn root_handle(&self) -> FileHandle {
-        self.root_handle.clone()
-    }
-
     async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
@@ -832,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn test_root_handle() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
         assert!(!root.is_empty(), "Root handle should not be empty");
         assert_eq!(root.len(), 32, "Root handle should be 32 bytes");
     }
@@ -840,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn test_getattr_root() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         let attr = fs
             .getattr(&root)
@@ -856,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_lookup_file() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create a file
         let file_handle = fs
@@ -888,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_read() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create file
         let file_handle = fs
@@ -922,7 +918,7 @@ mod tests {
     #[tokio::test]
     async fn test_mkdir_and_lookup() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create directory
         let dir_handle = fs
@@ -949,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn test_nested_operations() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create nested directory structure
         let dir1 = fs
@@ -980,7 +976,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_file() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create and remove file
         fs.create(&root, "temp.txt", 0o644)
@@ -999,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn test_rmdir() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create and remove directory
         fs.mkdir(&root, "tempdir", 0o755)
@@ -1018,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_traversal_prevention() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Try to create file with path traversal
         let result = fs.create(&root, "../etc/passwd", 0o644).await;
@@ -1034,7 +1030,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_nonexistent() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         let result = fs.lookup(&root, "nonexistent.txt").await;
         assert!(result.is_err(), "Lookup should fail for nonexistent file");
@@ -1043,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_idempotency() {
         let (fs, _temp_dir) = create_test_fs();
-        let root = fs.root_handle().await;
+        let root = fs.root_file_handle();
 
         // Create file
         fs.create(&root, "file.txt", 0o644)

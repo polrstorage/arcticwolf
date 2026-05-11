@@ -182,7 +182,7 @@ mod tests {
         fs::write(&test_file, b"Hello, World! This is a long file.").unwrap();
 
         // Get file handle and current ctime for guard
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
         let file_handle = fs.lookup(&root_handle, "truncate_test.txt").await.unwrap();
         let before_attrs = fs.getattr(&file_handle).await.unwrap();
 
@@ -242,7 +242,7 @@ mod tests {
         fs::write(&test_file, b"test").unwrap();
 
         // Get file handle and current ctime for guard
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
         let file_handle = fs.lookup(&root_handle, "mode_test.txt").await.unwrap();
         let before_attrs = fs.getattr(&file_handle).await.unwrap();
 

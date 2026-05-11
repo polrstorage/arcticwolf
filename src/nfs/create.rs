@@ -187,7 +187,7 @@ mod tests {
         };
         let fs = config.create_filesystem(1).unwrap();
 
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Serialize CREATE3args
         use crate::protocol::v3::nfs::{
@@ -242,7 +242,7 @@ mod tests {
         let test_file = temp_dir.path().join("existing.txt");
         fs::write(&test_file, b"old content").unwrap();
 
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Serialize CREATE3args with UNCHECKED mode
         use crate::protocol::v3::nfs::{

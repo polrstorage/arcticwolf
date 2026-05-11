@@ -210,7 +210,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir".to_string(), 1).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Create MKDIR3args manually
         use xdr_codec::Pack;
@@ -272,7 +272,7 @@ mod tests {
         let fs = LocalFilesystem::new("/tmp/nfs_test_mkdir_exists".to_string(), 1).unwrap();
 
         // Get root handle
-        let root_handle = fs.root_handle().await;
+        let root_handle = fs.root_file_handle();
 
         // Create MKDIR3args manually
         use xdr_codec::Pack;

@@ -101,13 +101,12 @@ async fn main() -> Result<()> {
     println!("  Log level: {}", log_level_str);
     println!();
 
-    // Initialize FSAL (File System Abstraction Layer)
+    // Initialize FSAL (File System Abstraction Layer).
     //
-    // Phase 3 of #26: MultiExportFilesystem owns one backend per configured
-    // export and routes operations by the uid prefix in each file handle.
-    // MOUNT/NFS dispatchers still take `&dyn Filesystem` and see the wrapper
-    // through that view; Phase 4/5 will hand them an `&dyn ExportRegistry`
-    // slice instead.
+    // MultiExportFilesystem owns one backend per configured export and
+    // routes operations by the uid prefix in each file handle. MOUNT MNT
+    // resolves the client-supplied dirpath against `ExportRegistry`; NFS
+    // still consumes the wrapper as `&dyn Filesystem`.
     println!("Initializing FSAL:");
 
     let filesystem: Arc<dyn fsal::NfsBackend> = Arc::new(
@@ -134,22 +133,6 @@ async fn main() -> Result<()> {
             if export.read_only { "ro" } else { "rw" },
             source.backend.name(),
             backend_path,
-        );
-    }
-    // MOUNT MNT still hands out the lowest-uid export's root regardless of
-    // the dirpath the client sent — Phase 4 of #26 swaps that for a dirpath
-    // lookup. Until then, configuring more than one export silently
-    // misroutes every mount to the first export, so warn the operator.
-    // `list_exports` is sorted by uid, so `exports[0]` is the lowest-uid.
-    if exports.len() > 1 {
-        let first = &exports[0];
-        eprintln!(
-            "Warning: {} exports configured. MOUNT MNT does not yet route by client dirpath \
-             — all mount requests will receive the root handle of export '{}' (uid {}). \
-             Multi-export routing lands in Phase 4 of #26.",
-            exports.len(),
-            first.name,
-            first.uid,
         );
     }
     println!();

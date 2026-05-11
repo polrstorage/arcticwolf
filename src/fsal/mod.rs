@@ -95,13 +95,12 @@ pub struct DirEntry {
 ///
 /// This trait defines the interface that all filesystem backends must implement.
 /// It provides operations for file/directory access, metadata queries, and I/O.
+///
+/// Note: root handles for individual exports are obtained via
+/// [`ExportRegistry::root_handle_for`] — they don't live on `Filesystem`
+/// because a multi-export backend has no single "the" root handle.
 #[async_trait]
 pub trait Filesystem: Send + Sync {
-    /// Get the root file handle
-    ///
-    /// This is typically the starting point for all filesystem operations.
-    async fn root_handle(&self) -> FileHandle;
-
     /// Look up a name in a directory
     ///
     /// Given a directory handle and a filename, return the file handle
@@ -329,22 +328,18 @@ pub struct ExportInfo {
 
 /// Registry of NFS exports, decoupled from per-handle filesystem operations.
 ///
-/// MOUNT MNT looks up a name to obtain the root handle; NFS write paths use
-/// [`is_read_only`](Self::is_read_only) to gate mutating operations; and
-/// [`export_for_handle`](Self::export_for_handle) is exposed mostly for
-/// diagnostics and tests. Phase 4 will switch MOUNT MNT to call
-/// [`root_handle_for`](Self::root_handle_for) instead of
-/// [`Filesystem::root_handle`].
+/// MOUNT MNT and MOUNT EXPORT operate against this view; NFS write paths
+/// will use [`is_read_only`](Self::is_read_only) to gate mutating operations
+/// once Phase 5 lands. [`export_for_handle`](Self::export_for_handle) is
+/// exposed mostly for diagnostics and tests.
 ///
-/// Only [`list_exports`](Self::list_exports) has a binary caller today —
-/// the other three methods carry per-method `#[allow(dead_code)]` until
-/// Phase 4/5 wires them up, so a future caller landing for any one of them
-/// removes only that attribute rather than unmasking the whole trait.
+/// `is_read_only` and `export_for_handle` are not wired into the NFS write
+/// path yet — they carry `#[allow(dead_code)]` so the trait shape stays
+/// stable through Phase 5 without producing build warnings now.
 pub trait ExportRegistry: Send + Sync {
     /// Look up the root file handle for the export advertised as `name`.
     ///
     /// Returns `None` if no export matches.
-    #[allow(dead_code)]
     fn root_handle_for(&self, name: &str) -> Option<FileHandle>;
 
     /// List every configured export in deterministic order.
@@ -366,17 +361,18 @@ pub trait ExportRegistry: Send + Sync {
 /// Combined trait used by [`crate::rpc::server::RpcServer`].
 ///
 /// The server holds a single `Arc<dyn NfsBackend>` and hands each dispatcher
-/// the trait view it needs (`&dyn Filesystem` to MOUNT/NFS handlers today;
-/// `&dyn ExportRegistry` once Phase 4/5 split the dispatcher signatures).
+/// the trait view it needs: MOUNT receives `&dyn ExportRegistry`, NFS still
+/// receives `&dyn Filesystem`.
 pub trait NfsBackend: Filesystem + ExportRegistry {}
 
 impl<T: Filesystem + ExportRegistry> NfsBackend for T {}
 
 /// FSAL-side backend configuration.
 ///
-/// Mirrors [`crate::config::BackendConfig`] one variant at a time. v1 only ships the
-/// `Local` variant; future S3/Ceph backends gain their own variants here so
-/// [`BackendConfig::create_filesystem`] can dispatch by `match self`.
+/// Mirrors [`crate::config::BackendConfig`] one variant at a time. v1 only
+/// ships the `Local` variant; future S3/Ceph backends gain their own
+/// variants here so [`BackendConfig::create_filesystem`] can dispatch by
+/// `match self`.
 ///
 /// Phase 3 moved the production translation into
 /// [`MultiExportFilesystem::build_from_config`], so this enum is now
@@ -392,9 +388,17 @@ pub enum BackendConfig {
 
 #[allow(dead_code)]
 impl BackendConfig {
-    /// Build a [`Filesystem`] for this backend, binding it to `export_uid` so
-    /// every file handle it produces carries that uid in its prefix.
-    pub fn create_filesystem(&self, export_uid: u32) -> Result<Box<dyn Filesystem>> {
+    /// Build the backend for this configuration, binding it to `export_uid`
+    /// so every file handle it produces carries that uid in its prefix.
+    ///
+    /// Returns a `Box<LocalFilesystem>` (concrete) rather than a
+    /// `Box<dyn Filesystem>`: the per-op NFS unit tests need the inherent
+    /// `LocalFilesystem::root_file_handle()` to seed their test handles, and
+    /// no longer have a `Filesystem::root_handle()` trait method to fall
+    /// back on. When a second backend variant lands, this signature widens
+    /// to `Result<Box<dyn FilesystemWithRoot>>` or similar — for now the
+    /// concrete return keeps the test surface minimal.
+    pub fn create_filesystem(&self, export_uid: u32) -> Result<Box<LocalFilesystem>> {
         match self {
             BackendConfig::Local { path } => {
                 let fs = LocalFilesystem::new(path, export_uid)?;

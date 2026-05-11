@@ -11,12 +11,23 @@ data:
     nfs_port = 2049
     mount_port = 0
 
+    # Two exports so the multi-export wiring is exercised end-to-end in
+    # CI: /data is the read-write export the POSIX suite drives against,
+    # /backup is a second rw export used to verify per-export isolation
+    # and showmount listing.
     [[exports]]
     name = "/data"
     uid = 1
     read_only = false
     backend = "local"
-    path = "/tmp/nfs_exports"
+    path = "/tmp/nfs_data"
+
+    [[exports]]
+    name = "/backup"
+    uid = 2
+    read_only = false
+    backend = "local"
+    path = "/tmp/nfs_backup"
 
     [logging]
     level = "debug"
@@ -52,8 +63,10 @@ spec:
             - name: RUST_LOG
               value: "info"
           volumeMounts:
-            - name: nfs-exports
-              mountPath: /tmp/nfs_exports
+            - name: nfs-data
+              mountPath: /tmp/nfs_data
+            - name: nfs-backup
+              mountPath: /tmp/nfs_backup
             - name: config
               mountPath: /etc/arcticwolf
               readOnly: true
@@ -65,9 +78,11 @@ spec:
               memory: "512Mi"
               cpu: "500m"
       volumes:
-        - name: nfs-exports
+        - name: nfs-data
           persistentVolumeClaim:
             claimName: nfs-exports
+        - name: nfs-backup
+          emptyDir: {}
         - name: config
           configMap:
             name: arcticwolf-config
