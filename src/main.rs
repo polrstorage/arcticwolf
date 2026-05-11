@@ -103,47 +103,55 @@ async fn main() -> Result<()> {
 
     // Initialize FSAL (File System Abstraction Layer)
     //
-    // Phases 1 and 2 of the multi-export migration (#26) refactor the config
-    // surface and start threading the export uid into the FSAL handle layer.
-    // The MOUNT/NFS dispatchers still operate against a single FSAL instance,
-    // so we pick the first configured export here as a placeholder. Phase 3
-    // introduces the MultiExportFilesystem wrapper that replaces this.
+    // Phase 3 of #26: MultiExportFilesystem owns one backend per configured
+    // export and routes operations by the uid prefix in each file handle.
+    // MOUNT/NFS dispatchers still take `&dyn Filesystem` and see the wrapper
+    // through that view; Phase 4/5 will hand them an `&dyn ExportRegistry`
+    // slice instead.
     println!("Initializing FSAL:");
 
-    let primary_export = config
-        .exports
-        .first()
-        .expect("Config::validate guarantees at least one export");
-    let config::BackendConfig::Local { path: export_path } = &primary_export.backend;
-
-    println!(
-        "  Export: {} (uid {})",
-        primary_export.name, primary_export.uid
+    let filesystem: Arc<dyn fsal::NfsBackend> = Arc::new(
+        fsal::MultiExportFilesystem::build_from_config(&config.exports)?,
     );
-    println!("  Read-only: {}", primary_export.read_only);
-    println!("  FSAL backend: {}", primary_export.backend.name());
-    println!("  Export path: {}", export_path.display());
 
-    if config.exports.len() > 1 {
-        eprintln!(
-            "Warning: {} exports configured but Phase 2 still only serves the first ('{}'). \
-             Multi-export routing lands in Phase 3 (#26).",
-            config.exports.len(),
-            primary_export.name,
+    let exports = filesystem.list_exports();
+    for export in &exports {
+        // Backend type/path live in `config.exports` (the FSAL view via
+        // `ExportInfo` is intentionally backend-agnostic). Cross-reference
+        // by uid so the banner stays accurate as we add backends.
+        let source = config
+            .exports
+            .iter()
+            .find(|e| e.uid == export.uid)
+            .expect("every ExportInfo originates from a config entry");
+        let backend_path = match &source.backend {
+            config::BackendConfig::Local { path } => path.display().to_string(),
+        };
+        println!(
+            "  Export: {} (uid {}, {}, backend={}, path={})",
+            export.name,
+            export.uid,
+            if export.read_only { "ro" } else { "rw" },
+            source.backend.name(),
+            backend_path,
         );
     }
-
-    // Translate the public config enum into the FSAL-side enum. The two are
-    // kept separate so backend-specific fields (e.g. future S3 credentials)
-    // don't bleed into the deserialized config surface.
-    let fsal_backend = match &primary_export.backend {
-        config::BackendConfig::Local { path } => fsal::BackendConfig::Local { path: path.clone() },
-    };
-    let filesystem: Arc<dyn fsal::Filesystem> =
-        Arc::from(fsal_backend.create_filesystem(primary_export.uid)?);
-
-    let root_handle = filesystem.root_handle().await;
-    println!("  Root handle: {} bytes", root_handle.len());
+    // MOUNT MNT still hands out the lowest-uid export's root regardless of
+    // the dirpath the client sent — Phase 4 of #26 swaps that for a dirpath
+    // lookup. Until then, configuring more than one export silently
+    // misroutes every mount to the first export, so warn the operator.
+    // `list_exports` is sorted by uid, so `exports[0]` is the lowest-uid.
+    if exports.len() > 1 {
+        let first = &exports[0];
+        eprintln!(
+            "Warning: {} exports configured. MOUNT MNT does not yet route by client dirpath \
+             — all mount requests will receive the root handle of export '{}' (uid {}). \
+             Multi-export routing lands in Phase 4 of #26.",
+            exports.len(),
+            first.name,
+            first.uid,
+        );
+    }
     println!();
 
     // Create portmapper registry

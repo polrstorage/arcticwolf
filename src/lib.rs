@@ -5,6 +5,7 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 //
 // This library provides the core components for building an NFSv3 server
 
+pub mod config;
 pub mod fsal;
 pub mod mount;
 pub mod nfs;
@@ -13,4 +14,4 @@ pub mod protocol;
 pub mod rpc;
 
 // Re-export commonly used types
-pub use fsal::{FileHandle, Filesystem, LocalFilesystem};
+pub use fsal::{FileHandle, Filesystem, LocalFilesystem, MultiExportFilesystem, NfsBackend};

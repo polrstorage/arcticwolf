@@ -60,11 +60,27 @@ impl LocalFilesystem {
         })
     }
 
-    /// Resolve a file handle to a full path
+    /// Return the root file handle for this export.
+    ///
+    /// Inherent (synchronous) twin of [`Filesystem::root_handle`]; lets
+    /// `MultiExportFilesystem` fetch each export's root without paying for an
+    /// `async fn` round-trip and without colliding with the trait method's
+    /// async signature. Renamed from `root_handle` so callers — and future
+    /// readers — never have to wonder which one they're invoking.
+    pub fn root_file_handle(&self) -> FileHandle {
+        self.root_handle.clone()
+    }
+
+    /// Resolve a file handle to a full path.
+    ///
+    /// Error string starts with `"Invalid handle"` (not `"Invalid file
+    /// handle"`) so the per-operation NFS handlers' substring matchers map
+    /// it to `NFS3ERR_STALE`; the previous wording had `"file"` between the
+    /// two words and silently fell through to `NFS3ERR_IO`.
     fn resolve_handle(&self, handle: &FileHandle) -> Result<PathBuf> {
         self.handle_manager
             .lookup_path(handle)
-            .ok_or_else(|| anyhow!("Invalid file handle"))
+            .ok_or_else(|| anyhow!("Invalid handle: not found in handle manager"))
     }
 
     /// Validate that a path is within the export root

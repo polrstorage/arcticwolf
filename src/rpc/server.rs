@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-use crate::fsal::Filesystem;
+use crate::fsal::{Filesystem, NfsBackend};
 use crate::portmap::Registry;
 use crate::protocol::v3::rpc::RpcMessage;
 
@@ -20,7 +20,7 @@ use crate::protocol::v3::rpc::RpcMessage;
 pub struct RpcServer {
     listener: TcpListener,
     registry: Registry,
-    filesystem: Arc<dyn Filesystem>,
+    filesystem: Arc<dyn NfsBackend>,
     allowed_programs: Vec<u32>,
 }
 
@@ -32,7 +32,7 @@ impl RpcServer {
     pub async fn bind(
         addr: &str,
         registry: Registry,
-        filesystem: Arc<dyn Filesystem>,
+        filesystem: Arc<dyn NfsBackend>,
         allowed_programs: Vec<u32>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
@@ -82,7 +82,7 @@ impl RpcServer {
 async fn handle_connection(
     mut socket: TcpStream,
     registry: Registry,
-    filesystem: Arc<dyn Filesystem>,
+    filesystem: Arc<dyn NfsBackend>,
     allowed_programs: &[u32],
 ) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(8192);
@@ -169,10 +169,15 @@ async fn handle_connection(
 }
 
 /// Handle a complete RPC message
+///
+/// Takes `&dyn NfsBackend` so future dispatcher splits can ask for the
+/// `ExportRegistry` slice; today's MOUNT and NFS handlers are still
+/// `&dyn Filesystem`-shaped, so we upcast at the call site (stable since
+/// Rust 1.86).
 async fn handle_rpc_message(
     data: &[u8],
     registry: &Registry,
-    filesystem: &dyn Filesystem,
+    filesystem: &dyn NfsBackend,
     allowed_programs: &[u32],
 ) -> Result<BytesMut> {
     // Debug: dump complete RPC message
@@ -260,12 +265,12 @@ async fn handle_rpc_message(
         100005 => {
             // MOUNT protocol (program 100005)
             debug!("Routing to MOUNT protocol handler");
-            crate::mount::handle_mount_call(&call, args_data, filesystem).await
+            crate::mount::handle_mount_call(&call, args_data, filesystem as &dyn Filesystem).await
         }
         100003 => {
             // NFS protocol (program 100003)
             debug!("Routing to NFS protocol handler");
-            crate::nfs::dispatch(&call, args_data, filesystem).await
+            crate::nfs::dispatch(&call, args_data, filesystem as &dyn Filesystem).await
         }
         _ => {
             warn!("Unknown program number: {}", call.prog);
