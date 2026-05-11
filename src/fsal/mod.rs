@@ -5,6 +5,7 @@
 
 pub mod handle;
 pub mod local;
+pub mod multi_export;
 
 // Future backends (uncomment when implemented)
 // #[cfg(feature = "s3")]
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 #[allow(unused_imports)]
 pub use handle::{FileHandle, FileHandleExt, HandleManager};
 pub use local::LocalFilesystem;
+pub use multi_export::MultiExportFilesystem;
 
 /// File attributes
 ///
@@ -311,17 +313,84 @@ pub trait Filesystem: Send + Sync {
     ) -> Result<FileHandle>;
 }
 
+/// Metadata describing a single configured export.
+///
+/// Returned by [`ExportRegistry::list_exports`] so MOUNT EXPORT (and startup
+/// banners) can enumerate exports without touching backend internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportInfo {
+    /// Export path as advertised to NFS clients (e.g. `/data`).
+    pub name: String,
+    /// Non-zero export uid embedded in every file handle for this export.
+    pub uid: u32,
+    /// True if writes are denied against this export.
+    pub read_only: bool,
+}
+
+/// Registry of NFS exports, decoupled from per-handle filesystem operations.
+///
+/// MOUNT MNT looks up a name to obtain the root handle; NFS write paths use
+/// [`is_read_only`](Self::is_read_only) to gate mutating operations; and
+/// [`export_for_handle`](Self::export_for_handle) is exposed mostly for
+/// diagnostics and tests. Phase 4 will switch MOUNT MNT to call
+/// [`root_handle_for`](Self::root_handle_for) instead of
+/// [`Filesystem::root_handle`].
+///
+/// Only [`list_exports`](Self::list_exports) has a binary caller today —
+/// the other three methods carry per-method `#[allow(dead_code)]` until
+/// Phase 4/5 wires them up, so a future caller landing for any one of them
+/// removes only that attribute rather than unmasking the whole trait.
+pub trait ExportRegistry: Send + Sync {
+    /// Look up the root file handle for the export advertised as `name`.
+    ///
+    /// Returns `None` if no export matches.
+    #[allow(dead_code)]
+    fn root_handle_for(&self, name: &str) -> Option<FileHandle>;
+
+    /// List every configured export in deterministic order.
+    fn list_exports(&self) -> Vec<ExportInfo>;
+
+    /// Report whether the export that owns `handle` is read-only.
+    ///
+    /// Returns `false` for handles whose export uid prefix is unknown or
+    /// missing — write paths should treat that as a stale-handle error
+    /// elsewhere; this method only answers the read-only question.
+    #[allow(dead_code)]
+    fn is_read_only(&self, handle: &FileHandle) -> bool;
+
+    /// Decode the export uid embedded in `handle`'s prefix, if present.
+    #[allow(dead_code)]
+    fn export_for_handle(&self, handle: &FileHandle) -> Option<u32>;
+}
+
+/// Combined trait used by [`crate::rpc::server::RpcServer`].
+///
+/// The server holds a single `Arc<dyn NfsBackend>` and hands each dispatcher
+/// the trait view it needs (`&dyn Filesystem` to MOUNT/NFS handlers today;
+/// `&dyn ExportRegistry` once Phase 4/5 split the dispatcher signatures).
+pub trait NfsBackend: Filesystem + ExportRegistry {}
+
+impl<T: Filesystem + ExportRegistry> NfsBackend for T {}
+
 /// FSAL-side backend configuration.
 ///
 /// Mirrors [`crate::config::BackendConfig`] one variant at a time. v1 only ships the
 /// `Local` variant; future S3/Ceph backends gain their own variants here so
 /// [`BackendConfig::create_filesystem`] can dispatch by `match self`.
+///
+/// Phase 3 moved the production translation into
+/// [`MultiExportFilesystem::build_from_config`], so this enum is now
+/// referenced only from the per-operation NFS unit tests in `src/nfs/*.rs`.
+/// Marked `#[allow(dead_code)]` because the main binary doesn't see those
+/// `#[cfg(test)]` call sites.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
     /// Local filesystem backend rooted at `path`.
     Local { path: PathBuf },
 }
 
+#[allow(dead_code)]
 impl BackendConfig {
     /// Build a [`Filesystem`] for this backend, binding it to `export_uid` so
     /// every file handle it produces carries that uid in its prefix.
