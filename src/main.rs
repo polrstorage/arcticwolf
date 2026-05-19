@@ -22,6 +22,10 @@ mod portmap;
 mod protocol;
 mod rpc;
 
+// `admin` (issue #25) is consumed from the library crate the same way
+// `config` is — there's no reason to have a binary-local copy and doing
+// so would re-trigger the dual-compilation problem documented above.
+use arcticwolf::admin;
 use arcticwolf::config::{self, Config};
 use protocol::v3::portmap::mapping;
 
@@ -72,6 +76,31 @@ fn register_services(
     println!("  NFS v3 (TCP) on port {}", nfs_port);
 
     println!();
+}
+
+/// Build the admin server future based on `[admin]` config.
+///
+/// When `enabled = false`, returns a `pending` future — the caller drops
+/// it into `tokio::select!` alongside the RPC servers, and that branch
+/// never fires. When enabled, binds the socket eagerly so any setup
+/// failure (missing parent dir, EACCES, stale non-socket at the path)
+/// returns from `main()` with a clear error instead of being deferred.
+fn build_admin_future(
+    admin: &config::AdminConfig,
+) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>> {
+    if !admin.enabled {
+        return Ok(Box::pin(std::future::pending::<Result<()>>()));
+    }
+
+    println!("Admin server:");
+    println!("  Socket: {}", admin.socket_path.display());
+    println!("  Mode: {:o}", admin.socket_mode);
+    println!();
+
+    let listener = admin::server::bind_admin_socket(&admin.socket_path, admin.socket_mode)?;
+    let context = admin::AdminContext::shared();
+    let socket_path = admin.socket_path.clone();
+    Ok(Box::pin(admin::serve(listener, socket_path, context)))
 }
 
 #[tokio::main]
@@ -186,7 +215,16 @@ async fn main() -> Result<()> {
         config.server.nfs_port as u32,
     );
 
-    // Run all three servers concurrently
+    // Admin Unix-domain-socket server (issue #25 phase 1).
+    //
+    // When `[admin] enabled = false` (the default) we deliberately do not
+    // bind a socket or spawn any task — `admin_future` becomes a
+    // never-resolving sentinel so it's selectable with the other servers
+    // but never wakes the select!.
+    let admin_future = build_admin_future(&config.admin)?;
+
+    // Run all servers concurrently. The admin branch is a `pending` future
+    // when admin is disabled, so its presence in `select!` is free.
     tokio::select! {
         result = portmap_server.serve() => {
             result?;
@@ -195,6 +233,9 @@ async fn main() -> Result<()> {
             result?;
         }
         result = nfs_server.serve() => {
+            result?;
+        }
+        result = admin_future => {
             result?;
         }
     }

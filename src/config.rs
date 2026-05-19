@@ -27,6 +27,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub exports: Vec<ExportConfig>,
     pub logging: LoggingConfig,
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +90,39 @@ pub struct LoggingConfig {
     pub level: Option<String>,
 }
 
+/// Admin Unix-domain-socket server settings.
+///
+/// The admin transport (issue #25) is opt-in: by default `enabled = false`
+/// so the scaffolding is inert and existing deployments are unaffected.
+/// When enabled, the daemon binds a length-prefixed JSON server at
+/// `socket_path` and applies `socket_mode` (default `0o600`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Whether the admin server is started at all. Defaults to `false`.
+    pub enabled: bool,
+    /// Filesystem path for the admin Unix domain socket.
+    pub socket_path: PathBuf,
+    /// File mode applied to the socket via `chmod(2)` after bind.
+    ///
+    /// TOML doesn't have an octal literal, so values are written in either
+    /// decimal (e.g. `384`) or Rust-style octal (e.g. `0o600`) — both
+    /// deserialize through `u32` here. We don't try to validate the mode
+    /// bits beyond their range; the kernel will reject anything wider when
+    /// `chmod` is called.
+    pub socket_mode: u32,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: PathBuf::from("/run/arcticwolf/admin.sock"),
+            socket_mode: 0o600,
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -112,6 +146,7 @@ impl Default for Config {
                 },
             }],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -179,6 +214,18 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.exports.is_empty() {
             bail!("Configuration must define at least one [[exports]] entry");
+        }
+
+        // Reject mode values that overflow the chmod(2) permission bits.
+        // `chmod` silently masks anything above 0o777, so accepting e.g.
+        // `0o7777` would lead to a surprising "I set 7777 but stat shows
+        // 0777" mismatch. Validating up front gives the operator a clear
+        // error pointing at the field they got wrong.
+        if self.admin.socket_mode > 0o777 {
+            bail!(
+                "admin.socket_mode = {:o} is invalid; must be <= 0o777 (chmod silently masks higher bits)",
+                self.admin.socket_mode,
+            );
         }
 
         let mut seen_uids: HashMap<u32, &str> = HashMap::new();
@@ -419,6 +466,7 @@ mod tests {
             server: ServerConfig::default(),
             exports: vec![],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         let err = config.validate().expect_err("empty exports must fail");
         let msg = err.to_string();
@@ -434,6 +482,7 @@ mod tests {
                 local_export("/b", 5, "/srv/b"),
             ],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         let err = config.validate().expect_err("duplicate uid must fail");
         let msg = err.to_string();
@@ -457,6 +506,7 @@ mod tests {
                 local_export("/data", 2, "/srv/b"),
             ],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         let err = config.validate().expect_err("duplicate name must fail");
         let msg = err.to_string();
@@ -472,6 +522,7 @@ mod tests {
             server: ServerConfig::default(),
             exports: vec![local_export("/data", 0, "/srv/a")],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         let err = config.validate().expect_err("uid 0 must fail");
         let msg = err.to_string();
@@ -484,6 +535,7 @@ mod tests {
             server: ServerConfig::default(),
             exports: vec![local_export("data", 1, "/srv/a")],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         let err = config.validate().expect_err("relative name must fail");
         let msg = err.to_string();
@@ -518,6 +570,7 @@ mod tests {
                 local_export("/c", 3, "/srv/c"),
             ],
             logging: LoggingConfig::default(),
+            admin: AdminConfig::default(),
         };
         config.validate().expect("distinct exports must validate");
     }
@@ -626,6 +679,134 @@ path = "/srv/data"
             err.contains("unknown") || err.contains("fsal"),
             "error should mention unknown field; got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_admin_config_defaults_when_section_absent() {
+        // The defining contract for #25 phase 1: a config file that doesn't
+        // mention `[admin]` at all must still parse and produce an inert
+        // (`enabled = false`) admin section. Existing deployments must not
+        // need to touch their TOML to keep building.
+        let toml = r#"
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse without [admin]");
+        assert!(!config.admin.enabled);
+        assert_eq!(
+            config.admin.socket_path,
+            PathBuf::from("/run/arcticwolf/admin.sock")
+        );
+        assert_eq!(config.admin.socket_mode, 0o600);
+    }
+
+    #[test]
+    fn test_admin_config_parses_explicit_values() {
+        // Operators write the mode either as a decimal number or a Rust-style
+        // octal literal; both must reach `AdminConfig::socket_mode` as the
+        // same `u32`. We exercise the octal form here — TOML accepts `0o600`
+        // as a numeric literal, but the assertion is on the decoded value.
+        let toml = r#"
+            [admin]
+            enabled = true
+            socket_path = "/tmp/aw-admin.sock"
+            socket_mode = 0o640
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse [admin]");
+        assert!(config.admin.enabled);
+        assert_eq!(
+            config.admin.socket_path,
+            PathBuf::from("/tmp/aw-admin.sock")
+        );
+        assert_eq!(config.admin.socket_mode, 0o640);
+    }
+
+    #[test]
+    fn test_admin_socket_mode_decimal_value() {
+        // TOML has no octal syntax outside the Rust-style `0o...` literal, so
+        // operators may write the mode as plain decimal. `384 == 0o600` must
+        // round-trip through deserialization to the same numeric value as
+        // `0o600` would. Pairs with `test_admin_config_parses_explicit_values`
+        // (which exercises the `0o640` form).
+        let toml = r#"
+            [admin]
+            enabled = true
+            socket_path = "/tmp/aw-admin.sock"
+            socket_mode = 384
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse decimal socket_mode");
+        assert_eq!(config.admin.socket_mode, 0o600);
+        config
+            .validate()
+            .expect("decimal socket_mode within range must validate");
+    }
+
+    #[test]
+    fn test_admin_socket_mode_too_high_is_rejected() {
+        // `chmod(2)` silently masks anything wider than 0o777, so passing
+        // a 4-digit octal (or a very large decimal) would silently drop
+        // bits without warning the operator. `validate()` must reject it.
+        let mut config = Config::default();
+        config.admin.socket_mode = 0o7777;
+        let err = config
+            .validate()
+            .expect_err("socket_mode > 0o777 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("must be <= 0o777"),
+            "error should explain the upper bound; got: {err}",
+        );
+
+        // Decimal far outside the chmod range — same code path, just confirms
+        // we don't have a magic-octal shortcut bypass.
+        let mut config = Config::default();
+        config.admin.socket_mode = 9_999_999;
+        let err = config
+            .validate()
+            .expect_err("absurd decimal socket_mode must be rejected")
+            .to_string();
+        assert!(
+            err.contains("must be <= 0o777"),
+            "error should explain the upper bound; got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_admin_config_rejects_unknown_field() {
+        // `AdminConfig` carries `deny_unknown_fields`, so a typo such as
+        // `socket_perms` instead of `socket_mode` must fail at load time
+        // rather than be silently dropped.
+        let toml = r#"
+            [admin]
+            enabled = true
+            socket_perms = 384
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown field inside [admin] must fail to parse"
         );
     }
 }

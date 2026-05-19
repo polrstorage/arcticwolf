@@ -16,7 +16,7 @@ TESTCASE ?= read,write
 # Default target
 .DEFAULT_GOAL := help
 
-.PHONY: help build test lint start-test-env nfstest stop-test-env clean
+.PHONY: help build test lint lockfile start-test-env nfstest stop-test-env clean
 
 # Show available targets and their descriptions
 help:
@@ -24,6 +24,7 @@ help:
 	@echo "  build           - Build release binary"
 	@echo "  test            - Run unit tests"
 	@echo "  lint            - Run clippy and rustfmt checks"
+	@echo "  lockfile        - Regenerate Cargo.lock from Cargo.toml"
 	@echo "  start-test-env  - Build and start both server and client VM"
 	@echo "  nfstest         - Run NFS tests (TESTCASE=read,write)"
 	@echo "  stop-test-env   - Stop both server and VM"
@@ -45,6 +46,10 @@ test:
 # Run clippy and rustfmt checks
 lint:
 	$(EARTHLY) +lint
+
+# Regenerate Cargo.lock from Cargo.toml
+lockfile:
+	$(EARTHLY) +lockfile
 
 # Build Docker image
 image:
