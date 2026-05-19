@@ -19,9 +19,20 @@ async-trait = "0.1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
+serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
+tokio-util = { version = "0.7", features = ["codec"] }
+# Needed for the `Sink`/`Stream` extension traits used on the admin
+# `Framed` connection. `default-features = false` keeps the build to just
+# the sink/stream helpers we use here.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# `nix` is unused by Phase 1 itself; pulled in now so Phase 6 (audit log)
+# can read `SO_PEERCRED` without another Cargo.toml churn. The `socket`
+# and `user` features cover both the peer credential lookup and the
+# subsequent uid/username resolution.
+nix = { version = "0.29", features = ["socket", "user"] }
 
 # XDR serialization (runtime)
 xdr-codec = "0.4"

@@ -43,6 +43,19 @@ lint:
     RUN cargo fmt -- --check
     RUN cargo clippy -- -D warnings
 
+# earthly +lockfile
+# Regenerate Cargo.lock from Cargo.toml and copy it back to the host.
+# Use after editing [dependencies] in Cargo.toml.
+lockfile:
+    FROM rust:1.91
+    WORKDIR /src
+    COPY Cargo.toml ./
+    COPY build.rs ./
+    COPY xdr ./xdr
+    COPY src ./src
+    RUN cargo generate-lockfile
+    SAVE ARTIFACT Cargo.lock AS LOCAL Cargo.lock
+
 # earthly +image
 image:
     ARG IMAGE_REPO=freezevicente
