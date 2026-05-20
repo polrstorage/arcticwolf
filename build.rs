@@ -3,7 +3,41 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn main() {
+use vergen_gitcl::{CargoBuilder, Emitter, GitclBuilder, RustcBuilder};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Emit the VERGEN_* env vars first so build/version metadata is
+    // available even if XDR codegen is short-circuited by a cached run.
+    emit_build_metadata()?;
+    generate_xdr_types();
+    Ok(())
+}
+
+/// Emit the `VERGEN_*` compile-time env vars consumed by the admin
+/// `version` command (`VERGEN_GIT_SHA`, `VERGEN_RUSTC_SEMVER`,
+/// `VERGEN_CARGO_DEBUG`).
+///
+/// The `gitcl` backend shells out to the `git` CLI. When the build runs
+/// without a `.git` directory available — as in the container build, which
+/// copies only the sources — vergen cannot resolve the commit; it falls
+/// back to a placeholder rather than failing, and the handler reports the
+/// field as "unknown".
+fn emit_build_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    let cargo = CargoBuilder::all_cargo()?;
+    let rustc = RustcBuilder::all_rustc()?;
+    let gitcl = GitclBuilder::all_git()?;
+    Emitter::default()
+        .add_instructions(&cargo)?
+        .add_instructions(&rustc)?
+        .add_instructions(&gitcl)?
+        .emit()?;
+    Ok(())
+}
+
+/// Run `xdrgen` over the XDR v3 specs and write the generated Rust types
+/// into `OUT_DIR`. Panics on failure — a broken codegen step must fail the
+/// build loudly.
+fn generate_xdr_types() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_path = Path::new(&out_dir);
 

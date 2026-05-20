@@ -8,10 +8,12 @@
 //! `arcticwolfctl raw '<json>'` debug command requires the wire format to
 //! be human-readable.
 //!
-//! This module exposes two helpers:
-//! - [`framed_request`] / [`framed_response`] wrap a Tokio `AsyncRead+Write`
-//!   stream in a typed framed sink/stream of `AdminRequest`/`AdminResponse`.
-//! - [`decode_request`] / [`encode_response`] are the raw conversion
+//! This module exposes:
+//! - [`framed`] wraps a Tokio `AsyncRead + AsyncWrite` stream in a
+//!   `LengthDelimitedCodec`, so each read or write is one length-prefixed
+//!   frame of raw bytes — the JSON body is encoded and decoded separately
+//!   by the helpers below.
+//! - [`decode_request`] / [`encode_response`] are the raw JSON conversion
 //!   functions, kept public so unit tests (and Phase 2 batch tooling) can
 //!   exercise them without setting up a socket pair.
 
