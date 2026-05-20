@@ -2,11 +2,22 @@
 name = "arcticwolf"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.86"
+# Required by vergen-gitcl 9.1.0 (transitive: vergen 9.0+ uses 1.88 features).
+rust-version = "1.88"
 
 [lib]
 name = "arcticwolf"
 path = "src/lib.rs"
+
+# Both binaries are declared explicitly: `arcticwolf` is the NFS daemon and
+# `arcticwolfctl` is the operator admin client (issue #25).
+[[bin]]
+name = "arcticwolf"
+path = "src/main.rs"
+
+[[bin]]
+name = "arcticwolfctl"
+path = "src/bin/arcticwolfctl.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -37,8 +48,32 @@ nix = { version = "0.29", features = ["socket", "user"] }
 # XDR serialization (runtime)
 xdr-codec = "0.4"
 
+# Test-only dependency, activated by the `test-util` feature (see
+# [features]). The `AdminContext::for_test` helper needs it to build a
+# tempdir-backed export when the library is compiled with `test-util` so
+# integration tests can link against it. Never compiled into release builds.
+tempfile = { version = "3", optional = true }
+
+[features]
+default = []
+# Enables test-only helpers (e.g. `AdminContext::for_test`) so integration
+# tests in tests/ can reuse the same fixtures the in-crate unit tests use.
+# Never enable in release builds.
+test-util = ["dep:tempfile"]
+
 [dev-dependencies]
 tempfile = "3"
+# Re-link this crate with the `test-util` feature enabled so integration
+# tests in tests/ can call the in-crate test helpers (AdminContext::for_test)
+# without duplicating the fixtures.
+arcticwolf = { path = ".", features = ["test-util"] }
 
 [build-dependencies]
-# No build dependencies - xdrgen is installed as CLI tool
+# xdrgen itself is installed as a CLI tool (see build.rs), not a crate.
+# `vergen-gitcl` generates the VERGEN_* compile-time env vars consumed by
+# the admin `version` command: VERGEN_GIT_SHA (build commit),
+# VERGEN_RUSTC_SEMVER (rustc version) and VERGEN_CARGO_DEBUG (build
+# profile). The `gitcl` backend shells out to the `git` CLI; when the
+# build runs without a `.git` directory (the container build copies only
+# sources) vergen falls back gracefully and the handler reports "unknown".
+vergen-gitcl = { version = "9", features = ["cargo", "rustc"] }

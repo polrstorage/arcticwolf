@@ -117,7 +117,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: PathBuf::from("/run/arcticwolf/admin.sock"),
+            socket_path: PathBuf::from(crate::admin::DEFAULT_ADMIN_SOCKET_PATH),
             socket_mode: 0o600,
         }
     }

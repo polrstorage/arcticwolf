@@ -87,6 +87,7 @@ fn register_services(
 /// returns from `main()` with a clear error instead of being deferred.
 fn build_admin_future(
     admin: &config::AdminConfig,
+    context: Arc<admin::AdminContext>,
 ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>> {
     if !admin.enabled {
         return Ok(Box::pin(std::future::pending::<Result<()>>()));
@@ -98,15 +99,19 @@ fn build_admin_future(
     println!();
 
     let listener = admin::server::bind_admin_socket(&admin.socket_path, admin.socket_mode)?;
-    let context = admin::AdminContext::shared();
     let socket_path = admin.socket_path.clone();
     Ok(Box::pin(admin::serve(listener, socket_path, context)))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration first (before tracing init)
-    let config = Config::load()?;
+    // Capture the process start instant up front so the admin `status`
+    // command can report an accurate uptime.
+    let start_time = std::time::Instant::now();
+
+    // Load configuration first (before tracing init). Wrapped in an `Arc`
+    // so it can be shared with the admin context without a deep copy.
+    let config = Arc::new(Config::load()?);
 
     // Initialize tracing with configured log level
     // Priority: config file -> RUST_LOG env -> "info"
@@ -123,6 +128,12 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_max_level(log_level).init();
 
+    // The log level that actually took effect. When `log_level_str` fails
+    // to parse we fall back to INFO above, so this must report `info`
+    // rather than the rejected configuration string — the startup banner
+    // and the admin `status` command both surface it to operators.
+    let startup_log_level = log_level.to_string().to_lowercase();
+
     println!("Arctic Wolf NFS Server");
     println!("======================");
     println!("Configuration:");
@@ -137,7 +148,7 @@ async fn main() -> Result<()> {
         }
     );
     println!("  NFS port: {}", config.server.nfs_port);
-    println!("  Log level: {}", log_level_str);
+    println!("  Log level: {}", startup_log_level);
     println!();
 
     // Initialize FSAL (File System Abstraction Layer).
@@ -215,13 +226,41 @@ async fn main() -> Result<()> {
         config.server.nfs_port as u32,
     );
 
-    // Admin Unix-domain-socket server (issue #25 phase 1).
+    // Admin Unix-domain-socket server (issue #25).
     //
     // When `[admin] enabled = false` (the default) we deliberately do not
     // bind a socket or spawn any task — `admin_future` becomes a
     // never-resolving sentinel so it's selectable with the other servers
     // but never wakes the select!.
-    let admin_future = build_admin_future(&config.admin)?;
+    //
+    // The admin `status` command reports the *actual* listening ports, so
+    // they are read back from the bound listeners here — a configured port
+    // of 0 means the OS picked one.
+    let server_metadata = Arc::new(admin::ServerMetadata {
+        nfs_port: nfs_server.local_port()?,
+        mount_port: mount_server.local_port()?,
+        portmap_port: portmap_server.local_port()?,
+    });
+
+    // `AdminContext` lives in the library crate, so it needs the library's
+    // `NfsBackend` view — a distinct type from the binary-local `fsal`
+    // module compiled into this binary (see the module comment at the top
+    // of this file). Until that duplication is cleaned up, build a second
+    // router from the same export config purely so the admin `status`
+    // command can report `export_count`; both routers observe identical
+    // configuration.
+    let admin_filesystem: Arc<dyn arcticwolf::fsal::NfsBackend> = Arc::new(
+        arcticwolf::fsal::MultiExportFilesystem::build_from_config(&config.exports)?,
+    );
+    let admin_context = admin::AdminContext::shared(
+        start_time,
+        server_metadata,
+        startup_log_level,
+        admin_filesystem,
+        config.clone(),
+    );
+
+    let admin_future = build_admin_future(&config.admin, admin_context)?;
 
     // Run all servers concurrently. The admin branch is a `pending` future
     // when admin is disabled, so its presence in `select!` is free.

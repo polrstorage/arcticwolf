@@ -22,6 +22,10 @@ common:
     # Copy source code
     COPY src ./src
 
+    # Copy Rust integration tests (cargo discovers tests/*.rs; the .py
+    # files in this directory are nfstest scripts and are ignored by cargo)
+    COPY tests ./tests
+
     # Pre-fetch dependencies to speed up subsequent builds
     RUN cargo fetch
 

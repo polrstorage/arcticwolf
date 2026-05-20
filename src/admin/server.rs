@@ -16,8 +16,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
+use super::commands;
 use super::context::AdminContext;
 use super::protocol::{decode_request, encode_response, framed};
+use super::request::AdminRequest;
 use super::response::AdminResponse;
 
 /// Upper bound for the post-codec-error courtesy response. After a frame
@@ -215,32 +217,32 @@ where
     framed.send(encoded).await.context("sending admin response")
 }
 
-/// Phase 1 dispatcher: parse the request to validate the wire format, but
-/// answer everything with a not-implemented error. Phase 2+ replaces this
-/// with per-command handlers.
-fn dispatch(_context: &AdminContext, frame: &[u8]) -> AdminResponse {
-    match decode_request(frame) {
-        Ok(req) => {
-            debug!("admin: received {:?}; not implemented in phase 1", req);
-            AdminResponse::error("Command not implemented in phase 1")
-        }
-        Err(err) => {
-            // Includes the "Unknown command: ..." prefix that the CLI keys
-            // on for its user-facing error.
-            AdminResponse::error(err)
-        }
+/// Decode an admin request frame and route it to its handler.
+///
+/// Handlers are synchronous — Phase 2's `status`/`version` only read
+/// already-resolved context state, so no `.await` is needed on this path.
+fn dispatch(context: &AdminContext, frame: &[u8]) -> AdminResponse {
+    let request = match decode_request(frame) {
+        Ok(request) => request,
+        // Includes the "Unknown command: ..." prefix the CLI keys on for
+        // its user-facing error.
+        Err(err) => return AdminResponse::error(err),
+    };
+    debug!("admin: dispatching {request:?}");
+    match request {
+        AdminRequest::Status => commands::status::handle(context),
+        AdminRequest::Version => commands::version::handle(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::request::AdminRequest;
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     fn check_dispatch(frame: &[u8]) -> AdminResponse {
-        let ctx = AdminContext::new();
-        dispatch(&ctx, frame)
+        let (context, _tmp) = AdminContext::for_test();
+        dispatch(&context, frame)
     }
 
     fn client_codec() -> LengthDelimitedCodec {
@@ -254,20 +256,28 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_known_request_returns_not_implemented() {
-        // The dispatcher must still decode the frame even though it has no
-        // handler — that catches mismatched serialization in tests as the
-        // protocol grows. The actual response stays generic until Phase 2.
+    fn dispatch_status_returns_ok_snapshot() {
+        // Phase 2: `status` is wired end to end and answers with an Ok
+        // carrier whose `data` is the health snapshot.
         let payload = serde_json::to_vec(&AdminRequest::Status).unwrap();
-        let response = check_dispatch(&payload);
-        match response {
-            AdminResponse::Err { error } => {
-                assert!(
-                    error.contains("not implemented"),
-                    "phase 1 dispatcher must reply with not-implemented; got: {error}",
-                );
+        match check_dispatch(&payload) {
+            AdminResponse::Ok { data } => {
+                assert_eq!(data["daemon_version"], env!("CARGO_PKG_VERSION"));
+                assert!(data.get("export_count").is_some());
             }
-            AdminResponse::Ok { .. } => panic!("phase 1 dispatcher must not return Ok"),
+            AdminResponse::Err { error } => panic!("status must return Ok; got: {error}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_version_returns_ok_build_info() {
+        let payload = serde_json::to_vec(&AdminRequest::Version).unwrap();
+        match check_dispatch(&payload) {
+            AdminResponse::Ok { data } => {
+                assert_eq!(data["daemon_version"], env!("CARGO_PKG_VERSION"));
+                assert!(data["build_profile"].is_string());
+            }
+            AdminResponse::Err { error } => panic!("version must return Ok; got: {error}"),
         }
     }
 
@@ -419,7 +429,7 @@ mod tests {
 
     /// End-to-end wire test: bind a socket in a tempdir, connect a client,
     /// send a length-prefixed `AdminRequest::Status` frame, and assert the
-    /// server replies with the Phase 1 "not implemented" `AdminResponse`.
+    /// server replies with an Ok `AdminResponse` carrying the snapshot.
     /// Exercises the same code path `main.rs` uses, just over a tempdir
     /// socket instead of `/run/arcticwolf/admin.sock`.
     #[tokio::test]
@@ -428,7 +438,7 @@ mod tests {
         let socket_path = dir.path().join("admin.sock");
 
         let listener = bind_admin_socket(&socket_path, 0o600).expect("bind admin sock");
-        let context = AdminContext::shared();
+        let (context, _export_tmp) = AdminContext::for_test();
         let socket_path_for_serve = socket_path.clone();
         let server =
             tokio::spawn(async move { serve(listener, socket_path_for_serve, context).await });
@@ -452,13 +462,12 @@ mod tests {
             .expect("frame is well-formed");
         let response: AdminResponse = serde_json::from_slice(&frame).expect("response decodes");
         match response {
-            AdminResponse::Err { error } => {
-                assert!(
-                    error.contains("not implemented"),
-                    "phase 1 server must reply with not-implemented; got: {error}",
-                );
+            AdminResponse::Ok { data } => {
+                assert_eq!(data["daemon_version"], env!("CARGO_PKG_VERSION"));
             }
-            AdminResponse::Ok { .. } => panic!("phase 1 server must not return Ok"),
+            AdminResponse::Err { error } => {
+                panic!("phase 2 server must answer status with Ok; got: {error}")
+            }
         }
 
         server.abort();
