@@ -4,30 +4,12 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 use anyhow::Result;
 use std::sync::Arc;
 
-// `config` is intentionally NOT redeclared with `mod config;` here. It lives
-// in the library crate (see `src/lib.rs`) and is consumed from the binary
-// via `arcticwolf::config`. This avoids the dual-compilation issue that
-// happens when both `lib.rs` and `main.rs` declare the same module (the
-// module gets compiled twice into separate types).
-//
-// The other modules (fsal/mount/nfs/portmap/protocol/rpc) are still
-// declared below for backward compatibility — they are the binary's own
-// view of the same sources. Migrating those is a separate cleanup; the
-// `config` consolidation is what mattered for #26 because the new
-// `Config` / `ExportConfig` types crossed the lib boundary.
-mod fsal;
-mod mount;
-mod nfs;
-mod portmap;
-mod protocol;
-mod rpc;
-
-// `admin` (issue #25) is consumed from the library crate the same way
-// `config` is — there's no reason to have a binary-local copy and doing
-// so would re-trigger the dual-compilation problem documented above.
 use arcticwolf::admin;
 use arcticwolf::config::{self, Config};
-use protocol::v3::portmap::mapping;
+use arcticwolf::fsal;
+use arcticwolf::portmap;
+use arcticwolf::protocol::v3::portmap::mapping;
+use arcticwolf::rpc;
 
 /// Portmapper port is fixed at 111 per RFC 1833
 const PORTMAP_PORT: u16 = 111;
@@ -242,21 +224,14 @@ async fn main() -> Result<()> {
         portmap_port: portmap_server.local_port()?,
     });
 
-    // `AdminContext` lives in the library crate, so it needs the library's
-    // `NfsBackend` view — a distinct type from the binary-local `fsal`
-    // module compiled into this binary (see the module comment at the top
-    // of this file). Until that duplication is cleaned up, build a second
-    // router from the same export config purely so the admin `status`
-    // command can report `export_count`; both routers observe identical
-    // configuration.
-    let admin_filesystem: Arc<dyn arcticwolf::fsal::NfsBackend> = Arc::new(
-        arcticwolf::fsal::MultiExportFilesystem::build_from_config(&config.exports)?,
-    );
+    // The admin context shares the daemon's single `MultiExportFilesystem`
+    // instance with the RPC servers, so the admin `status` command and the
+    // NFS path always observe the same set of exports.
     let admin_context = admin::AdminContext::shared(
         start_time,
         server_metadata,
         startup_log_level,
-        admin_filesystem,
+        filesystem.clone(),
         config.clone(),
     );
 
