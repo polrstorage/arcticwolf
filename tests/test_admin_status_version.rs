@@ -14,7 +14,7 @@ async fn status_and_version_round_trip_over_the_socket() {
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("admin.sock");
 
-    let (context, _export_dir) = AdminContext::for_test();
+    let (context, _export_dir, _log_guard) = AdminContext::for_test();
     let listener =
         admin::server::bind_admin_socket(&socket_path, 0o600).expect("bind admin socket");
     let server = tokio::spawn(admin::serve(listener, socket_path.clone(), context));

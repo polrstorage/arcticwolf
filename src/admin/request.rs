@@ -1,8 +1,8 @@
 //! Admin request schema.
 //!
-//! Phase 2 wires the two read-only commands (`Status`, `Version`); the
-//! remaining variants are added by later phases as their handlers land
-//! (Phase 3 the log-level commands, Phase 5 the exports/config commands,
+//! Phase 2 wired the two read-only commands (`Status`, `Version`); Phase 3
+//! adds the log-level commands. The remaining variants are added by later
+//! phases as their handlers land (Phase 5 the exports/config commands,
 //! Phase 7 metrics, Phase 8 shutdown). The variant set is kept in sync with
 //! the v1 surface in issue #25 so later phases can land handlers without
 //! touching the protocol again.
@@ -25,4 +25,11 @@ pub enum AdminRequest {
     /// `arcticwolfctl version` — daemon build/version metadata
     /// (`CARGO_PKG_VERSION`, git commit, rustc version, build profile).
     Version,
+    /// `arcticwolfctl log-level get` — report the tracing filter directive
+    /// currently in effect.
+    LogLevelGet,
+    /// `arcticwolfctl log-level set <level>` — swap the live tracing
+    /// filter. An unrecognized level is rejected and the previously active
+    /// filter is left intact.
+    LogLevelSet { level: String },
 }

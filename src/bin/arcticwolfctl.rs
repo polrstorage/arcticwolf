@@ -1,7 +1,8 @@
 //! `arcticwolfctl` — operator CLI for the Arctic Wolf admin socket.
 //!
 //! Speaks the length-prefixed JSON admin protocol (issue #25). Phase 2
-//! ships two read-only subcommands, `status` and `version`. A global
+//! shipped two read-only subcommands, `status` and `version`; Phase 3 adds
+//! the nested `log-level get` / `log-level set <level>` commands. A global
 //! `--socket` flag overrides the socket path and `--json` swaps the
 //! human-readable summary for the raw response payload.
 
@@ -32,14 +33,37 @@ enum Command {
     Status,
     /// Show client and daemon version information.
     Version,
+    /// Inspect or change the daemon's live log level.
+    LogLevel {
+        #[command(subcommand)]
+        action: LogLevelAction,
+    },
+}
+
+/// Sub-actions of the `log-level` command.
+#[derive(Subcommand, Debug)]
+enum LogLevelAction {
+    /// Print the tracing filter currently in effect.
+    Get,
+    /// Set the daemon's log level (error/warn/info/debug/trace/off).
+    Set {
+        /// The log level to apply.
+        level: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    // Match by reference so the nested `LogLevel { action }` bindings do not
+    // partially move `cli` out from under the `&cli` the run_* helpers take.
+    match &cli.command {
         Command::Status => run_status(&cli).await,
         Command::Version => run_version(&cli).await,
+        Command::LogLevel { action } => match action {
+            LogLevelAction::Get => run_log_level_get(&cli).await,
+            LogLevelAction::Set { level } => run_log_level_set(&cli, level).await,
+        },
     }
 }
 
@@ -125,6 +149,51 @@ async fn run_version(cli: &Cli) -> ExitCode {
         Err(err) => {
             println!("  daemon unreachable: {err}");
             ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `arcticwolfctl log-level get` — print the daemon's active log filter.
+/// Any failure (connection refused, admin error) exits non-zero.
+async fn run_log_level_get(cli: &Cli) -> ExitCode {
+    let data = match client::fetch_log_level(&cli.socket).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("arcticwolfctl: log-level get failed: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client::render_log_level_get(&data, cli.json) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("arcticwolfctl: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arcticwolfctl log-level set <level>` — change the daemon's log level.
+/// An unrecognized level is rejected by the daemon, which surfaces here as
+/// a stderr error and a non-zero exit (the issue #25 acceptance criterion).
+async fn run_log_level_set(cli: &Cli, level: &str) -> ExitCode {
+    let data = match client::set_log_level(&cli.socket, level).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("arcticwolfctl: log-level set failed: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client::render_log_level_set(&data, cli.json) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("arcticwolfctl: {err:#}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -244,6 +313,82 @@ mod tests {
 
         let code = run_version(&make_cli(socket, Command::Version)).await;
         assert_exit(code, ExitCode::SUCCESS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_log_level_get_exits_failure_when_socket_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = make_cli(
+            dir.path().join("absent.sock"),
+            Command::LogLevel {
+                action: LogLevelAction::Get,
+            },
+        );
+        assert_exit(run_log_level_get(&cli).await, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn run_log_level_get_exits_success_on_ok_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("admin.sock");
+        let response = AdminResponse::Ok {
+            data: json!({ "level": "info" }),
+        };
+        let server = spawn_fake_server(&socket, response);
+
+        let cli = make_cli(
+            socket,
+            Command::LogLevel {
+                action: LogLevelAction::Get,
+            },
+        );
+        assert_exit(run_log_level_get(&cli).await, ExitCode::SUCCESS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_log_level_set_exits_success_on_ok_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("admin.sock");
+        let response = AdminResponse::Ok {
+            data: json!({ "level": "debug" }),
+        };
+        let server = spawn_fake_server(&socket, response);
+
+        let cli = make_cli(
+            socket,
+            Command::LogLevel {
+                action: LogLevelAction::Set {
+                    level: "debug".to_string(),
+                },
+            },
+        );
+        assert_exit(run_log_level_set(&cli, "debug").await, ExitCode::SUCCESS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_log_level_set_exits_failure_when_daemon_returns_err() {
+        // Pins the issue #25 acceptance criterion: `log-level set tomato`
+        // (an unrecognized level the daemon rejects with an error) must
+        // exit non-zero so operator scripts can detect the failure.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("admin.sock");
+        let server = spawn_fake_server(
+            &socket,
+            AdminResponse::error("Invalid log level 'tomato': expected one of ..."),
+        );
+
+        let cli = make_cli(
+            socket,
+            Command::LogLevel {
+                action: LogLevelAction::Set {
+                    level: "tomato".to_string(),
+                },
+            },
+        );
+        assert_exit(run_log_level_set(&cli, "tomato").await, ExitCode::FAILURE);
         server.abort();
     }
 }

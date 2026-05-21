@@ -3,6 +3,7 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 
 use anyhow::Result;
 use std::sync::Arc;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 use arcticwolf::admin;
 use arcticwolf::config::{self, Config};
@@ -95,26 +96,33 @@ async fn main() -> Result<()> {
     // so it can be shared with the admin context without a deep copy.
     let config = Arc::new(Config::load()?);
 
-    // Initialize tracing with configured log level
-    // Priority: config file -> RUST_LOG env -> "info"
-    let log_level_str = config.logging.effective_level();
-    let log_level = match log_level_str.parse() {
-        Ok(level) => level,
-        Err(_) => {
+    // Initialize tracing with the configured log filter.
+    // Priority: config file -> RUST_LOG env -> "info".
+    //
+    // The filter is an `EnvFilter` wrapped in a `reload::Layer` so the admin
+    // `log-level` commands can swap it at runtime; `log_reload` is threaded
+    // into the `AdminContext` below. The `EnvFilter` layer filters globally
+    // for the registry, so the `fmt` layer only sees events that pass it.
+    let log_filter_str = config.logging.effective_level();
+    let env_filter = match EnvFilter::try_new(&log_filter_str) {
+        Ok(filter) => filter,
+        Err(err) => {
             eprintln!(
-                "Warning: Invalid log level '{}', falling back to 'info'",
-                log_level_str
+                "Warning: invalid log filter '{log_filter_str}': {err}; falling back to 'info'"
             );
-            tracing::Level::INFO
+            EnvFilter::new("info")
         }
     };
-    tracing_subscriber::fmt().with_max_level(log_level).init();
-
-    // The log level that actually took effect. When `log_level_str` fails
-    // to parse we fall back to INFO above, so this must report `info`
-    // rather than the rejected configuration string — the startup banner
-    // and the admin `status` command both surface it to operators.
-    let startup_log_level = log_level.to_string().to_lowercase();
+    // The directive that actually took effect — captured here because
+    // `env_filter` is moved into the reload layer on the next line. The
+    // startup banner surfaces it to operators; the admin `status` command
+    // reads the live value through the reload handle instead.
+    let effective_log_filter = env_filter.to_string();
+    let (filter_layer, log_reload) = reload::Layer::new(env_filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     println!("Arctic Wolf NFS Server");
     println!("======================");
@@ -130,7 +138,7 @@ async fn main() -> Result<()> {
         }
     );
     println!("  NFS port: {}", config.server.nfs_port);
-    println!("  Log level: {}", startup_log_level);
+    println!("  Log level: {}", effective_log_filter);
     println!();
 
     // Initialize FSAL (File System Abstraction Layer).
@@ -230,7 +238,7 @@ async fn main() -> Result<()> {
     let admin_context = admin::AdminContext::shared(
         start_time,
         server_metadata,
-        startup_log_level,
+        log_reload,
         filesystem.clone(),
         config.clone(),
     );
