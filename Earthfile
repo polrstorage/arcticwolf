@@ -48,16 +48,27 @@ lint:
     RUN cargo clippy -- -D warnings
 
 # earthly +lockfile
-# Regenerate Cargo.lock from Cargo.toml and copy it back to the host.
-# Use after editing [dependencies] in Cargo.toml.
+# Reconcile Cargo.lock with Cargo.toml — preserves existing pins when
+# constraints still permit. If a top-level requirement in Cargo.toml
+# is changed (e.g. `bytes = "1.5"` → `"1.6"`), that crate will resolve
+# to a new version.
+# Re-run after adding a dep or enabling a feature that pulls new transitives.
 lockfile:
     FROM rust:1.91
     WORKDIR /src
-    COPY Cargo.toml ./
+    # Copy the existing Cargo.lock alongside Cargo.toml so cargo treats
+    # already-pinned entries as fixed and only resolves newly-required
+    # transitives. `cargo generate-lockfile` (the previous approach)
+    # re-resolves from scratch and bumps unrelated semver-compatible
+    # dependencies. The `Cargo.lock*` wildcard mirrors `+common` and
+    # handles a fresh checkout where no lockfile exists yet — `cargo
+    # fetch` then resolves from scratch (similar to `generate-lockfile`
+    # but via the fetch interface).
+    COPY Cargo.toml Cargo.lock* ./
     COPY build.rs ./
     COPY xdr ./xdr
     COPY src ./src
-    RUN cargo generate-lockfile
+    RUN cargo fetch
     SAVE ARTIFACT Cargo.lock AS LOCAL Cargo.lock
 
 # earthly +image

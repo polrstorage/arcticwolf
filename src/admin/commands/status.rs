@@ -8,8 +8,14 @@ use crate::admin::{AdminContext, AdminResponse};
 ///
 /// The reported ports come from [`AdminContext::server_metadata`], which is
 /// resolved after `bind(2)` — so a configured port of `0` (dynamic
-/// allocation) is reported as the concrete port in use.
+/// allocation) is reported as the concrete port in use. `log_level` is read
+/// live from the tracing reload handle, so it reflects any `log-level set`
+/// applied since startup rather than the configured value.
 pub fn handle(context: &AdminContext) -> AdminResponse {
+    let log_level = context
+        .log_reload
+        .with_current(|filter| filter.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let data = json!({
         "daemon_version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": context.start_time.elapsed().as_secs(),
@@ -17,7 +23,7 @@ pub fn handle(context: &AdminContext) -> AdminResponse {
         "nfs_port": context.server_metadata.nfs_port,
         "mount_port": context.server_metadata.mount_port,
         "portmap_port": context.server_metadata.portmap_port,
-        "log_level": context.startup_log_level,
+        "log_level": log_level,
         "export_count": context.filesystem.list_exports().len(),
     });
     AdminResponse::Ok { data }
@@ -29,7 +35,7 @@ mod tests {
 
     #[test]
     fn status_returns_ok_with_all_documented_fields() {
-        let (context, _tmp) = AdminContext::for_test();
+        let (context, _tmp, _log_guard) = AdminContext::for_test();
         let data = match handle(&context) {
             AdminResponse::Ok { data } => data,
             AdminResponse::Err { error } => panic!("status must return Ok; got err: {error}"),

@@ -62,6 +62,25 @@ pub async fn fetch_version(socket_path: &Path) -> Result<Value> {
     fetch(socket_path, &AdminRequest::Version).await
 }
 
+/// Fetch the tracing filter directive currently in effect (`log-level get`).
+pub async fn fetch_log_level(socket_path: &Path) -> Result<Value> {
+    fetch(socket_path, &AdminRequest::LogLevelGet).await
+}
+
+/// Swap the daemon's live tracing filter (`log-level set <level>`).
+///
+/// The daemon rejects an unrecognized level with an `AdminResponse::Err`,
+/// which surfaces here as an `anyhow` error.
+pub async fn set_log_level(socket_path: &Path, level: &str) -> Result<Value> {
+    fetch(
+        socket_path,
+        &AdminRequest::LogLevelSet {
+            level: level.to_string(),
+        },
+    )
+    .await
+}
+
 /// Render a `status` payload either as pretty JSON or a human summary.
 pub fn render_status(data: &Value, json: bool) -> Result<String> {
     if json {
@@ -91,6 +110,24 @@ pub fn render_version(data: &Value, json: bool) -> Result<String> {
     writeln!(out, "Rustc version:  {}", field(data, "rustc_version"))?;
     write!(out, "Build profile:  {}", field(data, "build_profile"))?;
     Ok(out)
+}
+
+/// Render a `log-level get` payload either as pretty JSON or a human
+/// summary.
+pub fn render_log_level_get(data: &Value, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(data)?);
+    }
+    Ok(format!("Current log level: {}", field(data, "level")))
+}
+
+/// Render a `log-level set` payload either as pretty JSON or a human
+/// summary.
+pub fn render_log_level_set(data: &Value, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(data)?);
+    }
+    Ok(format!("Log level set to {}", field(data, "level")))
 }
 
 /// Render one JSON field for human output. A JSON string is unwrapped so it
@@ -155,5 +192,27 @@ mod tests {
     #[test]
     fn field_falls_back_to_unknown_for_missing_key() {
         assert_eq!(field(&json!({}), "nope"), "unknown");
+    }
+
+    #[test]
+    fn render_log_level_get_human_is_labelled_and_unquoted() {
+        let data = json!({ "level": "debug" });
+        let rendered = render_log_level_get(&data, false).expect("render human");
+        assert_eq!(rendered, "Current log level: debug");
+    }
+
+    #[test]
+    fn render_log_level_set_human_is_labelled() {
+        let data = json!({ "level": "trace" });
+        let rendered = render_log_level_set(&data, false).expect("render human");
+        assert_eq!(rendered, "Log level set to trace");
+    }
+
+    #[test]
+    fn render_log_level_json_round_trips() {
+        let data = json!({ "level": "info" });
+        let rendered = render_log_level_get(&data, true).expect("render json");
+        let parsed: Value = serde_json::from_str(&rendered).expect("json round trip");
+        assert_eq!(parsed, data);
     }
 }

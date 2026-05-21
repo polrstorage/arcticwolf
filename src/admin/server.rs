@@ -232,6 +232,8 @@ fn dispatch(context: &AdminContext, frame: &[u8]) -> AdminResponse {
     match request {
         AdminRequest::Status => commands::status::handle(context),
         AdminRequest::Version => commands::version::handle(),
+        AdminRequest::LogLevelGet => commands::log_level::handle_get(context),
+        AdminRequest::LogLevelSet { level } => commands::log_level::handle_set(context, &level),
     }
 }
 
@@ -241,7 +243,7 @@ mod tests {
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     fn check_dispatch(frame: &[u8]) -> AdminResponse {
-        let (context, _tmp) = AdminContext::for_test();
+        let (context, _tmp, _log_guard) = AdminContext::for_test();
         dispatch(&context, frame)
     }
 
@@ -438,7 +440,7 @@ mod tests {
         let socket_path = dir.path().join("admin.sock");
 
         let listener = bind_admin_socket(&socket_path, 0o600).expect("bind admin sock");
-        let (context, _export_tmp) = AdminContext::for_test();
+        let (context, _export_tmp, _log_guard) = AdminContext::for_test();
         let socket_path_for_serve = socket_path.clone();
         let server =
             tokio::spawn(async move { serve(listener, socket_path_for_serve, context).await });
