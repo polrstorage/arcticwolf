@@ -48,6 +48,15 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # and `user` features cover both the peer credential lookup and the
 # subsequent uid/username resolution.
 nix = { version = "0.29", features = ["socket", "user"] }
+# `arc-swap` backs the live export snapshot in
+# `fsal::multi_export::MultiExportFilesystem`. The NFS read path needs to
+# pick a backend for every request without ever blocking the (single) admin
+# writer, and the admin mutation path needs to replace the map atomically
+# without taking a global lock that would stall in-flight RPCs. `ArcSwap`
+# gives both: readers get a lock-free `load()` returning an `Arc` snapshot
+# they can clone out and drop before any `.await`, writers do a single
+# `store(Arc::new(new_snapshot))`.
+arc-swap = "1"
 
 # XDR serialization (runtime)
 xdr-codec = "0.4"

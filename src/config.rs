@@ -247,12 +247,7 @@ impl Config {
                 );
             }
             seen_uids.insert(export.uid, export.name.as_str());
-            if !export.name.starts_with('/') {
-                bail!(
-                    "Export name '{}' must start with '/' (e.g. '/data')",
-                    export.name
-                );
-            }
+            crate::fsal::multi_export::validate_export_name(&export.name)?;
             if !seen_names.insert(export.name.as_str()) {
                 bail!("Duplicate export name '{}'", export.name);
             }
