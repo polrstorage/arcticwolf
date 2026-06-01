@@ -85,11 +85,13 @@ mod tests {
                 name: "/data".to_string(),
                 uid: 1,
                 read_only: false,
+                fsal: "local".to_string(),
             },
             ExportInfo {
                 name: "/backup".to_string(),
                 uid: 2,
                 read_only: true,
+                fsal: "local".to_string(),
             },
         ]);
         let call = make_export_call(0xdeadbeef);

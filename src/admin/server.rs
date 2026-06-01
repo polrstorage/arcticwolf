@@ -234,6 +234,19 @@ fn dispatch(context: &AdminContext, frame: &[u8]) -> AdminResponse {
         AdminRequest::Version => commands::version::handle(),
         AdminRequest::LogLevelGet => commands::log_level::handle_get(context),
         AdminRequest::LogLevelSet { level } => commands::log_level::handle_set(context, &level),
+        AdminRequest::ExportsList => commands::exports_list::handle(context),
+        AdminRequest::ExportsAdd { config, dry_run } => {
+            commands::exports_add::handle(context, &config, dry_run)
+        }
+        AdminRequest::ExportsRemove { selector, dry_run } => {
+            commands::exports_remove::handle(context, &selector, dry_run)
+        }
+        AdminRequest::ExportsUpdate {
+            selector,
+            read_only,
+            dry_run,
+        } => commands::exports_update::handle(context, &selector, read_only, dry_run),
+        AdminRequest::ConfigShow => commands::config_show::handle(context),
     }
 }
 

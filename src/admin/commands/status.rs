@@ -3,6 +3,7 @@
 use serde_json::json;
 
 use crate::admin::{AdminContext, AdminResponse};
+use crate::fsal::ExportRegistry;
 
 /// Build the `status` response from the live daemon context.
 ///

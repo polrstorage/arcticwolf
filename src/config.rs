@@ -6,7 +6,7 @@
 
 use anyhow::bail;
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
@@ -30,7 +30,7 @@ pub struct Config {
     pub admin: AdminConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
     pub bind_address: String,
@@ -51,7 +51,7 @@ pub struct ServerConfig {
 /// "unknown field `readOnly`, expected `path`". For non-flattened sections
 /// like `[server]` and `[logging]`, `Config::load` additionally wraps
 /// deserialization with `serde_ignored` to catch typos there as well.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ExportConfig {
     /// Export path as advertised to NFS clients (e.g. "/data"). Must start with `/`.
     pub name: String,
@@ -69,7 +69,7 @@ pub struct ExportConfig {
 ///
 /// Tagged union — the `backend` key in TOML selects the variant and the remaining
 /// keys deserialize into that variant's fields.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
 pub enum BackendConfig {
     Local { path: PathBuf },
@@ -84,7 +84,7 @@ impl BackendConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct LoggingConfig {
     /// Log level. If not set, falls back to RUST_LOG env var, then "info"
     pub level: Option<String>,
@@ -96,7 +96,7 @@ pub struct LoggingConfig {
 /// so the scaffolding is inert and existing deployments are unaffected.
 /// When enabled, the daemon binds a length-prefixed JSON server at
 /// `socket_path` and applies `socket_mode` (default `0o600`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Whether the admin server is started at all. Defaults to `false`.
