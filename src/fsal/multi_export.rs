@@ -18,6 +18,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +64,54 @@ pub(crate) fn validate_export_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate the input-only invariants both `add_export` and `dry_run_add`
+/// enforce *before* consulting the live snapshot: name shape, non-zero
+/// uid, backend-specific path rules. Snapshot-relative checks (duplicate
+/// name/uid, retired uid) live in the callers because they need the
+/// already-loaded snapshot.
+fn validate_input_invariants(config: &ExportConfig) -> Result<()> {
+    validate_export_name(&config.name)?;
+    if config.uid == 0 {
+        bail!(
+            "Export '{}' has uid 0; uid must be a non-zero u32",
+            config.name
+        );
+    }
+    match &config.backend {
+        ConfigBackend::Local { path } => {
+            if !path.is_absolute() {
+                bail!(
+                    "Export '{}' local backend path '{}' must be absolute",
+                    config.name,
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Construct the backend `LocalFilesystem` for `config`. Used by both
+/// `add_export` (which stores the result in the new snapshot) and
+/// `dry_run_add` (which drops it immediately) so both paths agree on
+/// whether a given input *can* initialize a backend.
+///
+/// The HandleManager allocation inside `LocalFilesystem::new` is cheap and
+/// invisible — the value lies in catching path-doesn't-exist and
+/// path-not-a-directory in the dry-run before a real `add` is attempted.
+fn build_backend(config: &ExportConfig) -> Result<LocalFilesystem> {
+    match &config.backend {
+        ConfigBackend::Local { path } => {
+            LocalFilesystem::new(path, config.uid).with_context(|| {
+                format!(
+                    "Failed to initialize local backend for export '{}' at {:?}",
+                    config.name, path
+                )
+            })
+        }
+    }
+}
+
 /// Internal record for one configured export.
 ///
 /// `Clone` so `add_export`/`remove_export`/`update_export` can build a fresh
@@ -74,6 +123,10 @@ pub(crate) fn validate_export_name(name: &str) -> Result<()> {
 struct ExportEntry {
     name: String,
     read_only: bool,
+    /// Short discriminator for the active backend variant (`"local"`).
+    /// Reported in the `exports list` admin response so operators can see
+    /// which FSAL each export is using without consulting the config.
+    fsal: &'static str,
     /// Concrete backend so the wrapper can call the inherent
     /// `LocalFilesystem::root_file_handle()` without going through an
     /// `async fn` trait dispatch.
@@ -122,13 +175,49 @@ impl ExportsSnapshot {
     }
 }
 
+/// Result of a successful [`MultiExportFilesystem::remove_export`].
+///
+/// Both fields are read off the same locked snapshot that performs the
+/// swap, so the (uid, name) pair always reflects the exact entry that was
+/// retired — there is no second `load()` that another mutation could
+/// invalidate between the lookup and the swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedExport {
+    pub uid: u32,
+    pub name: String,
+}
+
+/// Result of a successful [`MultiExportFilesystem::update_export`].
+///
+/// Carries the before/after `read_only` pair so callers can render a
+/// `from → to` diff without re-loading the snapshot (where another
+/// mutation could have flipped the bit again). v1 only mutates
+/// `read_only`; when more fields land, mirror them here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedExport {
+    pub uid: u32,
+    pub name: String,
+    pub prev_read_only: bool,
+    pub new_read_only: bool,
+}
+
 /// Selector used by admin mutations to identify an existing export.
 ///
 /// V1 ships only by-name and by-uid; the public admin CLI surfaces the
 /// by-name form (`arcticwolfctl export remove /data`), while the by-uid
 /// form is used by tests and by future audit-log replay flows that have
 /// the uid but not necessarily the name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized externally-tagged so the admin wire form is `{"name": "/data"}`
+/// or `{"uid": 5}`, matching the CLI's `--name`/`--uid` flag pair.
+///
+/// `#[non_exhaustive]` marks this as a forward-compatibility lever: a
+/// future selector variant (e.g. by-path or by-handle-prefix) can land
+/// without breaking out-of-crate consumers that match on it. Same-crate
+/// code (this file's tests, the admin handlers) is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ExportSelector {
     Name(String),
     Uid(u32),
@@ -203,6 +292,7 @@ impl MultiExportFilesystem {
             let entry = ExportEntry {
                 name: export.name.clone(),
                 read_only: export.read_only,
+                fsal: export.backend.name(),
                 fs: Arc::new(fs),
             };
 
@@ -330,25 +420,7 @@ impl MultiExportFilesystem {
     pub fn add_export(&self, config: &ExportConfig) -> Result<()> {
         // Name normalization runs before the write lock so cheap input
         // rejections don't serialize behind a slower mutation.
-        validate_export_name(&config.name)?;
-
-        if config.uid == 0 {
-            bail!(
-                "Export '{}' has uid 0; uid must be a non-zero u32",
-                config.name
-            );
-        }
-        match &config.backend {
-            ConfigBackend::Local { path } => {
-                if !path.is_absolute() {
-                    bail!(
-                        "Export '{}' local backend path '{}' must be absolute",
-                        config.name,
-                        path.display()
-                    );
-                }
-            }
-        }
+        validate_input_invariants(config)?;
 
         let _guard = self.write_lock.lock().expect("write_lock poisoned");
         let current = self.state.load();
@@ -369,20 +441,12 @@ impl MultiExportFilesystem {
         // initialization failure (path doesn't exist, not a directory, etc.)
         // surfaces with the operator's input still rejected and the live
         // snapshot unchanged.
-        let fs = match &config.backend {
-            ConfigBackend::Local { path } => {
-                LocalFilesystem::new(path, config.uid).with_context(|| {
-                    format!(
-                        "Failed to initialize local backend for export '{}' at {:?}",
-                        config.name, path
-                    )
-                })?
-            }
-        };
+        let fs = build_backend(config)?;
 
         let entry = ExportEntry {
             name: config.name.clone(),
             read_only: config.read_only,
+            fsal: config.backend.name(),
             fs: Arc::new(fs),
         };
 
@@ -403,12 +467,17 @@ impl MultiExportFilesystem {
         Ok(())
     }
 
-    /// Remove an export by name or uid. Returns the uid that was removed
-    /// (now in `retired_uids`). Errors if no live export matches.
+    /// Remove an export by name or uid. Returns the (uid, name) that were
+    /// retired; errors if no live export matches.
+    ///
+    /// Both fields are sourced from the snapshot loaded *under the write
+    /// lock*, so the response is guaranteed to describe the exact entry
+    /// that was swapped out — no second `load()` that another concurrent
+    /// mutation could race against.
     ///
     /// Serialized against other admin mutations via `write_lock`; readers
     /// (NFS RPC handlers) are unaffected.
-    pub fn remove_export(&self, selector: &ExportSelector) -> Result<u32> {
+    pub fn remove_export(&self, selector: &ExportSelector) -> Result<RemovedExport> {
         let _guard = self.write_lock.lock().expect("write_lock poisoned");
         let current = self.state.load();
         let uid = Self::resolve_selector(&current, selector)?;
@@ -431,7 +500,64 @@ impl MultiExportFilesystem {
         };
         drop(current);
         self.state.store(Arc::new(new_snapshot));
-        Ok(uid)
+        Ok(RemovedExport { uid, name })
+    }
+
+    /// Dry-run counterpart to [`add_export`]: applies the same input and
+    /// snapshot-consistency checks but neither acquires the write lock nor
+    /// mutates state. Returns `Ok(())` if a real `add_export` with this
+    /// config *would likely succeed* against the snapshot loaded right now.
+    ///
+    /// "Likely" because there is an intentional TOCTOU window: another
+    /// admin mutation could land between this check and a subsequent
+    /// `add_export` call. Phase 5 accepts this — dry-run is a pre-flight
+    /// "does this look sane" check, not a transactional reservation.
+    ///
+    /// Backend initialization (path exists, is a directory) is exercised
+    /// the same way `add_export` does it: by constructing the backend and
+    /// discarding it. The HandleManager allocation is cheap; the goal is
+    /// that `dry_run_add` cannot return `Ok` for an input that would fail
+    /// `add_export`.
+    pub fn dry_run_add(&self, config: &ExportConfig) -> Result<()> {
+        validate_input_invariants(config)?;
+        let current = self.state.load();
+        if current.by_uid.contains_key(&config.uid) {
+            bail!("Export uid {} is already in use", config.uid);
+        }
+        if current.retired_uids.contains(&config.uid) {
+            bail!(
+                "Export uid {} was retired this run and cannot be reused until daemon restart",
+                config.uid
+            );
+        }
+        if current.by_name.contains_key(&config.name) {
+            bail!("Export name {:?} is already in use", config.name);
+        }
+        // Exercise the same backend-init path `add_export` will take. The
+        // returned `LocalFilesystem` is dropped immediately; only the
+        // existence/dir checks inside `LocalFilesystem::new` matter here.
+        let _ = build_backend(config)?;
+        Ok(())
+    }
+
+    /// Dry-run counterpart to [`remove_export`]. Same TOCTOU caveat as
+    /// [`dry_run_add`]. Returns `(uid, name)` of the export that would be
+    /// removed if the selector resolves; errors otherwise.
+    pub fn dry_run_remove(&self, selector: &ExportSelector) -> Result<(u32, String)> {
+        let current = self.state.load();
+        let uid = Self::resolve_selector(&current, selector)?;
+        let name = current.by_uid[&uid].name.clone();
+        Ok((uid, name))
+    }
+
+    /// Dry-run counterpart to [`update_export`]. Returns
+    /// `(uid, name, current_read_only)` for the matched export, so the
+    /// caller can render a `from → to` diff in the response.
+    pub fn dry_run_update(&self, selector: &ExportSelector) -> Result<(u32, String, bool)> {
+        let current = self.state.load();
+        let uid = Self::resolve_selector(&current, selector)?;
+        let entry = &current.by_uid[&uid];
+        Ok((uid, entry.name.clone(), entry.read_only))
     }
 
     /// Update mutable fields on an existing export.
@@ -442,27 +568,33 @@ impl MultiExportFilesystem {
     /// without invalidating handles, but a path change would silently
     /// re-route them) and is deferred to a future phase per the issue plan.
     ///
+    /// Returns the (uid, name, prev_read_only, new_read_only) describing the
+    /// swap, all sourced from the snapshot loaded *under the write lock* so
+    /// the response cannot disagree with the snapshot that was just stored.
+    ///
     /// Serialized against other admin mutations via `write_lock`; readers
     /// (NFS RPC handlers) are unaffected.
     pub fn update_export(
         &self,
         selector: &ExportSelector,
         new_read_only: Option<bool>,
-    ) -> Result<()> {
-        if new_read_only.is_none() {
-            bail!("update_export called with no fields to mutate");
-        }
+    ) -> Result<UpdatedExport> {
+        let new_ro = match new_read_only {
+            Some(ro) => ro,
+            None => bail!("update_export called with no fields to mutate"),
+        };
 
         let _guard = self.write_lock.lock().expect("write_lock poisoned");
         let current = self.state.load();
         let uid = Self::resolve_selector(&current, selector)?;
+        // `unwrap` safe: `resolve_selector` proved the key exists.
+        let entry = &current.by_uid[&uid];
+        let name = entry.name.clone();
+        let prev_ro = entry.read_only;
 
         let mut by_uid = current.by_uid.clone();
-        if let Some(ro) = new_read_only {
-            // `unwrap` safe: `resolve_selector` proved the key exists, and
-            // we just cloned the map so it still does.
-            by_uid.get_mut(&uid).unwrap().read_only = ro;
-        }
+        // `unwrap` safe: just cloned the map, key still present.
+        by_uid.get_mut(&uid).unwrap().read_only = new_ro;
 
         let new_snapshot = ExportsSnapshot {
             by_uid,
@@ -471,7 +603,12 @@ impl MultiExportFilesystem {
         };
         drop(current);
         self.state.store(Arc::new(new_snapshot));
-        Ok(())
+        Ok(UpdatedExport {
+            uid,
+            name,
+            prev_read_only: prev_ro,
+            new_read_only: new_ro,
+        })
     }
 }
 
@@ -498,9 +635,17 @@ impl ExportRegistry for MultiExportFilesystem {
                     name: entry.name.clone(),
                     uid,
                     read_only: entry.read_only,
+                    fsal: entry.fsal.to_string(),
                 }
             })
             .collect()
+    }
+
+    fn retired_uids(&self) -> Vec<u32> {
+        let snapshot = self.state.load();
+        let mut uids: Vec<u32> = snapshot.retired_uids.iter().copied().collect();
+        uids.sort_unstable();
+        uids
     }
 
     fn is_read_only(&self, handle: &FileHandle) -> bool {
@@ -736,11 +881,13 @@ mod tests {
                     name: "/data".to_string(),
                     uid: 1,
                     read_only: false,
+                    fsal: "local".to_string(),
                 },
                 ExportInfo {
                     name: "/backup".to_string(),
                     uid: 2,
                     read_only: true,
+                    fsal: "local".to_string(),
                 },
             ]
         );
@@ -1009,7 +1156,8 @@ mod tests {
         let removed = router
             .remove_export(&ExportSelector::Name("/data".to_string()))
             .expect("remove must succeed");
-        assert_eq!(removed, 1);
+        assert_eq!(removed.uid, 1);
+        assert_eq!(removed.name, "/data");
 
         let infos = router.list_exports();
         assert!(!infos.iter().any(|i| i.name == "/data"), "got: {infos:?}");
@@ -1023,7 +1171,8 @@ mod tests {
         let removed = router
             .remove_export(&ExportSelector::Uid(2))
             .expect("remove must succeed");
-        assert_eq!(removed, 2);
+        assert_eq!(removed.uid, 2);
+        assert_eq!(removed.name, "/backup");
         assert!(router.root_handle_for("/backup").is_none());
     }
 
@@ -1077,17 +1226,25 @@ mod tests {
         assert!(router.is_read_only(&backup_root));
 
         // Flip /data to ro.
-        router
+        let updated = router
             .update_export(&ExportSelector::Name("/data".to_string()), Some(true))
             .expect("update must succeed");
+        assert_eq!(updated.uid, 1);
+        assert_eq!(updated.name, "/data");
+        assert!(!updated.prev_read_only);
+        assert!(updated.new_read_only);
         assert!(router.is_read_only(&data_root));
         // The other export is untouched.
         assert!(router.is_read_only(&backup_root));
 
         // Flip /backup to rw via uid selector.
-        router
+        let updated = router
             .update_export(&ExportSelector::Uid(2), Some(false))
             .expect("update must succeed");
+        assert_eq!(updated.uid, 2);
+        assert_eq!(updated.name, "/backup");
+        assert!(updated.prev_read_only);
+        assert!(!updated.new_read_only);
         assert!(!router.is_read_only(&backup_root));
 
         // And list_exports reflects both mutations.
@@ -1219,5 +1376,55 @@ mod tests {
         validate_export_name("/").expect("'/' must be accepted");
         validate_export_name("/data").expect("'/data' must be accepted");
         validate_export_name("/srv/nfs/data").expect("nested path must be accepted");
+    }
+
+    /// `dry_run_add` must reject inputs that `add_export` would reject for
+    /// the same reason. Before this test, the dry-run only checked
+    /// `path.is_absolute()`, so `--dry-run --path /does/not/exist`
+    /// returned "would succeed" while the real add would then fail with
+    /// "Failed to canonicalize root path". Now both paths go through
+    /// `build_backend`, which canonicalizes the root and verifies it's a
+    /// directory.
+    #[test]
+    fn dry_run_add_rejects_path_that_does_not_exist() {
+        let (router, _data, _backup) = build_two_export_router();
+        let cfg = export(
+            "/missing",
+            42,
+            PathBuf::from("/this/path/does/not/exist/arcticwolf"),
+            false,
+        );
+        let err = router
+            .dry_run_add(&cfg)
+            .expect_err("nonexistent path must fail dry-run")
+            .to_string();
+        assert!(
+            err.contains("Failed to initialize local backend"),
+            "got: {err}"
+        );
+        // Live snapshot unchanged.
+        assert_eq!(router.list_exports().len(), 2);
+    }
+
+    /// Pin the externally-tagged wire shape of `ExportSelector` —
+    /// `{"name": "/data"}` / `{"uid": 5}`. The CLI relies on it on the
+    /// way out and tests + future audit-log replay rely on it on the way in.
+    #[test]
+    fn export_selector_wire_format() {
+        use serde_json::json;
+
+        assert_eq!(
+            serde_json::to_value(ExportSelector::Name("/data".to_string())).unwrap(),
+            json!({ "name": "/data" })
+        );
+        assert_eq!(
+            serde_json::to_value(ExportSelector::Uid(5)).unwrap(),
+            json!({ "uid": 5 })
+        );
+
+        let v: ExportSelector = serde_json::from_value(json!({ "name": "/data" })).unwrap();
+        assert!(matches!(v, ExportSelector::Name(ref s) if s == "/data"));
+        let v: ExportSelector = serde_json::from_value(json!({ "uid": 5 })).unwrap();
+        assert!(matches!(v, ExportSelector::Uid(5)));
     }
 }

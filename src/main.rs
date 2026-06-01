@@ -149,9 +149,13 @@ async fn main() -> Result<()> {
     // still consumes the wrapper as `&dyn Filesystem`.
     println!("Initializing FSAL:");
 
-    let filesystem: Arc<dyn fsal::NfsBackend> = Arc::new(
-        fsal::MultiExportFilesystem::build_from_config(&config.exports)?,
-    );
+    // The concrete `MultiExportFilesystem` is shared with both the RPC
+    // servers (as `Arc<dyn NfsBackend>`) and the admin context (as the
+    // concrete type, so admin handlers can call the inherent mutators).
+    let multi_export = Arc::new(fsal::MultiExportFilesystem::build_from_config(
+        &config.exports,
+    )?);
+    let filesystem: Arc<dyn fsal::NfsBackend> = multi_export.clone();
 
     let exports = filesystem.list_exports();
     for export in &exports {
@@ -239,7 +243,7 @@ async fn main() -> Result<()> {
         start_time,
         server_metadata,
         log_reload,
-        filesystem.clone(),
+        multi_export.clone(),
         config.clone(),
     );
 

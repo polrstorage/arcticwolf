@@ -301,7 +301,7 @@ mod tests {
 
         use crate::admin::context::{LogReloadHandle, ServerMetadata};
         use crate::config::{BackendConfig, Config, ExportConfig};
-        use crate::fsal::{MultiExportFilesystem, NfsBackend};
+        use crate::fsal::MultiExportFilesystem;
 
         #[derive(Clone, Default)]
         struct CaptureLayer(Arc<Mutex<Vec<String>>>);
@@ -361,7 +361,7 @@ mod tests {
             }],
             ..Config::default()
         };
-        let filesystem: Arc<dyn NfsBackend> = Arc::new(
+        let filesystem: Arc<MultiExportFilesystem> = Arc::new(
             MultiExportFilesystem::build_from_config(&config.exports)
                 .expect("build test filesystem"),
         );

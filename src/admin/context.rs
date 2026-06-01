@@ -17,7 +17,7 @@ use std::time::Instant;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
 use crate::config::Config;
-use crate::fsal::NfsBackend;
+use crate::fsal::MultiExportFilesystem;
 
 /// Live reload handle for the daemon's tracing `EnvFilter`.
 ///
@@ -55,8 +55,12 @@ pub struct AdminContext {
     /// retuning daemon verbosity without a restart. `status` also reads it
     /// so the reported `log_level` always reflects the live filter.
     pub log_reload: LogReloadHandle,
-    /// Filesystem backend. Phase 2 uses it for `export_count`.
-    pub filesystem: Arc<dyn NfsBackend>,
+    /// Filesystem backend. Phase 2 uses it for `export_count`; Phase 5
+    /// also calls the inherent admin mutation methods
+    /// (`add_export`/`remove_export`/`update_export`) on it, so the
+    /// context stores the concrete `MultiExportFilesystem` rather than
+    /// `Arc<dyn NfsBackend>`.
+    pub filesystem: Arc<MultiExportFilesystem>,
     /// Original daemon configuration (e.g. for `bind_address`).
     pub config: Arc<Config>,
 }
@@ -70,7 +74,7 @@ impl AdminContext {
         start_time: Instant,
         server_metadata: Arc<ServerMetadata>,
         log_reload: LogReloadHandle,
-        filesystem: Arc<dyn NfsBackend>,
+        filesystem: Arc<MultiExportFilesystem>,
         config: Arc<Config>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -129,7 +133,6 @@ impl AdminContext {
     /// shipped in release builds.
     pub fn for_test() -> (Arc<Self>, tempfile::TempDir, TestLogReloadGuard) {
         use crate::config::{BackendConfig, Config, ExportConfig};
-        use crate::fsal::MultiExportFilesystem;
 
         let tmp = tempfile::tempdir().expect("create tempdir for admin test context");
         let config = Config {
@@ -143,7 +146,7 @@ impl AdminContext {
             }],
             ..Config::default()
         };
-        let filesystem: Arc<dyn NfsBackend> = Arc::new(
+        let filesystem: Arc<MultiExportFilesystem> = Arc::new(
             MultiExportFilesystem::build_from_config(&config.exports)
                 .expect("build test filesystem"),
         );

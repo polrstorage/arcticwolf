@@ -17,6 +17,7 @@ pub mod multi_export;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -361,7 +362,12 @@ pub trait Filesystem: Send + Sync {
 ///
 /// Returned by [`ExportRegistry::list_exports`] so MOUNT EXPORT (and startup
 /// banners) can enumerate exports without touching backend internals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `#[non_exhaustive]` so future per-export metadata (e.g. squash policy,
+/// auth flavor) can land without breaking out-of-crate consumers. Same-crate
+/// destructuring is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ExportInfo {
     /// Export path as advertised to NFS clients (e.g. `/data`).
     pub name: String,
@@ -369,6 +375,9 @@ pub struct ExportInfo {
     pub uid: u32,
     /// True if writes are denied against this export.
     pub read_only: bool,
+    /// Short FSAL discriminator (`"local"` today). Forward-compatible: when
+    /// other backends land, this becomes their variant name.
+    pub fsal: String,
 }
 
 /// Registry of NFS exports, decoupled from per-handle filesystem operations.
@@ -397,6 +406,13 @@ pub trait ExportRegistry: Send + Sync {
     /// Decode the export uid embedded in `handle`'s prefix, if present.
     #[allow(dead_code)]
     fn export_for_handle(&self, handle: &FileHandle) -> Option<u32>;
+
+    /// List uids that were live during this daemon's run and have since
+    /// been removed. Sorted ascending. Defaults to empty so backends that
+    /// don't track retirement (e.g. test doubles) don't have to implement it.
+    fn retired_uids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// Combined trait used by [`crate::rpc::server::RpcServer`].
