@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
+use super::audit::{AuditEvent, PeerCreds, peer_creds, rfc3339_micros_now};
 use super::commands;
 use super::context::AdminContext;
 use super::protocol::{decode_request, encode_response, framed};
@@ -156,24 +157,48 @@ pub async fn serve(
             .with_context(|| format!("admin accept failed on {}", socket_path.display()))?;
         debug!("admin connection accepted");
 
+        // Extract `SO_PEERCRED` once per connection. The triple is fixed
+        // for the lifetime of the socket (the kernel snapshots it at
+        // connect time), so we don't re-query on every request.
+        let peer = peer_creds(&socket);
+
         let context = context.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, context).await {
+            if let Err(err) = handle_connection(socket, context, peer).await {
                 warn!("admin connection error: {err:#}");
             }
         });
     }
 }
 
-async fn handle_connection(socket: UnixStream, context: Arc<AdminContext>) -> Result<()> {
+async fn handle_connection(
+    socket: UnixStream,
+    context: Arc<AdminContext>,
+    peer: Option<PeerCreds>,
+) -> Result<()> {
     let mut framed = framed(socket);
 
     while let Some(frame) = framed.next().await {
         let bytes = match frame {
             Ok(bytes) => bytes,
             Err(err) => {
-                // Codec-level errors (oversize frame, eof mid-frame). Try
-                // to send a structured error back, then close. The write
+                // Codec-level errors (oversize frame, eof mid-frame). Record
+                // a synthetic audit event *before* anything else, so an
+                // operator who triggers a frame error (e.g. an oversize
+                // payload) still leaves an audit trail even though the
+                // request never decoded. `duration_ms` is 0: there is no
+                // per-request decode→dispatch span to measure here.
+                context.audit.record(AuditEvent {
+                    ts: rfc3339_micros_now(),
+                    peer,
+                    command: "<frame-error>".to_string(),
+                    request: serde_json::Value::Null,
+                    result: "err",
+                    error: Some(format!("{err:#}")),
+                    duration_ms: 0,
+                });
+
+                // Try to send a structured error back, then close. The write
                 // half may be wedged if the client isn't reading (e.g. it
                 // sent an oversize frame and then walked away), so bound
                 // the courtesy send by `ERROR_RESPONSE_TIMEOUT` rather
@@ -200,10 +225,72 @@ async fn handle_connection(socket: UnixStream, context: Arc<AdminContext>) -> Re
             }
         };
 
+        // Phase 6: build the audit event around dispatch and hand it to
+        // the writer *before* the response is encoded. `record` is
+        // fire-and-forget — the call returns immediately.
+        let start = Instant::now();
+        let (command_tag, request_payload) = extract_command_and_request(&bytes);
         let response = dispatch(&context, &bytes);
+        let duration = start.elapsed();
+        let event = build_audit_event(
+            command_tag,
+            request_payload,
+            &response,
+            peer,
+            duration.as_millis(),
+        );
+        context.audit.record(event);
+
         send_response(&mut framed, &response).await?;
     }
     Ok(())
+}
+
+/// Peel the `command` discriminator out of the wire frame and return both
+/// the tag (`"exports-add"`, `"<undecodable>"`, …) and the request body
+/// minus the tag — that's what the audit `request` field carries.
+///
+/// We don't reuse [`crate::admin::protocol::decode_request`] for this: the
+/// audit schema wants the payload "verbatim", and parsing into the typed
+/// `AdminRequest` enum would drop omitted-default fields and renormalize
+/// member order. Parsing as a free-form `Value` keeps the wire shape.
+fn extract_command_and_request(bytes: &[u8]) -> (String, serde_json::Value) {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            let tag = map
+                .remove("command")
+                .and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
+            (tag, serde_json::Value::Object(map))
+        }
+        Ok(other) => ("<unknown>".to_string(), other),
+        Err(_) => ("<undecodable>".to_string(), serde_json::Value::Null),
+    }
+}
+
+fn build_audit_event(
+    command: String,
+    request: serde_json::Value,
+    response: &AdminResponse,
+    peer: Option<PeerCreds>,
+    duration_ms: u128,
+) -> AuditEvent {
+    let (result, error) = match response {
+        AdminResponse::Ok { .. } => ("ok", None),
+        AdminResponse::Err { error } => ("err", Some(error.clone())),
+    };
+    AuditEvent {
+        ts: rfc3339_micros_now(),
+        peer,
+        command,
+        request,
+        result,
+        error,
+        duration_ms,
+    }
 }
 
 async fn send_response<S>(
@@ -486,5 +573,81 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    /// A codec-level frame error must still leave an audit trail. We point
+    /// the context at a `FileAuditWriter` over a tempfile, connect a raw
+    /// client, and write a 4-byte length prefix declaring a ~4 GiB frame —
+    /// far past the server codec's 1 MiB cap, so the decoder errors on the
+    /// length field alone (without waiting for the body). The connection
+    /// then dies, but the synthetic `<frame-error>` event must have been
+    /// recorded first.
+    #[tokio::test]
+    async fn frame_error_records_synthetic_audit_event() {
+        use crate::admin::audit::FileAuditWriter;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("admin.sock");
+        let audit_path = dir.path().join("audit.jsonl");
+
+        let listener = bind_admin_socket(&socket_path, 0o600).expect("bind admin sock");
+        let audit = Arc::new(FileAuditWriter::open(&audit_path).expect("open audit writer"));
+        let (context, _export_tmp, _log_guard) = AdminContext::for_test_with_audit(audit);
+        let socket_path_for_serve = socket_path.clone();
+        let server =
+            tokio::spawn(async move { serve(listener, socket_path_for_serve, context).await });
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to admin socket");
+        stream
+            .write_all(&[0xFF, 0xFF, 0xFF, 0xFF])
+            .await
+            .expect("write oversize length prefix");
+        stream.flush().await.expect("flush");
+
+        let lines = wait_for_audit_lines(&audit_path, 1).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("audit line is valid JSON");
+        assert_eq!(value["command"], "<frame-error>");
+        assert_eq!(value["result"], "err");
+        assert!(
+            value["error"].as_str().is_some(),
+            "frame-error event must carry an error string; got: {value}",
+        );
+        assert!(
+            value["request"].is_null(),
+            "frame-error event request must be null; got: {value}",
+        );
+
+        server.abort();
+    }
+
+    /// Poll `path` until at least `min_lines` non-empty lines are present.
+    /// The `FileAuditWriter` drains on a `tokio::spawn` task we can't join,
+    /// so the test observes the file. Bounded by a 2s ceiling so a wedged
+    /// writer surfaces as a failure, not a hang.
+    async fn wait_for_audit_lines(path: &std::path::Path, min_lines: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await {
+                let lines: Vec<String> = contents
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+                    .collect();
+                if lines.len() >= min_lines {
+                    return lines;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "audit writer never produced {min_lines} lines at {}",
+                    path.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

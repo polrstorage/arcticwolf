@@ -28,6 +28,7 @@ pub struct Config {
     pub exports: Vec<ExportConfig>,
     pub logging: LoggingConfig,
     pub admin: AdminConfig,
+    pub audit: AuditConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -123,6 +124,27 @@ impl Default for AdminConfig {
     }
 }
 
+/// Admin audit-log settings (issue #25 Phase 6).
+///
+/// When `enabled = true`, every admin request the daemon accepts produces
+/// one JSON-lines record in `path`. `enabled = false` (the default) makes
+/// the audit subsystem inert — no file is opened, no events are recorded.
+///
+/// `path` is required when `enabled = true`; `Config::validate()` rejects
+/// the combination of `enabled = true` and `path = None`. The parent
+/// directory of `path` must already exist at daemon startup — the daemon
+/// will not auto-create it (paths under `/var/log` are operator territory).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Whether the audit writer is started. Defaults to `false`.
+    pub enabled: bool,
+    /// Filesystem path for the JSON-lines audit log. Required when
+    /// `enabled = true`. Opened with `append(true).create(true)` and
+    /// chmod'd to `0o640` (umask-respecting); never truncated.
+    pub path: Option<PathBuf>,
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -147,6 +169,7 @@ impl Default for Config {
             }],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         }
     }
 }
@@ -226,6 +249,25 @@ impl Config {
                 "admin.socket_mode = {:o} is invalid; must be <= 0o777 (chmod silently masks higher bits)",
                 self.admin.socket_mode,
             );
+        }
+
+        // Phase 6 audit config: `path` is mandatory and non-empty when the
+        // audit writer is enabled. Without it we'd have nowhere to write
+        // events, and silently disabling audit on a half-configured section
+        // would be worse than failing fast at startup. An empty `path = ""`
+        // is caught here too: otherwise the error only surfaces deep inside
+        // `FileAuditWriter::open` as a confusing "No such file or directory"
+        // against an empty display.
+        if self.audit.enabled {
+            match &self.audit.path {
+                None => bail!(
+                    "audit.enabled = true requires audit.path to be set (no default audit-log path)"
+                ),
+                Some(path) if path.as_os_str().is_empty() => {
+                    bail!("[audit] path must not be empty when enabled = true");
+                }
+                Some(_) => {}
+            }
         }
 
         let mut seen_uids: HashMap<u32, &str> = HashMap::new();
@@ -462,6 +504,7 @@ mod tests {
             exports: vec![],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         let err = config.validate().expect_err("empty exports must fail");
         let msg = err.to_string();
@@ -478,6 +521,7 @@ mod tests {
             ],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         let err = config.validate().expect_err("duplicate uid must fail");
         let msg = err.to_string();
@@ -502,6 +546,7 @@ mod tests {
             ],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         let err = config.validate().expect_err("duplicate name must fail");
         let msg = err.to_string();
@@ -518,6 +563,7 @@ mod tests {
             exports: vec![local_export("/data", 0, "/srv/a")],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         let err = config.validate().expect_err("uid 0 must fail");
         let msg = err.to_string();
@@ -531,6 +577,7 @@ mod tests {
             exports: vec![local_export("data", 1, "/srv/a")],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         let err = config.validate().expect_err("relative name must fail");
         let msg = err.to_string();
@@ -566,6 +613,7 @@ mod tests {
             ],
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         };
         config.validate().expect("distinct exports must validate");
     }
@@ -802,6 +850,90 @@ path = "/srv/data"
         assert!(
             result.is_err(),
             "unknown field inside [admin] must fail to parse"
+        );
+    }
+
+    #[test]
+    fn test_audit_config_defaults_when_section_absent() {
+        // Phase 6: a config file that doesn't mention `[audit]` must still
+        // parse and produce an inert (`enabled = false`, `path = None`)
+        // audit section. The audit subsystem must be opt-in.
+        let toml = r#"
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse without [audit]");
+        assert!(!config.audit.enabled);
+        assert!(config.audit.path.is_none());
+        config.validate().expect("disabled audit must validate");
+    }
+
+    #[test]
+    fn test_audit_enabled_without_path_is_rejected() {
+        // `[audit] enabled = true` with no `path` is a half-configured
+        // section — silently disabling audit would mask the operator's
+        // intent. `validate()` must fail fast.
+        let mut config = Config::default();
+        config.audit.enabled = true;
+        config.audit.path = None;
+        let err = config
+            .validate()
+            .expect_err("enabled audit without path must fail")
+            .to_string();
+        assert!(
+            err.contains("audit.path"),
+            "error should mention the missing field; got: {err}",
+        );
+    }
+
+    #[test]
+    fn audit_enabled_with_empty_path_is_rejected() {
+        // `path = ""` is `Some` but not a usable destination. `validate()`
+        // must reject it up front with a clear message rather than letting
+        // it slip through to `FileAuditWriter::open`, where it surfaces as a
+        // confusing "No such file or directory" against an empty path.
+        let mut config = Config::default();
+        config.audit.enabled = true;
+        config.audit.path = Some(PathBuf::from(""));
+        let err = config
+            .validate()
+            .expect_err("empty audit path must be rejected")
+            .to_string();
+        assert!(
+            err.contains("must not be empty"),
+            "error should explain the empty path; got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_audit_enabled_with_path_validates() {
+        let mut config = Config::default();
+        config.audit.enabled = true;
+        config.audit.path = Some(PathBuf::from("/var/log/arcticwolf/admin-audit.jsonl"));
+        config.validate().expect("enabled+path must validate");
+    }
+
+    #[test]
+    fn test_audit_config_rejects_unknown_field() {
+        let toml = r#"
+            [audit]
+            enabled = true
+            path = "/tmp/x"
+            file = "/tmp/y"
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown field inside [audit] must fail to parse"
         );
     }
 }

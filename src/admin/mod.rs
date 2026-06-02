@@ -7,6 +7,7 @@
 //! `arcticwolfctl` client (see [`client`]). Later phases add the remaining
 //! commands (log-level, exports/config, metrics, shutdown).
 
+pub mod audit;
 pub mod client;
 pub mod commands;
 pub mod context;
@@ -15,6 +16,7 @@ pub mod request;
 pub mod response;
 pub mod server;
 
+pub use audit::{AuditEvent, AuditWriter, FileAuditWriter, NoopAuditWriter, PeerCreds};
 pub use context::{AdminContext, ServerMetadata};
 pub use request::AdminRequest;
 pub use response::AdminResponse;
