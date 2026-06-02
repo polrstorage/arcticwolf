@@ -16,6 +16,9 @@ use std::time::Instant;
 
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
+use crate::admin::audit::AuditWriter;
+#[cfg(any(test, feature = "test-util"))]
+use crate::admin::audit::NoopAuditWriter;
 use crate::config::Config;
 use crate::fsal::MultiExportFilesystem;
 
@@ -63,6 +66,12 @@ pub struct AdminContext {
     pub filesystem: Arc<MultiExportFilesystem>,
     /// Original daemon configuration (e.g. for `bind_address`).
     pub config: Arc<Config>,
+    /// Phase 6: structured audit-log destination. The admin server
+    /// fire-and-forgets one event per accepted request. Wired to a
+    /// `FileAuditWriter` when `[audit] enabled = true`, otherwise to the
+    /// inert `NoopAuditWriter` so the dispatch path can call
+    /// `context.audit.record(event)` unconditionally.
+    pub audit: Arc<dyn AuditWriter>,
 }
 
 impl AdminContext {
@@ -76,6 +85,7 @@ impl AdminContext {
         log_reload: LogReloadHandle,
         filesystem: Arc<MultiExportFilesystem>,
         config: Arc<Config>,
+        audit: Arc<dyn AuditWriter>,
     ) -> Arc<Self> {
         Arc::new(Self {
             start_time,
@@ -83,6 +93,7 @@ impl AdminContext {
             log_reload,
             filesystem,
             config,
+            audit,
         })
     }
 }
@@ -117,11 +128,12 @@ pub type TestLogReloadGuard = std::sync::MutexGuard<'static, ()>;
 #[cfg(any(test, feature = "test-util"))]
 impl AdminContext {
     /// Construct a minimal `AdminContext` suitable for tests: one
-    /// tempdir-backed export, fixed ports, `info` log level. The returned
-    /// [`tempfile::TempDir`] and [`TestLogReloadGuard`] must both be kept
-    /// alive for as long as the context is used — the tempdir backs the
-    /// export, and the guard serializes access to the shared tracing
-    /// reload handle (see `TEST_LOG_RELOAD_LOCK`).
+    /// tempdir-backed export, fixed ports, `info` log level, and an inert
+    /// [`NoopAuditWriter`]. The returned [`tempfile::TempDir`] and
+    /// [`TestLogReloadGuard`] must both be kept alive for as long as the
+    /// context is used — the tempdir backs the export, and the guard
+    /// serializes access to the shared tracing reload handle (see
+    /// `TEST_LOG_RELOAD_LOCK`).
     ///
     /// The reload handle itself is shared across all `for_test` callers
     /// via a process-wide `OnceLock`; the underlying layer is leaked once
@@ -131,7 +143,22 @@ impl AdminContext {
     /// Available under `#[cfg(test)]` for in-crate unit tests, or via the
     /// `test-util` feature for integration tests under `tests/`. Never
     /// shipped in release builds.
+    ///
+    /// Tests that need to inspect the audit stream (the Phase 6 integration
+    /// suite) call [`AdminContext::for_test_with_audit`] instead so they
+    /// can plug in a `FileAuditWriter` over a tempfile.
     pub fn for_test() -> (Arc<Self>, tempfile::TempDir, TestLogReloadGuard) {
+        Self::for_test_with_audit(Arc::new(NoopAuditWriter))
+    }
+
+    /// Variant of [`for_test`] that lets the caller supply the audit
+    /// writer. Used by Phase 6's `tests/test_admin_audit.rs` to point the
+    /// context at a `FileAuditWriter` backed by a tempfile; all other
+    /// callers should keep using `for_test`, which threads in a
+    /// `NoopAuditWriter`.
+    pub fn for_test_with_audit(
+        audit: Arc<dyn AuditWriter>,
+    ) -> (Arc<Self>, tempfile::TempDir, TestLogReloadGuard) {
         use crate::config::{BackendConfig, Config, ExportConfig};
 
         let tmp = tempfile::tempdir().expect("create tempdir for admin test context");
@@ -195,6 +222,7 @@ impl AdminContext {
             log_reload,
             filesystem,
             Arc::new(config),
+            audit,
         );
         (context, tmp, guard)
     }

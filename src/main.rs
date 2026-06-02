@@ -236,6 +236,25 @@ async fn main() -> Result<()> {
         portmap_port: portmap_server.local_port()?,
     });
 
+    // Phase 6: build the audit writer based on `[audit]` config. When
+    // disabled (the default) we get a `NoopAuditWriter` so the dispatch
+    // path can `record(event)` without branching on whether audit is on.
+    // When enabled, opening the file fails fast — the daemon refuses to
+    // start with audit configured but unwritable.
+    let audit_writer: Arc<dyn admin::AuditWriter> = if config.audit.enabled {
+        let path = config
+            .audit
+            .path
+            .as_ref()
+            .expect("validate() guarantees audit.path is set when audit.enabled is true");
+        println!("Audit log:");
+        println!("  Path: {}", path.display());
+        println!();
+        Arc::new(admin::FileAuditWriter::open(path)?)
+    } else {
+        Arc::new(admin::NoopAuditWriter)
+    };
+
     // The admin context shares the daemon's single `MultiExportFilesystem`
     // instance with the RPC servers, so the admin `status` command and the
     // NFS path always observe the same set of exports.
@@ -245,6 +264,7 @@ async fn main() -> Result<()> {
         log_reload,
         multi_export.clone(),
         config.clone(),
+        audit_writer,
     );
 
     let admin_future = build_admin_future(&config.admin, admin_context)?;
