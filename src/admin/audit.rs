@@ -34,6 +34,16 @@
 //!   mid-frame) before any JSON was decoded; `request` is `null` and the
 //!   connection is closed immediately afterward.
 //!
+//! A fourth sentinel, `<unknown-command>`, exists only in the metrics
+//! `by_command` map (see [`crate::metrics::AdminMetrics`]), *not* in the
+//! audit log: it is the bucket a client-supplied tag falls into when it names
+//! a command the daemon doesn't recognize. The audit log instead records the
+//! raw tag verbatim, so the two surfaces differ here by design — the audit
+//! preserves what was sent, the metrics map bounds itself. `<unknown-command>`
+//! is distinct from `<unknown>` above: `<unknown>` means "valid JSON, no
+//! `command` field", whereas `<unknown-command>` means "named a command we
+//! don't have".
+//!
 //! Two writer implementations are provided. [`FileAuditWriter`] owns the
 //! audit-log file and a dedicated writer task; calls to
 //! [`AuditWriter::record`] hand the event off through an unbounded mpsc

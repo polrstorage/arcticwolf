@@ -8,6 +8,7 @@ compile_error!("Arctic Wolf NFS server only supports Linux");
 pub mod admin;
 pub mod config;
 pub mod fsal;
+pub mod metrics;
 pub mod mount;
 pub mod nfs;
 pub mod portmap;

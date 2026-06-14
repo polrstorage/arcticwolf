@@ -198,6 +198,11 @@ async fn handle_connection(
                     duration_ms: 0,
                 });
 
+                // A frame error is still an admin request the server
+                // accepted (and rejected). Count it under the same synthetic
+                // tag the audit uses so the two surfaces agree.
+                context.metrics.admin.record("<frame-error>");
+
                 // Try to send a structured error back, then close. The write
                 // half may be wedged if the client isn't reading (e.g. it
                 // sent an oversize frame and then walked away), so bound
@@ -230,6 +235,9 @@ async fn handle_connection(
         // fire-and-forget — the call returns immediately.
         let start = Instant::now();
         let (command_tag, request_payload) = extract_command_and_request(&bytes);
+        // Count every accepted request under the same tag the audit records,
+        // before dispatch — `metrics` itself counts, matching the spec.
+        context.metrics.admin.record(&command_tag);
         let response = dispatch(&context, &bytes);
         let duration = start.elapsed();
         let event = build_audit_event(
@@ -334,6 +342,7 @@ fn dispatch(context: &AdminContext, frame: &[u8]) -> AdminResponse {
             dry_run,
         } => commands::exports_update::handle(context, &selector, read_only, dry_run),
         AdminRequest::ConfigShow => commands::config_show::handle(context),
+        AdminRequest::Metrics => commands::metrics::handle(context),
     }
 }
 

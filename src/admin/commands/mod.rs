@@ -12,5 +12,6 @@ pub mod exports_list;
 pub mod exports_remove;
 pub mod exports_update;
 pub mod log_level;
+pub mod metrics;
 pub mod status;
 pub mod version;
