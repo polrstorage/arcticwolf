@@ -129,6 +129,11 @@ pub async fn fetch_config_show(socket_path: &Path) -> Result<Value> {
     fetch(socket_path, &AdminRequest::ConfigShow).await
 }
 
+/// Fetch the daemon's operational `metrics` snapshot.
+pub async fn fetch_metrics(socket_path: &Path) -> Result<Value> {
+    fetch(socket_path, &AdminRequest::Metrics).await
+}
+
 /// Render a `status` payload either as pretty JSON or a human summary.
 pub fn render_status(data: &Value, json: bool) -> Result<String> {
     if json {
@@ -337,6 +342,15 @@ pub fn render_exports_update(data: &Value, json: bool) -> Result<String> {
 /// and a human-curated layout land later). The `--json` flag is accepted
 /// to keep the flag surface consistent across commands.
 pub fn render_config_show(data: &Value, _json: bool) -> Result<String> {
+    Ok(serde_json::to_string_pretty(data)?)
+}
+
+/// Render a `metrics` payload.
+///
+/// Like `config show`, the human form IS the pretty JSON form for v1 — the
+/// JSON snapshot is the surface (no table view). `--json` is accepted for
+/// flag-surface consistency but does not change the output.
+pub fn render_metrics(data: &Value, _json: bool) -> Result<String> {
     Ok(serde_json::to_string_pretty(data)?)
 }
 

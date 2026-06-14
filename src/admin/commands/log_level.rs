@@ -377,6 +377,7 @@ mod tests {
             filesystem,
             Arc::new(config),
             Arc::new(crate::admin::NoopAuditWriter),
+            Arc::new(crate::metrics::Metrics::new()),
         );
 
         // Filter starts at `warn`: debug is suppressed, warn passes.

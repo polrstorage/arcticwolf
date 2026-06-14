@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{BackendConfig as ConfigBackend, ExportConfig};
+use crate::metrics::{ExportMetrics, ExportMetricsSnapshot};
 
 use super::handle::{FileHandle, FileHandleExt};
 use super::local::LocalFilesystem;
@@ -117,8 +118,12 @@ fn build_backend(config: &ExportConfig) -> Result<LocalFilesystem> {
 /// `Clone` so `add_export`/`remove_export`/`update_export` can build a fresh
 /// snapshot from the current one with `HashMap::clone()` (which moves each
 /// entry through `Clone`); cloning an `ExportEntry` only clones the inner
-/// `Arc<LocalFilesystem>` (cheap refcount bump), it does not duplicate the
-/// backend's `HandleManager` state.
+/// `Arc<LocalFilesystem>` and `Arc<ExportMetrics>` (cheap refcount bumps), it
+/// does not duplicate the backend's `HandleManager` state. The
+/// `Arc<ExportMetrics>` being shared rather than deep-copied is load-bearing:
+/// it is why per-export counters survive an `update_export` rebuild (the same
+/// allocation is carried into the new snapshot) yet reset on `remove_export`
+/// (the entry, and its last `Arc`, are dropped — see [`crate::metrics`]).
 #[derive(Clone)]
 struct ExportEntry {
     name: String,
@@ -131,6 +136,10 @@ struct ExportEntry {
     /// `LocalFilesystem::root_file_handle()` without going through an
     /// `async fn` trait dispatch.
     fs: Arc<LocalFilesystem>,
+    /// Per-export operational counters (Phase 7). Behind an `Arc` so a
+    /// snapshot rebuild that doesn't touch this export carries the same
+    /// counters forward (see the `Clone` note above).
+    metrics: Arc<ExportMetrics>,
 }
 
 /// Immutable snapshot of the live export set.
@@ -294,6 +303,7 @@ impl MultiExportFilesystem {
                 read_only: export.read_only,
                 fsal: export.backend.name(),
                 fs: Arc::new(fs),
+                metrics: Arc::new(ExportMetrics::default()),
             };
 
             if by_uid.insert(export.uid, entry).is_some() {
@@ -322,16 +332,29 @@ impl MultiExportFilesystem {
         })
     }
 
-    /// Resolve `handle` against the live snapshot and return a clone of the
-    /// owning backend's `Arc<LocalFilesystem>`.
+    /// Resolve `handle` against the live snapshot and return clones of the
+    /// owning backend's `Arc<LocalFilesystem>` and its `Arc<ExportMetrics>`.
     ///
     /// This is the single chokepoint every single-handle async trait method
     /// funnels through: the snapshot `Guard` is dropped when this function
     /// returns, so the caller awaits on a plain `Arc<LocalFilesystem>` and
     /// never holds a guard across an await point.
-    fn inner_for_handle(&self, handle: &FileHandle) -> Result<Arc<LocalFilesystem>> {
+    ///
+    /// The per-export `requests` counter is bumped here, *after* the handle
+    /// resolves to a live export but *before* the caller awaits the backend
+    /// op — so a stale/unknown handle (which errors out above) is not
+    /// counted against any export, and every dispatched op is.
+    fn inner_for_handle(
+        &self,
+        handle: &FileHandle,
+    ) -> Result<(Arc<LocalFilesystem>, Arc<ExportMetrics>)> {
         let snapshot = self.state.load();
-        Ok(snapshot.entry_for_handle(handle)?.fs.clone())
+        let entry = snapshot.entry_for_handle(handle)?;
+        entry
+            .metrics
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((entry.fs.clone(), entry.metrics.clone()))
     }
 
     /// Resolve a pair of handles for an inherently single-export operation
@@ -350,7 +373,7 @@ impl MultiExportFilesystem {
         op: &str,
         a_label: &str,
         b_label: &str,
-    ) -> Result<Arc<LocalFilesystem>> {
+    ) -> Result<(Arc<LocalFilesystem>, Arc<ExportMetrics>)> {
         let a_uid = a.as_slice().export_uid().ok_or_else(|| {
             anyhow!(
                 "Invalid handle: {} too short to carry an export uid",
@@ -380,7 +403,11 @@ impl MultiExportFilesystem {
                 a_uid
             )
         })?;
-        Ok(entry.fs.clone())
+        entry
+            .metrics
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((entry.fs.clone(), entry.metrics.clone()))
     }
 
     /// Resolve `selector` to the uid of the matching live export.
@@ -448,6 +475,10 @@ impl MultiExportFilesystem {
             read_only: config.read_only,
             fsal: config.backend.name(),
             fs: Arc::new(fs),
+            // A freshly-added export starts with zeroed counters; a uid
+            // retired earlier this run can never be re-added (see
+            // `retired_uids`), so this never silently revives stale metrics.
+            metrics: Arc::new(ExportMetrics::default()),
         };
 
         let mut by_uid = current.by_uid.clone();
@@ -610,6 +641,35 @@ impl MultiExportFilesystem {
             new_read_only: new_ro,
         })
     }
+
+    /// Snapshot per-export operational counters, one entry per live export,
+    /// sorted by uid for deterministic output. Backs the `exports` array of
+    /// the admin `metrics` command.
+    ///
+    /// Each counter is loaded with `Relaxed`; the result is not atomic
+    /// across exports or against the rest of the metrics snapshot (see
+    /// [`crate::metrics`]). Retired/removed exports are intentionally
+    /// absent — v1 keeps no historical metrics for them.
+    pub fn export_metrics(&self) -> Vec<ExportMetricsSnapshot> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let snapshot = self.state.load();
+        let mut uids: Vec<u32> = snapshot.by_uid.keys().copied().collect();
+        uids.sort_unstable();
+        uids.into_iter()
+            .map(|uid| {
+                let entry = &snapshot.by_uid[&uid];
+                let m = &entry.metrics;
+                ExportMetricsSnapshot {
+                    uid,
+                    name: entry.name.clone(),
+                    requests: m.requests.load(Relaxed),
+                    bytes_read: m.bytes_read.load(Relaxed),
+                    bytes_written: m.bytes_written.load(Relaxed),
+                    errors: m.errors.load(Relaxed),
+                }
+            })
+            .collect()
+    }
 }
 
 impl ExportRegistry for MultiExportFilesystem {
@@ -663,19 +723,39 @@ impl ExportRegistry for MultiExportFilesystem {
 
 #[async_trait]
 impl Filesystem for MultiExportFilesystem {
+    // Each method resolves the handle to `(inner backend, per-export
+    // metrics)` via `inner_for_handle`/`inner_for_same_export_pair` — which
+    // bump the per-export `requests` counter before the op runs — then tags
+    // the export's `errors` counter on an `Err` return. `read`/`write`
+    // additionally credit `bytes_read`/`bytes_written` by the actual byte
+    // count on success.
     async fn lookup(&self, dir_handle: &FileHandle, name: &str) -> Result<FileHandle> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.lookup(dir_handle, name).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.lookup(dir_handle, name).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.getattr(handle).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.getattr(handle).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn read(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<Vec<u8>> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.read(handle, offset, count).await
+        use std::sync::atomic::Ordering::Relaxed;
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        match inner.read(handle, offset, count).await {
+            Ok(data) => {
+                metrics.bytes_read.fetch_add(data.len() as u64, Relaxed);
+                Ok(data)
+            }
+            Err(err) => {
+                metrics.errors.fetch_add(1, Relaxed);
+                Err(err)
+            }
+        }
     }
 
     async fn readdir(
@@ -684,23 +764,39 @@ impl Filesystem for MultiExportFilesystem {
         cookie: u64,
         count: u32,
     ) -> Result<(Vec<DirEntry>, bool)> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.readdir(dir_handle, cookie, count).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.readdir(dir_handle, cookie, count).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.write(handle, offset, data).await
+        use std::sync::atomic::Ordering::Relaxed;
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        match inner.write(handle, offset, data).await {
+            Ok(written) => {
+                metrics.bytes_written.fetch_add(u64::from(written), Relaxed);
+                Ok(written)
+            }
+            Err(err) => {
+                metrics.errors.fetch_add(1, Relaxed);
+                Err(err)
+            }
+        }
     }
 
     async fn setattr_size(&self, handle: &FileHandle, size: u64) -> Result<()> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.setattr_size(handle, size).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.setattr_size(handle, size).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn setattr_mode(&self, handle: &FileHandle, mode: u32) -> Result<()> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.setattr_mode(handle, mode).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.setattr_mode(handle, mode).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn setattr_owner(
@@ -709,28 +805,38 @@ impl Filesystem for MultiExportFilesystem {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<()> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.setattr_owner(handle, uid, gid).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.setattr_owner(handle, uid, gid).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.create(dir_handle, name, mode).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.create(dir_handle, name, mode).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.remove(dir_handle, name).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.remove(dir_handle, name).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.mkdir(dir_handle, name, mode).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.mkdir(dir_handle, name, mode).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn rmdir(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.rmdir(dir_handle, name).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.rmdir(dir_handle, name).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn rename(
@@ -740,16 +846,18 @@ impl Filesystem for MultiExportFilesystem {
         to_dir_handle: &FileHandle,
         to_name: &str,
     ) -> Result<()> {
-        let inner = self.inner_for_same_export_pair(
+        let (inner, metrics) = self.inner_for_same_export_pair(
             from_dir_handle,
             to_dir_handle,
             "rename",
             "source",
             "target",
         )?;
-        inner
+        let r = inner
             .rename(from_dir_handle, from_name, to_dir_handle, to_name)
-            .await
+            .await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn symlink(
@@ -758,13 +866,17 @@ impl Filesystem for MultiExportFilesystem {
         name: &str,
         target: &str,
     ) -> Result<FileHandle> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.symlink(dir_handle, name, target).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.symlink(dir_handle, name, target).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn readlink(&self, handle: &FileHandle) -> Result<String> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.readlink(handle).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.readlink(handle).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn link(
@@ -773,14 +885,18 @@ impl Filesystem for MultiExportFilesystem {
         dir_handle: &FileHandle,
         name: &str,
     ) -> Result<FileHandle> {
-        let inner =
+        let (inner, metrics) =
             self.inner_for_same_export_pair(file_handle, dir_handle, "link", "file", "dir")?;
-        inner.link(file_handle, dir_handle, name).await
+        let r = inner.link(file_handle, dir_handle, name).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn commit(&self, handle: &FileHandle, offset: u64, count: u32) -> Result<()> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.commit(handle, offset, count).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.commit(handle, offset, count).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn mknod(
@@ -791,13 +907,17 @@ impl Filesystem for MultiExportFilesystem {
         mode: u32,
         rdev: (u32, u32),
     ) -> Result<FileHandle> {
-        let inner = self.inner_for_handle(dir_handle)?;
-        inner.mknod(dir_handle, name, file_type, mode, rdev).await
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner.mknod(dir_handle, name, file_type, mode, rdev).await;
+        metrics.record_result(&r);
+        r
     }
 
     async fn fs_stats(&self, handle: &FileHandle) -> Result<FsStats> {
-        let inner = self.inner_for_handle(handle)?;
-        inner.fs_stats(handle).await
+        let (inner, metrics) = self.inner_for_handle(handle)?;
+        let r = inner.fs_stats(handle).await;
+        metrics.record_result(&r);
+        r
     }
 }
 
@@ -1426,5 +1546,84 @@ mod tests {
         assert!(matches!(v, ExportSelector::Name(ref s) if s == "/data"));
         let v: ExportSelector = serde_json::from_value(json!({ "uid": 5 })).unwrap();
         assert!(matches!(v, ExportSelector::Uid(5)));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7: per-export metrics survive update, reset on remove.
+    // ---------------------------------------------------------------
+
+    /// Bumping a counter then `update_export`ing an unrelated field
+    /// (read_only) must leave the counter intact — the same
+    /// `Arc<ExportMetrics>` is carried into the rebuilt snapshot rather than
+    /// a fresh zeroed one.
+    #[test]
+    fn export_metrics_survive_update_export_snapshot_rebuild() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (router, _data, _backup) = build_two_export_router();
+
+        // Capture uid 1's metrics Arc and bump every counter.
+        let before = router.state.load().by_uid[&1].metrics.clone();
+        before.requests.fetch_add(5, Relaxed);
+        before.bytes_read.fetch_add(100, Relaxed);
+        before.bytes_written.fetch_add(40, Relaxed);
+        before.errors.fetch_add(1, Relaxed);
+
+        // Flip read_only — rebuilds the snapshot copy-on-write.
+        router
+            .update_export(&ExportSelector::Uid(1), Some(true))
+            .expect("update must succeed");
+
+        let after = router.state.load().by_uid[&1].metrics.clone();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "update_export must preserve the existing Arc<ExportMetrics>, not reallocate",
+        );
+        assert_eq!(after.requests.load(Relaxed), 5);
+        assert_eq!(after.bytes_read.load(Relaxed), 100);
+        assert_eq!(after.bytes_written.load(Relaxed), 40);
+        assert_eq!(after.errors.load(Relaxed), 1);
+
+        // The public snapshot agrees.
+        let snap = router.export_metrics();
+        let one = snap.iter().find(|e| e.uid == 1).expect("uid 1 present");
+        assert_eq!(one.requests, 5);
+        assert_eq!(one.bytes_read, 100);
+        assert_eq!(one.bytes_written, 40);
+        assert_eq!(one.errors, 1);
+    }
+
+    /// Removing an export drops its metrics; re-adding under the same name
+    /// (with a fresh uid, since the old one is retired) yields a brand-new
+    /// zeroed `Arc<ExportMetrics>`.
+    #[test]
+    fn export_metrics_reset_on_remove_then_readd() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (router, _data, _backup) = build_two_export_router();
+
+        let before = router.state.load().by_uid[&1].metrics.clone();
+        before.requests.fetch_add(9, Relaxed);
+
+        router
+            .remove_export(&ExportSelector::Uid(1))
+            .expect("remove must succeed");
+
+        // Re-add the same name with a fresh uid (uid 1 is retired).
+        let new_dir = TempDir::new().unwrap();
+        let cfg = export("/data", 3, new_dir.path().to_path_buf(), false);
+        router.add_export(&cfg).expect("re-add must succeed");
+
+        let after = router.state.load().by_uid[&3].metrics.clone();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a re-added export must get a fresh Arc<ExportMetrics>",
+        );
+        assert_eq!(after.requests.load(Relaxed), 0);
+
+        let snap = router.export_metrics();
+        let three = snap.iter().find(|e| e.uid == 3).expect("uid 3 present");
+        assert_eq!(three.requests, 0);
+        assert_eq!(three.bytes_read, 0);
+        assert_eq!(three.bytes_written, 0);
+        assert_eq!(three.errors, 0);
     }
 }

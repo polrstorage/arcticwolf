@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, reload, util::Subscrib
 use arcticwolf::admin;
 use arcticwolf::config::{self, Config};
 use arcticwolf::fsal;
+use arcticwolf::metrics::Metrics;
 use arcticwolf::portmap;
 use arcticwolf::protocol::v3::portmap::mapping;
 use arcticwolf::rpc;
@@ -157,6 +158,12 @@ async fn main() -> Result<()> {
     )?);
     let filesystem: Arc<dyn fsal::NfsBackend> = multi_export.clone();
 
+    // Phase 7: single in-memory metrics registry, constructed once and
+    // shared (by `Arc` clone) with every RPC server and the admin context.
+    // Per-export counters live on each `ExportEntry` inside the filesystem
+    // router, so they are not threaded through here.
+    let metrics = Arc::new(Metrics::new());
+
     let exports = filesystem.list_exports();
     for export in &exports {
         // Backend type/path live in `config.exports` (the FSAL view via
@@ -190,6 +197,7 @@ async fn main() -> Result<()> {
         registry.clone(),
         filesystem.clone(),
         vec![100000], // PORTMAP only
+        metrics.clone(),
     )
     .await?;
 
@@ -198,6 +206,7 @@ async fn main() -> Result<()> {
         registry.clone(),
         filesystem.clone(),
         vec![100005], // MOUNT only
+        metrics.clone(),
     )
     .await?;
 
@@ -209,6 +218,7 @@ async fn main() -> Result<()> {
         registry.clone(),
         filesystem.clone(),
         vec![100003], // NFS only
+        metrics.clone(),
     )
     .await?;
 
@@ -265,6 +275,7 @@ async fn main() -> Result<()> {
         multi_export.clone(),
         config.clone(),
         audit_writer,
+        metrics.clone(),
     );
 
     let admin_future = build_admin_future(&config.admin, admin_context)?;

@@ -51,6 +51,8 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Show a JSON snapshot of runtime metrics (counters reset on restart).
+    Metrics,
 }
 
 /// Sub-actions of the `log-level` command.
@@ -183,6 +185,7 @@ async fn main() -> ExitCode {
         Command::Config { action } => match action {
             ConfigAction::Show => run_config_show(&cli).await,
         },
+        Command::Metrics => run_metrics(&cli).await,
     }
 }
 
@@ -457,6 +460,28 @@ async fn run_config_show(cli: &Cli) -> ExitCode {
         }
     };
     match client::render_config_show(&data, cli.json) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("arcticwolfctl: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arcticwolfctl metrics` — fetch and pretty-print the runtime counter
+/// snapshot. Any failure (connection refused, admin error) exits non-zero.
+async fn run_metrics(cli: &Cli) -> ExitCode {
+    let data = match client::fetch_metrics(&cli.socket).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("arcticwolfctl: metrics failed: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client::render_metrics(&data, cli.json) {
         Ok(text) => {
             println!("{text}");
             ExitCode::SUCCESS
@@ -991,6 +1016,42 @@ mod tests {
         ))
         .await;
         assert_exit(code, ExitCode::SUCCESS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_metrics_exits_success_on_ok_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("admin.sock");
+        let response = AdminResponse::Ok {
+            data: json!({
+                "server": { "uptime_seconds": 1, "rpc_requests_total": 0, "rpc_errors_total": 0 },
+                "nfs_ops": { "getattr": 0 },
+                "exports": [],
+                "admin": { "commands_total": 1, "by_command": { "metrics": 1 } },
+            }),
+        };
+        let server = spawn_fake_server(&socket, response);
+
+        let code = run_metrics(&make_cli(socket, Command::Metrics)).await;
+        assert_exit(code, ExitCode::SUCCESS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_metrics_exits_failure_when_socket_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = make_cli(dir.path().join("absent.sock"), Command::Metrics);
+        assert_exit(run_metrics(&cli).await, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn run_metrics_exits_failure_when_daemon_returns_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("admin.sock");
+        let server = spawn_fake_server(&socket, AdminResponse::error("simulated"));
+        let code = run_metrics(&make_cli(socket, Command::Metrics)).await;
+        assert_exit(code, ExitCode::FAILURE);
         server.abort();
     }
 

@@ -21,6 +21,7 @@ use crate::admin::audit::AuditWriter;
 use crate::admin::audit::NoopAuditWriter;
 use crate::config::Config;
 use crate::fsal::MultiExportFilesystem;
+use crate::metrics::Metrics;
 
 /// Live reload handle for the daemon's tracing `EnvFilter`.
 ///
@@ -72,6 +73,11 @@ pub struct AdminContext {
     /// inert `NoopAuditWriter` so the dispatch path can call
     /// `context.audit.record(event)` unconditionally.
     pub audit: Arc<dyn AuditWriter>,
+    /// Phase 7: operational counters shared with the RPC servers and the
+    /// filesystem router. The `metrics` admin command snapshots this; the
+    /// admin server also bumps the per-command counters here on every
+    /// accepted request.
+    pub metrics: Arc<Metrics>,
 }
 
 impl AdminContext {
@@ -79,6 +85,7 @@ impl AdminContext {
     /// state. `main.rs` shares the result across per-connection tasks
     /// behind the returned `Arc` (see the type-level note on why `Clone`
     /// is deliberately not derived).
+    #[allow(clippy::too_many_arguments)]
     pub fn shared(
         start_time: Instant,
         server_metadata: Arc<ServerMetadata>,
@@ -86,6 +93,7 @@ impl AdminContext {
         filesystem: Arc<MultiExportFilesystem>,
         config: Arc<Config>,
         audit: Arc<dyn AuditWriter>,
+        metrics: Arc<Metrics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             start_time,
@@ -94,6 +102,7 @@ impl AdminContext {
             filesystem,
             config,
             audit,
+            metrics,
         })
     }
 }
@@ -223,6 +232,7 @@ impl AdminContext {
             filesystem,
             Arc::new(config),
             audit,
+            Arc::new(Metrics::new()),
         );
         (context, tmp, guard)
     }
