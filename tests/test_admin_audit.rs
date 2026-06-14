@@ -12,11 +12,13 @@ use std::time::Duration;
 use arcticwolf::admin::{self, AdminContext, AdminRequest, AdminResponse, FileAuditWriter};
 use arcticwolf::config::{BackendConfig, ExportConfig};
 use arcticwolf::fsal::multi_export::ExportSelector;
+use arcticwolf::shutdown::InFlight;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::sync::CancellationToken;
 
 fn cfg(name: &str, uid: u32, path: PathBuf, read_only: bool) -> ExportConfig {
     ExportConfig {
@@ -47,7 +49,7 @@ fn client_codec() -> LengthDelimitedCodec {
 ///   - `_audit_dir`         — owns the audit-log tempdir
 ///   - `_export_dir`        — owns the for_test() export tempdir
 ///   - `_log_guard`         — serializes shared tracing reload handle
-///   - `server`             — the spawned serve() task; aborted by caller
+///   - `token`              — cancels the detached serve() task on teardown
 async fn spawn_with_audit() -> (
     PathBuf,
     PathBuf,
@@ -55,7 +57,7 @@ async fn spawn_with_audit() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     admin::context::TestLogReloadGuard,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
+    CancellationToken,
 ) {
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("admin.sock");
@@ -67,7 +69,16 @@ async fn spawn_with_audit() -> (
     let (context, export_dir, log_guard) = AdminContext::for_test_with_audit(audit_writer);
     let listener =
         admin::server::bind_admin_socket(&socket_path, 0o600).expect("bind admin socket");
-    let server = tokio::spawn(admin::serve(listener, socket_path.clone(), context));
+    // Detach the serve task; the returned token drives shutdown via
+    // `token.cancel()` — the same path production uses (Fix 18).
+    let token = CancellationToken::new();
+    let _server = tokio::spawn(admin::serve_with_shutdown(
+        listener,
+        socket_path.clone(),
+        context,
+        token.clone(),
+        Arc::new(InFlight::new()),
+    ));
     (
         socket_path,
         audit_path,
@@ -75,7 +86,7 @@ async fn spawn_with_audit() -> (
         audit_dir,
         export_dir,
         log_guard,
-        server,
+        token,
     )
 }
 
@@ -128,7 +139,7 @@ async fn send_raw_frame(socket_path: &std::path::Path, body: &[u8]) -> AdminResp
 
 #[tokio::test]
 async fn audit_records_status_request_with_peer_uid() {
-    let (socket_path, audit_path, _sd, _ad, _xd, _g, server) = spawn_with_audit().await;
+    let (socket_path, audit_path, _sd, _ad, _xd, _g, token) = spawn_with_audit().await;
 
     admin::client::fetch_status(&socket_path)
         .await
@@ -165,12 +176,12 @@ async fn audit_records_status_request_with_peer_uid() {
             u64::from(std::process::id()),
         );
     }
-    server.abort();
+    token.cancel();
 }
 
 #[tokio::test]
 async fn audit_records_ok_and_err_outcomes_with_correct_fields() {
-    let (socket_path, audit_path, _sd, _ad, _xd, _g, server) = spawn_with_audit().await;
+    let (socket_path, audit_path, _sd, _ad, _xd, _g, token) = spawn_with_audit().await;
 
     // OK: add a new export.
     let new_dir = tempfile::tempdir().expect("new export tempdir");
@@ -232,12 +243,12 @@ async fn audit_records_ok_and_err_outcomes_with_correct_fields() {
     assert!(lines[2].get("error").is_none());
     assert_eq!(lines[2]["request"]["selector"]["uid"], 7);
 
-    server.abort();
+    token.cancel();
 }
 
 #[tokio::test]
 async fn audit_records_malformed_frame_with_undecodable_marker() {
-    let (socket_path, audit_path, _sd, _ad, _xd, _g, server) = spawn_with_audit().await;
+    let (socket_path, audit_path, _sd, _ad, _xd, _g, token) = spawn_with_audit().await;
 
     // Bytes that aren't valid JSON at all — the audit line must still get
     // emitted, with the documented `<undecodable>` command tag and a
@@ -262,7 +273,7 @@ async fn audit_records_malformed_frame_with_undecodable_marker() {
         "undecodable frame must carry the decode error: {event}",
     );
 
-    server.abort();
+    token.cancel();
 }
 
 #[tokio::test]
@@ -270,7 +281,7 @@ async fn audit_records_every_request_in_order_including_repeats() {
     // Pin the "every request gets one line" invariant across a mixed
     // batch — operators rely on a 1:1 ratio so log volume matches
     // request count exactly.
-    let (socket_path, audit_path, _sd, _ad, _xd, _g, server) = spawn_with_audit().await;
+    let (socket_path, audit_path, _sd, _ad, _xd, _g, token) = spawn_with_audit().await;
 
     let _ = admin::client::fetch_status(&socket_path).await.unwrap();
     let _ = admin::client::fetch_version(&socket_path).await.unwrap();
@@ -296,5 +307,5 @@ async fn audit_records_every_request_in_order_including_repeats() {
         );
     }
 
-    server.abort();
+    token.cancel();
 }

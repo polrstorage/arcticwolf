@@ -5,9 +5,12 @@
 //! and asserts the response JSON shape for both commands as well as the
 //! `--json` / human render paths.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use arcticwolf::admin::{self, AdminContext};
+use arcticwolf::shutdown::InFlight;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn status_and_version_round_trip_over_the_socket() {
@@ -17,7 +20,14 @@ async fn status_and_version_round_trip_over_the_socket() {
     let (context, _export_dir, _log_guard) = AdminContext::for_test();
     let listener =
         admin::server::bind_admin_socket(&socket_path, 0o600).expect("bind admin socket");
-    let server = tokio::spawn(admin::serve(listener, socket_path.clone(), context));
+    let token = CancellationToken::new();
+    let _server = tokio::spawn(admin::serve_with_shutdown(
+        listener,
+        socket_path.clone(),
+        context,
+        token.clone(),
+        Arc::new(InFlight::new()),
+    ));
 
     // --- status ---
     let status = tokio::time::timeout(
@@ -91,7 +101,7 @@ async fn status_and_version_round_trip_over_the_socket() {
     let json_version = admin::client::render_version(&version, true).expect("render json version");
     assert!(json_version.contains("\"rustc_version\""));
 
-    server.abort();
+    token.cancel();
 }
 
 #[tokio::test]

@@ -20,7 +20,7 @@ pub use audit::{AuditEvent, AuditWriter, FileAuditWriter, NoopAuditWriter, PeerC
 pub use context::{AdminContext, ServerMetadata};
 pub use request::AdminRequest;
 pub use response::AdminResponse;
-pub use server::serve;
+pub use server::serve_with_shutdown;
 
 /// Default filesystem path for the admin Unix domain socket.
 ///

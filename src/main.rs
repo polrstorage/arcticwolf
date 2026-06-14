@@ -1,8 +1,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("Arctic Wolf NFS server only supports Linux");
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 use arcticwolf::admin;
@@ -12,6 +15,7 @@ use arcticwolf::metrics::Metrics;
 use arcticwolf::portmap;
 use arcticwolf::protocol::v3::portmap::mapping;
 use arcticwolf::rpc;
+use arcticwolf::shutdown::{self, Signal};
 
 /// Portmapper port is fixed at 111 per RFC 1833
 const PORTMAP_PORT: u16 = 111;
@@ -64,17 +68,27 @@ fn register_services(
 
 /// Build the admin server future based on `[admin]` config.
 ///
-/// When `enabled = false`, returns a `pending` future — the caller drops
-/// it into `tokio::select!` alongside the RPC servers, and that branch
-/// never fires. When enabled, binds the socket eagerly so any setup
-/// failure (missing parent dir, EACCES, stale non-socket at the path)
-/// returns from `main()` with a clear error instead of being deferred.
+/// When `enabled = false`, returns a future that simply waits for the
+/// shutdown token and then resolves `Ok(())`. (A `pending()` here would
+/// never resolve, forcing the whole-daemon drain to always hit its timeout
+/// when admin is disabled.) When enabled, binds the socket eagerly so any
+/// setup failure (missing parent dir, EACCES, stale non-socket at the path)
+/// returns from `main()` with a clear error instead of being deferred, then
+/// serves until the token is cancelled.
+///
+/// The future is boxed `+ Send` so the caller can `tokio::spawn` it
+/// alongside the RPC server tasks.
 fn build_admin_future(
     admin: &config::AdminConfig,
     context: Arc<admin::AdminContext>,
-) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>> {
+    shutdown: CancellationToken,
+    in_flight: Arc<shutdown::InFlight>,
+) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>> {
     if !admin.enabled {
-        return Ok(Box::pin(std::future::pending::<Result<()>>()));
+        return Ok(Box::pin(async move {
+            shutdown.cancelled().await;
+            Ok(())
+        }));
     }
 
     println!("Admin server:");
@@ -84,14 +98,20 @@ fn build_admin_future(
 
     let listener = admin::server::bind_admin_socket(&admin.socket_path, admin.socket_mode)?;
     let socket_path = admin.socket_path.clone();
-    Ok(Box::pin(admin::serve(listener, socket_path, context)))
+    Ok(Box::pin(admin::serve_with_shutdown(
+        listener,
+        socket_path,
+        context,
+        shutdown,
+        in_flight,
+    )))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Capture the process start instant up front so the admin `status`
     // command can report an accurate uptime.
-    let start_time = std::time::Instant::now();
+    let process_start_instant = std::time::Instant::now();
 
     // Load configuration first (before tracing init). Wrapped in an `Arc`
     // so it can be shared with the admin context without a deep copy.
@@ -124,6 +144,78 @@ async fn main() -> Result<()> {
         .with(filter_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // === Graceful shutdown wiring (issue #25 Phase 8) ===
+    //
+    // Install the signal handlers as early as possible — immediately after
+    // tracing init (so the watch task's `tracing::info!` isn't dropped, per
+    // the logging-order rule) and *before* any side-effecting init (FSAL
+    // build, port binds, audit-file open, admin-socket bind). A SIGTERM that
+    // arrives during init must be caught and turned into a clean shutdown
+    // rather than killing the process with the default action — which would
+    // leave half-bound listeners and possibly an orphaned admin socket file
+    // behind. (Fix 3)
+    //
+    // We deliberately do *not* try to abort init when a signal lands mid-init:
+    // init runs to completion, the four server tasks are spawned as usual, and
+    // each one observes the already-cancelled token on its first select! and
+    // breaks out of its accept loop before taking a single connection. The
+    // drain then joins them immediately (0 in-flight), and the normal
+    // audit-flush + socket-cleanup tail runs. Because that tail only runs after
+    // init has finished, `audit` always exists by the time we touch it — there
+    // is no early-exit path that could reach cleanup before `audit` is built,
+    // so no guarding is required.
+    //
+    // A single `CancellationToken` fans the signal out to all four accept
+    // loops. We chose `tokio_util::sync::CancellationToken` over a
+    // `tokio::sync::watch`: it is already on the dependency tree, its
+    // `cancelled()` future is exactly the shape each accept loop's
+    // `tokio::select!` arm wants, and `cancel()` is idempotent and broadcast
+    // to every clone — no `*borrow()`/`changed()` dance.
+    //
+    // Flow: the first SIGTERM/SIGINT cancels the token, so every server stops
+    // accepting and drains its in-flight tasks (bounded by `[shutdown]
+    // drain_timeout_seconds`); then the audit writer is flushed and the admin
+    // socket file removed; finally the process exits 0. A *second* signal while
+    // draining escalates to an immediate `std::process::exit` with the
+    // conventional `128 + signum` code (130 for SIGINT, 143 for SIGTERM).
+    let shutdown_token = CancellationToken::new();
+
+    // Install the signal handlers up front so a `signal()` failure is a clear
+    // startup error (propagated via `?`) rather than a silent drop inside a
+    // spawned task.
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    {
+        let shutdown_token = shutdown_token.clone();
+        tokio::spawn(async move {
+            // First signal: begin graceful shutdown.
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("received SIGTERM, beginning graceful shutdown"),
+                _ = sigint.recv() => tracing::info!("received SIGINT, beginning graceful shutdown"),
+            }
+            shutdown_token.cancel();
+            // Second signal: abandon the drain and exit immediately. This
+            // `process::exit` is why the escalation path can't be unit-tested
+            // in-process (see `arcticwolf::shutdown` tests, which cover the
+            // pure exit-code mapping instead).
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::warn!("second signal (SIGTERM) during drain, exiting immediately");
+                    std::process::exit(Signal::Terminate.escalation_exit_code());
+                }
+                _ = sigint.recv() => {
+                    tracing::warn!("second signal (SIGINT) during drain, exiting immediately");
+                    std::process::exit(Signal::Interrupt.escalation_exit_code());
+                }
+            }
+        });
+    }
+
+    // Process-wide in-flight handler counter, shared by all four servers so
+    // the drain-timeout warn can report the aggregate still-running count.
+    // (Fix 9)
+    let in_flight = Arc::new(shutdown::InFlight::new());
 
     println!("Arctic Wolf NFS Server");
     println!("======================");
@@ -264,12 +356,17 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(admin::NoopAuditWriter)
     };
+    // Keep a clone for the shutdown flush. The other clone is moved into the
+    // admin context below; on shutdown `shutdown()` closes the channel and
+    // joins the writer task regardless of how many `Arc` clones remain (see
+    // `FileAuditWriter::shutdown`).
+    let audit_for_shutdown = audit_writer.clone();
 
     // The admin context shares the daemon's single `MultiExportFilesystem`
     // instance with the RPC servers, so the admin `status` command and the
     // NFS path always observe the same set of exports.
     let admin_context = admin::AdminContext::shared(
-        start_time,
+        process_start_instant,
         server_metadata,
         log_reload,
         multi_export.clone(),
@@ -278,24 +375,90 @@ async fn main() -> Result<()> {
         metrics.clone(),
     );
 
-    let admin_future = build_admin_future(&config.admin, admin_context)?;
+    // Spawn all four servers, each holding a clone of the shutdown token (set
+    // up early, above) and the shared in-flight counter. If a signal already
+    // fired during init the token is cancelled, so each server breaks out of
+    // its accept loop on the first select! without taking a connection.
+    let portmap_handle = {
+        let token = shutdown_token.clone();
+        let in_flight = in_flight.clone();
+        tokio::spawn(async move { portmap_server.serve(token, in_flight).await })
+    };
+    let mount_handle = {
+        let token = shutdown_token.clone();
+        let in_flight = in_flight.clone();
+        tokio::spawn(async move { mount_server.serve(token, in_flight).await })
+    };
+    let nfs_handle = {
+        let token = shutdown_token.clone();
+        let in_flight = in_flight.clone();
+        tokio::spawn(async move { nfs_server.serve(token, in_flight).await })
+    };
+    let admin_handle = {
+        let admin_future = build_admin_future(
+            &config.admin,
+            admin_context,
+            shutdown_token.clone(),
+            in_flight.clone(),
+        )?;
+        tokio::spawn(admin_future)
+    };
 
-    // Run all servers concurrently. The admin branch is a `pending` future
-    // when admin is disabled, so its presence in `select!` is free.
-    tokio::select! {
-        result = portmap_server.serve() => {
-            result?;
+    // Block until the shutdown signal fires (the signal task cancels the
+    // token). Until then every server is busy in its own task.
+    shutdown_token.cancelled().await;
+    let drain_start_instant = Instant::now();
+    tracing::info!("shutdown signal received, draining in-flight requests");
+
+    // Drain every server, bounded by the configured timeout. The join
+    // collects each server's exit status; errors are logged (not
+    // propagated) because we're already shutting down and want the other
+    // servers to finish regardless. If the timeout fires, `drain` is dropped
+    // — detaching (not aborting) the still-running tasks — and the daemon
+    // exits anyway with status 0.
+    let drain_timeout = Duration::from_secs(config.shutdown.drain_timeout_seconds);
+    let drain = async {
+        let (portmap_res, mount_res, nfs_res, admin_res) =
+            tokio::join!(portmap_handle, mount_handle, nfs_handle, admin_handle);
+        for (label, res) in [
+            ("portmap", portmap_res),
+            ("mount", mount_res),
+            ("nfs", nfs_res),
+            ("admin", admin_res),
+        ] {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        server = label,
+                        "server exited with error during shutdown: {err:#}"
+                    )
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        server = label,
+                        "server task panicked during shutdown: {join_err}"
+                    )
+                }
+            }
         }
-        result = mount_server.serve() => {
-            result?;
-        }
-        result = nfs_server.serve() => {
-            result?;
-        }
-        result = admin_future => {
-            result?;
-        }
+    };
+    let _ = shutdown::drain_with_timeout(drain, drain_timeout, &in_flight).await;
+
+    // Flush the audit writer: closes its channel and joins the writer task so
+    // every queued event reaches disk. A no-op for the `NoopAuditWriter`.
+    audit_for_shutdown.shutdown().await;
+
+    // Fallback admin-socket cleanup. `serve_with_shutdown` already removes
+    // the socket on a clean drain; this covers the timeout path where that
+    // task may not have returned. Best-effort — the file is usually gone.
+    if config.admin.enabled {
+        let _ = std::fs::remove_file(&config.admin.socket_path);
     }
 
+    tracing::info!(
+        total_ms = drain_start_instant.elapsed().as_millis(),
+        "shutdown complete"
+    );
     Ok(())
 }

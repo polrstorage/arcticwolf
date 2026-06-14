@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use arcticwolf::admin::{self, AdminContext};
 use arcticwolf::fsal::{ExportRegistry, Filesystem, MultiExportFilesystem};
+use arcticwolf::shutdown::InFlight;
+use tokio_util::sync::CancellationToken;
 
 /// Bring up an admin server on a tempdir socket and hand back a clone of
 /// the shared filesystem so the test can drive per-export counters. Every
@@ -21,7 +23,7 @@ async fn spawn() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     admin::context::TestLogReloadGuard,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
+    CancellationToken,
 ) {
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("admin.sock");
@@ -31,13 +33,22 @@ async fn spawn() -> (
 
     let listener =
         admin::server::bind_admin_socket(&socket_path, 0o600).expect("bind admin socket");
-    let server = tokio::spawn(admin::serve(listener, socket_path.clone(), context));
-    (socket_path, fs, socket_dir, export_dir, log_guard, server)
+    // Detach the serve task; the returned token drives shutdown via
+    // `token.cancel()` — the same path production uses (Fix 18).
+    let token = CancellationToken::new();
+    let _server = tokio::spawn(admin::serve_with_shutdown(
+        listener,
+        socket_path.clone(),
+        context,
+        token.clone(),
+        Arc::new(InFlight::new()),
+    ));
+    (socket_path, fs, socket_dir, export_dir, log_guard, token)
 }
 
 #[tokio::test]
 async fn metrics_counts_admin_commands_and_per_export_io() {
-    let (socket_path, fs, _socket_dir, _export_dir, _log_guard, server) = spawn().await;
+    let (socket_path, fs, _socket_dir, _export_dir, _log_guard, token) = spawn().await;
 
     // A handful of admin commands. `metrics` itself is counted.
     admin::client::fetch_status(&socket_path)
@@ -105,5 +116,5 @@ async fn metrics_counts_admin_commands_and_per_export_io() {
     assert_eq!(data["server"]["rpc_requests_total"], 0);
     assert_eq!(data["server"]["rpc_errors_total"], 0);
 
-    server.abort();
+    token.cancel();
 }

@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::audit::{AuditEvent, PeerCreds, peer_creds, rfc3339_micros_now};
@@ -22,6 +24,7 @@ use super::context::AdminContext;
 use super::protocol::{decode_request, encode_response, framed};
 use super::request::AdminRequest;
 use super::response::AdminResponse;
+use crate::shutdown::{InFlight, InFlightGuard};
 
 /// Upper bound for the post-codec-error courtesy response. After a frame
 /// decode failure the socket is in an unknown state (e.g. oversize payload
@@ -139,36 +142,101 @@ pub fn bind_admin_socket(socket_path: &Path, socket_mode: u32) -> Result<UnixLis
     Ok(listener)
 }
 
-/// Run the admin server until the listener returns a fatal error.
+/// Best-effort RAII unlink of the admin socket file. Removing the socket on
+/// *every* exit from [`serve_with_shutdown`] — clean drain, an `accept()`
+/// error propagated via `?`, or a panic — is what stops a failed accept from
+/// leaking the socket file. `main.rs` has its own fallback unlink for the
+/// timeout path, but tests that call `serve_with_shutdown` directly have no
+/// such fallback and relied on this guard. (Fix 15)
+struct SocketCleanup<'a> {
+    path: &'a Path,
+}
+
+impl Drop for SocketCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path);
+    }
+}
+
+/// Run the admin server until `shutdown` is cancelled (issue #25 Phase 8).
 ///
-/// `socket_path` is held only so the file can be unlinked on a clean
-/// shutdown — graceful shutdown lands in Phase 8, so today we just log
-/// the socket path on accept loop termination.
-pub async fn serve(
+/// The accept loop races `shutdown.cancelled()` against the next
+/// `accept()`: a cancellation breaks the loop so no new connections are
+/// taken, while connections already accepted keep running. Per-connection
+/// handlers are tracked in a [`JoinSet`] and drained after the loop breaks,
+/// so an admin command in flight when the signal arrives completes rather
+/// than being cut off. The whole-daemon drain timeout lives in `main.rs`, so
+/// this await is intentionally unbounded here.
+///
+/// Known limitation (follow-up to #25): a per-connection handler parked in
+/// [`StreamExt::next`] waiting for the client's next frame does not race the
+/// cancellation token, so a *connected but idle* admin client blocks the drain
+/// until the whole-daemon timeout ceiling. Active connections drain promptly;
+/// only silent-idle ones hit the ceiling. Nudging idle connections on cancel
+/// is tracked as a follow-up.
+///
+/// On any exit the socket file is unlinked by the [`SocketCleanup`] guard.
+/// `main.rs` also unlinks it as a fallback for the timeout path (both use a
+/// best-effort remove, so the double-unlink is harmless).
+///
+/// `in_flight` is the process-wide handler counter shared by all four servers;
+/// each spawned handler holds an [`InFlightGuard`] so the drain-timeout warn
+/// can report the aggregate still-running count. (Fix 9)
+pub async fn serve_with_shutdown(
     listener: UnixListener,
     socket_path: PathBuf,
     context: Arc<AdminContext>,
+    shutdown: CancellationToken,
+    in_flight: Arc<InFlight>,
 ) -> Result<()> {
     info!("admin server accepting on {}", socket_path.display());
+    // Arm the unconditional socket-file cleanup before the first fallible
+    // `accept()` so an `accept` error (propagated via `?`) can't leak it. (Fix 15)
+    let _cleanup = SocketCleanup { path: &socket_path };
+    let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
-        let (socket, _) = listener
-            .accept()
-            .await
-            .with_context(|| format!("admin accept failed on {}", socket_path.display()))?;
-        debug!("admin connection accepted");
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accept_result = listener.accept() => {
+                let (socket, _) = accept_result
+                    .with_context(|| format!("admin accept failed on {}", socket_path.display()))?;
+                debug!("admin connection accepted");
 
-        // Extract `SO_PEERCRED` once per connection. The triple is fixed
-        // for the lifetime of the socket (the kernel snapshots it at
-        // connect time), so we don't re-query on every request.
-        let peer = peer_creds(&socket);
+                // Extract `SO_PEERCRED` once per connection. The triple is
+                // fixed for the lifetime of the socket (the kernel snapshots
+                // it at connect time), so we don't re-query on every request.
+                let peer = peer_creds(&socket);
 
-        let context = context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, context, peer).await {
-                warn!("admin connection error: {err:#}");
+                let context = context.clone();
+                // Count this handler in the shared in-flight gauge; the guard
+                // moves into the task and decrements on completion (including
+                // panic), so the gauge always settles. (Fix 9)
+                let guard = InFlightGuard::new(in_flight.clone());
+                tasks.spawn(async move {
+                    let _in_flight = guard;
+                    if let Err(err) = handle_connection(socket, context, peer).await {
+                        warn!("admin connection error: {err:#}");
+                    }
+                });
             }
-        });
+        }
     }
+
+    info!(
+        in_flight = tasks.len(),
+        "admin server shutting down, draining connections"
+    );
+    while tasks.join_next().await.is_some() {}
+
+    // Close the listener fd so the path is no longer bound, then drop the
+    // cleanup guard to unlink the socket file at a defined point (rather than
+    // at the end of scope) so the log line below reflects reality. The guard
+    // also runs on the early `?`/panic paths above, where this explicit drop
+    // is never reached.
+    drop(listener);
+    drop(_cleanup);
+    info!("admin socket {} removed", socket_path.display());
+    Ok(())
 }
 
 async fn handle_connection(
@@ -178,6 +246,10 @@ async fn handle_connection(
 ) -> Result<()> {
     let mut framed = framed(socket);
 
+    // TODO(follow-up to #25): nudge idle connections on cancel. This loop
+    // parks in `framed.next()` waiting for the client's next frame and does
+    // not race the shutdown token, so an idle admin client holds its handler
+    // (and the drain) open until the whole-daemon timeout ceiling.
     while let Some(frame) = framed.next().await {
         let bytes = match frame {
             Ok(bytes) => bytes,
@@ -551,8 +623,14 @@ mod tests {
         let listener = bind_admin_socket(&socket_path, 0o600).expect("bind admin sock");
         let (context, _export_tmp, _log_guard) = AdminContext::for_test();
         let socket_path_for_serve = socket_path.clone();
-        let server =
-            tokio::spawn(async move { serve(listener, socket_path_for_serve, context).await });
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_with_shutdown(
+            listener,
+            socket_path_for_serve,
+            context,
+            token.clone(),
+            Arc::new(InFlight::new()),
+        ));
 
         let stream = tokio::net::UnixStream::connect(&socket_path)
             .await
@@ -581,7 +659,60 @@ mod tests {
             }
         }
 
-        server.abort();
+        // Close the client so its handler task ends, then cancel and await a
+        // clean drain — the representative shutdown path (Fix 18).
+        drop(framed);
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve drains within 5s")
+            .expect("serve task joins")
+            .expect("serve returns Ok");
+    }
+
+    /// The RAII `SocketCleanup` guard is what makes `serve_with_shutdown`
+    /// unlink the socket file on *every* exit — including the `accept()`-error
+    /// `?` return that, before Fix 15, leaked the file (tests have no
+    /// `main.rs` fallback unlink). Rather than fight tokio's readiness-based
+    /// accept loop to synthesize that error path, we pin the guard's contract
+    /// directly: it removes the file on a normal drop.
+    #[test]
+    fn socket_cleanup_guard_removes_file_on_drop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("admin.sock");
+        std::fs::write(&path, b"").expect("create placeholder socket file");
+        assert!(path.exists(), "precondition: file present");
+        {
+            let _guard = SocketCleanup {
+                path: path.as_path(),
+            };
+        } // guard drops here
+        assert!(
+            !path.exists(),
+            "SocketCleanup must remove the socket file when it drops (Fix 15)",
+        );
+    }
+
+    /// The guard must also fire on the panic-unwind path, since a panicking
+    /// connection handler must not leave the socket file behind.
+    #[test]
+    fn socket_cleanup_guard_runs_on_panic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("admin.sock");
+        std::fs::write(&path, b"").expect("create placeholder socket file");
+        assert!(path.exists(), "precondition: file present");
+        let path_for_closure = path.clone();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = SocketCleanup {
+                path: path_for_closure.as_path(),
+            };
+            panic!("simulated handler panic");
+        });
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !path.exists(),
+            "SocketCleanup must remove the socket file even on a panic unwind (Fix 15)",
+        );
     }
 
     /// A codec-level frame error must still leave an audit trail. We point
@@ -604,8 +735,14 @@ mod tests {
         let audit = Arc::new(FileAuditWriter::open(&audit_path).expect("open audit writer"));
         let (context, _export_tmp, _log_guard) = AdminContext::for_test_with_audit(audit);
         let socket_path_for_serve = socket_path.clone();
-        let server =
-            tokio::spawn(async move { serve(listener, socket_path_for_serve, context).await });
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_with_shutdown(
+            listener,
+            socket_path_for_serve,
+            context,
+            token.clone(),
+            Arc::new(InFlight::new()),
+        ));
 
         let mut stream = tokio::net::UnixStream::connect(&socket_path)
             .await
@@ -630,7 +767,14 @@ mod tests {
             "frame-error event request must be null; got: {value}",
         );
 
-        server.abort();
+        // The frame-error handler has already returned (the server closed the
+        // connection), so cancel + await drains cleanly (Fix 18).
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve drains within 5s")
+            .expect("serve task joins")
+            .expect("serve returns Ok");
     }
 
     /// Poll `path` until at least `min_lines` non-empty lines are present.

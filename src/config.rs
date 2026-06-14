@@ -29,6 +29,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub admin: AdminConfig,
     pub audit: AuditConfig,
+    pub shutdown: ShutdownConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,6 +146,32 @@ pub struct AuditConfig {
     pub path: Option<PathBuf>,
 }
 
+/// Graceful-shutdown settings (issue #25 Phase 8).
+///
+/// On `SIGTERM`/`SIGINT` the daemon stops accepting new connections and
+/// waits for in-flight requests to finish before exiting. The wait is
+/// bounded by `drain_timeout_seconds`: it is a *ceiling*, not a target —
+/// a server that drains in 5ms exits in 5ms; only a stuck handler makes
+/// the daemon wait the full window. When the ceiling is hit the daemon
+/// logs a warning and exits anyway (with status 0 — a slow drain is not a
+/// failure). The section is optional; an absent `[shutdown]` block uses
+/// the 30-second default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// Maximum number of seconds to wait for in-flight requests to drain
+    /// before forcing exit. Default 30.
+    pub drain_timeout_seconds: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            drain_timeout_seconds: 30,
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -170,6 +197,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         }
     }
 }
@@ -505,6 +533,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         let err = config.validate().expect_err("empty exports must fail");
         let msg = err.to_string();
@@ -522,6 +551,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         let err = config.validate().expect_err("duplicate uid must fail");
         let msg = err.to_string();
@@ -547,6 +577,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         let err = config.validate().expect_err("duplicate name must fail");
         let msg = err.to_string();
@@ -564,6 +595,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         let err = config.validate().expect_err("uid 0 must fail");
         let msg = err.to_string();
@@ -578,6 +610,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         let err = config.validate().expect_err("relative name must fail");
         let msg = err.to_string();
@@ -614,6 +647,7 @@ mod tests {
             logging: LoggingConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            shutdown: ShutdownConfig::default(),
         };
         config.validate().expect("distinct exports must validate");
     }
@@ -914,6 +948,62 @@ path = "/srv/data"
         config.audit.enabled = true;
         config.audit.path = Some(PathBuf::from("/var/log/arcticwolf/admin-audit.jsonl"));
         config.validate().expect("enabled+path must validate");
+    }
+
+    #[test]
+    fn test_shutdown_config_defaults_when_section_absent() {
+        // Phase 8: a config file without `[shutdown]` must still parse and
+        // yield the 30-second default drain timeout. The section is opt-in.
+        let toml = r#"
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse without [shutdown]");
+        assert_eq!(config.shutdown.drain_timeout_seconds, 30);
+        config
+            .validate()
+            .expect("absent shutdown section must validate");
+    }
+
+    #[test]
+    fn test_shutdown_config_parses_explicit_value() {
+        let toml = r#"
+            [shutdown]
+            drain_timeout_seconds = 5
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let config: Config = toml::from_str(toml).expect("should parse [shutdown]");
+        assert_eq!(config.shutdown.drain_timeout_seconds, 5);
+    }
+
+    #[test]
+    fn test_shutdown_config_rejects_unknown_field() {
+        // `ShutdownConfig` carries `deny_unknown_fields`, so a typo such as
+        // `drain_timeout` instead of `drain_timeout_seconds` must fail at
+        // load time rather than be silently dropped.
+        let toml = r#"
+            [shutdown]
+            drain_timeout = 5
+
+            [[exports]]
+            name = "/data"
+            uid = 1
+            backend = "local"
+            path = "/srv/data"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown field inside [shutdown] must fail to parse"
+        );
     }
 
     #[test]
