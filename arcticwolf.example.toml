@@ -40,3 +40,21 @@ path = "/srv/nfs/backup"
 [logging]
 # Log level: "error", "warn", "info", "debug", "trace" (default: "info")
 level = "info"
+
+# Graceful shutdown (optional; omit the section to accept the defaults).
+#
+# On SIGTERM/SIGINT the daemon stops accepting new connections and waits for
+# in-flight requests to drain before exiting 0. A second signal during the
+# drain forces an immediate exit (128 + signum).
+[shutdown]
+# Maximum seconds to wait for in-flight requests to drain before forcing
+# exit. This is a CEILING, not a target: a server that drains in 5ms exits
+# in 5ms. Hitting the ceiling logs a warning but still exits 0 (a slow
+# drain is not a failure). Default: 30.
+#
+# Note: per-connection handlers do not yet check for shutdown between
+# requests, so a connected-but-idle client (one holding a connection open
+# without sending traffic) keeps its handler alive and will make the drain
+# run all the way to this ceiling. Active clients drain promptly; only
+# silent-idle ones hit the ceiling. Tracked as a follow-up to #25.
+drain_timeout_seconds = 30

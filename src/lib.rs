@@ -14,6 +14,7 @@ pub mod nfs;
 pub mod portmap;
 pub mod protocol;
 pub mod rpc;
+pub mod shutdown;
 
 // Re-export commonly used types
 pub use fsal::{FileHandle, Filesystem, LocalFilesystem, MultiExportFilesystem, NfsBackend};

@@ -80,6 +80,11 @@ tempfile = "3"
 # tests in tests/ can call the in-crate test helpers (AdminContext::for_test)
 # without duplicating the fixtures.
 arcticwolf = { path = ".", features = ["test-util"] }
+# Enable tokio's `test-util` feature (virtual-time `start_paused`/`advance`)
+# for tests only — it is NOT part of the `full` feature set used by the
+# release binary, so it lives here to keep it out of production builds. The
+# drain-timeout test runs on paused time to stay deterministic on slow CI.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 # xdrgen itself is installed as a CLI tool (see build.rs), not a crate.

@@ -61,14 +61,17 @@
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Peer credentials captured from `SO_PEERCRED` on the admin connection.
@@ -157,9 +160,22 @@ pub struct AuditEvent {
 /// file is gone) are surfaced through `tracing::warn!` rather than
 /// propagated to the caller — losing an audit line is preferable to
 /// stalling or failing an admin command on a side-channel.
+#[async_trait]
 pub trait AuditWriter: Send + Sync {
     /// Hand `event` to the writer for asynchronous recording.
     fn record(&self, event: AuditEvent);
+
+    /// Flush every queued event to its destination and stop the writer.
+    ///
+    /// Called once from `main.rs` during graceful shutdown (issue #25 Phase
+    /// 8), *after* all four server accept loops have drained — so by the
+    /// time this runs no new events are being recorded. The returned future
+    /// completes only once everything queued has reached disk.
+    ///
+    /// Implementations must be idempotent: a second call is a no-op (the
+    /// daemon calls it exactly once, but tests and a future double-shutdown
+    /// path must not panic or hang).
+    async fn shutdown(&self);
 }
 
 /// Inert audit writer. Used when `[audit] enabled = false` so the request
@@ -167,8 +183,12 @@ pub trait AuditWriter: Send + Sync {
 /// `Option` round-trip at the call site.
 pub struct NoopAuditWriter;
 
+#[async_trait]
 impl AuditWriter for NoopAuditWriter {
     fn record(&self, _event: AuditEvent) {}
+
+    /// Nothing is buffered, so shutdown returns immediately.
+    async fn shutdown(&self) {}
 }
 
 /// Audit writer backed by a JSON-lines file and a dedicated writer task.
@@ -178,9 +198,23 @@ impl AuditWriter for NoopAuditWriter {
 /// I/O, and message-passing makes the contention-free hot path explicit.
 /// Backpressure is fine via the unbounded channel: admin traffic is
 /// human-scale (operator commands), not RPC-scale.
+///
+/// Both fields are wrapped in `Option` behind a `std::sync::Mutex` so
+/// [`AuditWriter::shutdown`] can take ownership of the single sender and the
+/// writer-task handle through a shared `&self` (the writer is shared as
+/// `Arc<dyn AuditWriter>`). Taking the sender closes the channel — which is
+/// how the writer task learns to flush and exit — and taking the handle lets
+/// shutdown `.await` the task to completion. The `Mutex` is uncontended on
+/// the hot path: `record` only locks to read the sender, and admin traffic
+/// is human-scale.
 #[derive(Debug)]
 pub struct FileAuditWriter {
-    tx: mpsc::UnboundedSender<AuditEvent>,
+    /// The single channel sender. `Some` while the writer is live; `None`
+    /// after [`shutdown`](AuditWriter::shutdown) has taken and dropped it.
+    tx: Mutex<Option<mpsc::UnboundedSender<AuditEvent>>>,
+    /// Join handle for the spawned [`writer_task`]. `Some` until `shutdown`
+    /// takes it to `.await`; `None` afterwards (idempotency marker).
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl FileAuditWriter {
@@ -214,8 +248,11 @@ impl FileAuditWriter {
         let file = File::from_std(std_file);
 
         let (tx, rx) = mpsc::unbounded_channel::<AuditEvent>();
-        tokio::spawn(writer_task(file, rx));
-        Ok(Self { tx })
+        let task = tokio::spawn(writer_task(file, rx));
+        Ok(Self {
+            tx: Mutex::new(Some(tx)),
+            task: Mutex::new(Some(task)),
+        })
     }
 }
 
@@ -229,18 +266,56 @@ impl FileAuditWriter {
     fn with_dropped_receiver() -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<AuditEvent>();
         drop(rx);
-        Self { tx }
+        Self {
+            tx: Mutex::new(Some(tx)),
+            task: Mutex::new(None),
+        }
     }
 }
 
+#[async_trait]
 impl AuditWriter for FileAuditWriter {
     fn record(&self, event: AuditEvent) {
-        // The receiver lives in the spawned writer task. If that task has
-        // exited (panic, runtime shutdown, channel close on drop), there
-        // is nothing to do with the event — losing an audit record is
-        // strictly preferable to stalling or failing the admin request.
-        if let Err(err) = self.tx.send(event) {
+        let guard = self.tx.lock().unwrap_or_else(|poison| poison.into_inner());
+        // `guard` is `None` once `shutdown` has run: the sender is gone and
+        // the file is flushed, so a `record` arriving in that final teardown
+        // window is dropped silently. While the writer is live, the receiver
+        // lives in the spawned task; if that task has exited (panic, runtime
+        // shutdown, channel close on drop) the `send` errors and we drop the
+        // event — losing an audit record is strictly preferable to stalling
+        // or failing the admin request.
+        if let Some(tx) = guard.as_ref()
+            && let Err(err) = tx.send(event)
+        {
             warn!("audit: dropping event, writer channel closed: {err}");
+        }
+    }
+
+    async fn shutdown(&self) {
+        // Drop the *sole* channel sender so the writer task's `recv()`
+        // returns `None`, letting it flush its `BufWriter` and exit. Because
+        // every `Arc<dyn AuditWriter>` clone routes through this one `Mutex`,
+        // taking the Option here closes the channel no matter how many clones
+        // are still alive — we don't have to rely on every holder dropping
+        // its `Arc` first. Idempotent: after the first call the Option is
+        // `None` and the take is a cheap no-op.
+        {
+            let mut guard = self.tx.lock().unwrap_or_else(|poison| poison.into_inner());
+            guard.take();
+        }
+        // Take and await the writer task so all queued events have reached
+        // disk before we return. The second `shutdown` call finds `None`.
+        let handle = {
+            let mut guard = self
+                .task
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard.take()
+        };
+        if let Some(handle) = handle
+            && let Err(err) = handle.await
+        {
+            warn!("audit: writer task did not exit cleanly during shutdown: {err}");
         }
     }
 }
@@ -373,6 +448,61 @@ mod tests {
             value.get("error").is_none(),
             "ok result must not carry an error field",
         );
+    }
+
+    #[tokio::test]
+    async fn file_writer_shutdown_flushes_all_events() {
+        // Phase 8: `shutdown().await` must guarantee every recorded event has
+        // reached disk by the time it returns. Unlike the drop-based tests
+        // (which poll the file because the writer task can't be joined), this
+        // path joins the task explicitly, so we can read the file *once*
+        // straight afterward with no polling and see all N lines.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let writer = FileAuditWriter::open(&path).expect("open audit writer");
+        for i in 0..32 {
+            let mut event = sample_event();
+            event.duration_ms = i;
+            writer.record(event);
+        }
+        writer.shutdown().await;
+
+        let contents = std::fs::read_to_string(&path).expect("read audit file after shutdown");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            32,
+            "shutdown must flush every recorded event before returning",
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert_eq!(
+                value["duration_ms"], i as u128 as i64,
+                "events must be in order"
+            );
+        }
+
+        // Idempotency: a second shutdown must not panic or hang, and a
+        // `record` after shutdown is a silent no-op (the file is unchanged).
+        writer.shutdown().await;
+        writer.record(sample_event());
+        let after = std::fs::read_to_string(&path).expect("re-read audit file");
+        assert_eq!(
+            after.lines().filter(|l| !l.is_empty()).count(),
+            32,
+            "record after shutdown must be dropped silently",
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_writer_shutdown_returns_immediately() {
+        // The inert writer buffers nothing, so shutdown is a no-op that must
+        // resolve without blocking. Bound it so a regression (e.g. someone
+        // making it await something) surfaces as a failure, not a hang.
+        let w = NoopAuditWriter;
+        tokio::time::timeout(Duration::from_secs(1), w.shutdown())
+            .await
+            .expect("noop shutdown must return immediately");
     }
 
     #[tokio::test]

@@ -7,12 +7,15 @@ use bytes::{BufMut, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::fsal::{ExportRegistry, NfsBackend};
 use crate::metrics::Metrics;
 use crate::portmap::Registry;
 use crate::protocol::v3::rpc::{RpcMessage, rpc_call_msg};
+use crate::shutdown::{InFlight, InFlightGuard};
 
 /// RPC server handling TCP connections with record marking
 ///
@@ -56,31 +59,88 @@ impl RpcServer {
         Ok(self.listener.local_addr()?.port())
     }
 
-    /// Start accepting connections and serving RPC requests.
-    pub async fn serve(&self) -> Result<()> {
+    /// Human-readable label for the single RPC program this instance serves,
+    /// derived from `allowed_programs`. Used only for shutdown log lines.
+    fn service_label(&self) -> &'static str {
+        match self.allowed_programs.first().copied() {
+            Some(100000) => "portmap",
+            Some(100005) => "mount",
+            Some(100003) => "nfs",
+            _ => "rpc",
+        }
+    }
+
+    /// Start accepting connections and serving RPC requests until `shutdown`
+    /// is cancelled (issue #25 Phase 8).
+    ///
+    /// The accept loop races `shutdown.cancelled()` against the next
+    /// `accept()`: a cancellation breaks the loop so no new connections are
+    /// taken, while connections already accepted continue to run. Every
+    /// per-connection handler is tracked in a [`JoinSet`]; after the loop
+    /// breaks we await the set so in-flight requests drain before returning.
+    /// The whole-daemon drain timeout lives in `main.rs`, so this await is
+    /// intentionally unbounded here.
+    ///
+    /// Known limitation (follow-up to #25): per-connection handlers do not
+    /// currently check `shutdown` between requests, so a *connected but idle*
+    /// client (no traffic, handler parked in `read_exact`) keeps its task
+    /// alive and blocks the drain until the whole-daemon timeout ceiling fires.
+    /// Active connections drain promptly; only silent-idle ones hit the
+    /// ceiling. Nudging idle connections on cancel is tracked as a follow-up.
+    ///
+    /// `in_flight` is the process-wide handler counter shared by all four
+    /// servers; each spawned handler holds an [`InFlightGuard`] so the
+    /// drain-timeout warn can report the aggregate still-running count. (Fix 9)
+    pub async fn serve(&self, shutdown: CancellationToken, in_flight: Arc<InFlight>) -> Result<()> {
+        let label = self.service_label();
         info!(
             "RPC server listening on {} for programs {:?}",
             self.listener.local_addr()?,
             self.allowed_programs
         );
 
+        let mut tasks: JoinSet<()> = JoinSet::new();
         loop {
-            let (socket, peer_addr) = self.listener.accept().await?;
-            info!("New connection from {}", peer_addr);
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                accept_result = self.listener.accept() => {
+                    let (socket, peer_addr) = accept_result?;
+                    info!("New connection from {}", peer_addr);
 
-            let registry = self.registry.clone();
-            let filesystem = self.filesystem.clone();
-            let allowed_programs = self.allowed_programs.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(socket, registry, filesystem, &allowed_programs, metrics)
+                    let registry = self.registry.clone();
+                    let filesystem = self.filesystem.clone();
+                    let allowed_programs = self.allowed_programs.clone();
+                    let metrics = self.metrics.clone();
+                    // Count this handler in the shared in-flight gauge; the
+                    // guard moves into the task and decrements on completion
+                    // (including panic), so the gauge always settles. (Fix 9)
+                    let guard = InFlightGuard::new(in_flight.clone());
+                    tasks.spawn(async move {
+                        let _in_flight = guard;
+                        if let Err(e) = handle_connection(
+                            socket,
+                            registry,
+                            filesystem,
+                            &allowed_programs,
+                            metrics,
+                        )
                         .await
-                {
-                    error!("Connection error from {}: {}", peer_addr, e);
+                        {
+                            error!("Connection error from {}: {}", peer_addr, e);
+                        }
+                    });
                 }
-            });
+            }
         }
+
+        info!(
+            server = label,
+            in_flight = tasks.len(),
+            "shutdown requested, draining in-flight requests"
+        );
+        while tasks.join_next().await.is_some() {}
+        info!(server = label, "drain complete");
+        Ok(())
     }
 }
 
@@ -95,6 +155,10 @@ async fn handle_connection(
     let mut buffer = BytesMut::with_capacity(8192);
 
     loop {
+        // TODO(follow-up to #25): nudge idle connections on cancel. This loop
+        // blocks in `read_exact` waiting for the next request; it does not race
+        // the shutdown token, so an idle client holds its handler (and the
+        // drain) open until the whole-daemon timeout ceiling.
         // Read record marking fragment header (4 bytes)
         let mut header = [0u8; 4];
         if socket.read_exact(&mut header).await.is_err() {
