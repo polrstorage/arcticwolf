@@ -35,6 +35,12 @@ POSIX read/write suite. Build inputs live under `nfstest/`:
 
 Override the POSIX test cases with `make nfstest TESTCASE=read,write`.
 
+## Git Conventions
+
+Every commit must be signed off (Developer Certificate of Origin). Always
+create commits with `git commit -s` so a `Signed-off-by:` trailer is added.
+When amending, use `git commit --amend -s`.
+
 ## Architecture
 
 ### Layer Structure
