@@ -1,0 +1,28 @@
+# Arctic Wolf configuration used by the Apple-container integration test.
+#
+# Mirrors arcticwolf.example.toml but pins logging to debug and uses export
+# paths that the server image (nfstest/server/Dockerfile) creates at build
+# time. The POSIX suite drives /data (rw); /backup is mounted read_only so
+# the read-only enforcement path is exercised against a real Linux client.
+
+[server]
+bind_address = "0.0.0.0"
+nfs_port = 2049
+mount_port = 0
+
+[[exports]]
+name = "/data"
+uid = 1
+read_only = false
+backend = "local"
+path = "/srv/nfs/data"
+
+[[exports]]
+name = "/backup"
+uid = 2
+read_only = true
+backend = "local"
+path = "/srv/nfs/backup"
+
+[logging]
+level = "debug"

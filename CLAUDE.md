@@ -11,11 +11,29 @@ Arctic Wolf is a Rust-based NFSv3 server implementing RFC 1813 (NFSv3), RFC 5531
 **Important:** Always use `make` commands for building and testing. Do not run `cargo` or `earthly` directly.
 
 ```bash
-make build    # Build in container
-make test     # Run unit tests
-make lint     # Run clippy + rustfmt
-make nfstest  # Full integration tests with VM
+make build    # Build in container (Earthly)
+make test     # Run unit tests (Earthly)
+make lint     # Run clippy + rustfmt (Earthly)
+make nfstest  # Full NFS integration test on Apple `container`
 ```
+
+### Integration test (Apple `container`)
+
+`make nfstest` runs the end-to-end NFSv3 test entirely on Apple's `container`
+runtime — no Docker, Earthly, or QEMU. It boots the Arctic Wolf server and an
+`nfstest_posix` client as two containers on the default `192.168.64.0/24`
+bridge; the client mounts the server's `/data` export and runs the upstream
+POSIX read/write suite. Build inputs live under `nfstest/`:
+
+- `nfstest/server/Dockerfile` — server image (`container build`).
+- `nfstest/client/Dockerfile` — nfstest client image.
+- `nfstest/kernel/` — a Linux kernel `Image` rebuilt from Apple's own kernel
+  config with `CONFIG_NFS_FS=y` (the default Apple kernel has no NFS client).
+  `make nfstest-kernel` builds it once and caches it in `nfstest/kernel/out/`.
+- `nfstest/scripts/nfstest.py` — orchestration (build / start-server /
+  run-test / stop) driven via the `container` CLI.
+
+Override the POSIX test cases with `make nfstest TESTCASE=read,write`.
 
 ## Architecture
 

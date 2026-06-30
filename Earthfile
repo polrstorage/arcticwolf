@@ -81,42 +81,7 @@ image:
     ENTRYPOINT ["./target/release/arcticwolf"]
     SAVE IMAGE ${IMAGE_REPO}/arcticwolf:${IMAGE_TAG}
 
-# earthly +server-docker
-# Build Docker image using the same build environment
-server-docker:
-    ARG IMAGE_NAME=arcticwolf
-    ARG IMAGE_TAG=latest
-    FROM +common
-    RUN cargo build
-    ENV RUST_LOG=debug
-    EXPOSE 111 2049
-    ENTRYPOINT ["./target/debug/arcticwolf"]
-    SAVE IMAGE ${IMAGE_NAME}:${IMAGE_TAG}
-
-# earthly +client-vm
-# Build Alpine VM image for integration testing
-client-vm:
-    ARG VM_OUTPUT_DIR=build/nfstest/vm
-    ARG VM_IMAGE_NAME=vm.qcow2
-    ARG CIDATA_NAME=cidata.iso
-    FROM alpine:3.19
-    RUN apk add --no-cache qemu-img cdrkit curl
-
-    WORKDIR /build
-
-    # Download Alpine nocloud image (x86_64 with cloud-init)
-    RUN curl -L -o vm.qcow2 \
-        https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/cloud/nocloud_alpine-3.19.0-x86_64-bios-cloudinit-r0.qcow2
-
-    # Resize image to have more space
-    RUN qemu-img resize vm.qcow2 2G
-
-    # Create cloud-init ISO (NoCloud datasource)
-    RUN mkdir -p cidata
-    COPY nfstest/vm/user-data ./cidata/user-data
-    RUN echo "instance-id: nfstest-vm" > cidata/meta-data
-    RUN genisoimage -output cidata.iso -volid cidata -joliet -rock cidata/
-
-    # Export VM artifacts to local build directory
-    SAVE ARTIFACT vm.qcow2 AS LOCAL ${VM_OUTPUT_DIR}/${VM_IMAGE_NAME}
-    SAVE ARTIFACT cidata.iso AS LOCAL ${VM_OUTPUT_DIR}/${CIDATA_NAME}
+# The local NFS integration test no longer uses Earthly. It runs entirely on
+# Apple `container` (server + nfstest client + custom NFS-enabled kernel) and
+# is driven by `make nfstest` -> nfstest/scripts/nfstest.py. See
+# nfstest/server, nfstest/client, and nfstest/kernel for the build inputs.
