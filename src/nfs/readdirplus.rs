@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{COOKIEVERFSIZE, NfsMessage, cookieverf3, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS READDIRPLUS request
 ///
@@ -31,6 +32,7 @@ pub async fn handle_readdirplus(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS READDIRPLUS: xid={}", xid);
 
@@ -45,15 +47,28 @@ pub async fn handle_readdirplus(
         args.maxcount
     );
 
-    // Get directory attributes
-    let dir_attr = match filesystem.getattr(&args.dir.0).await {
-        Ok(attr) => NfsMessage::fsal_to_fattr3(&attr),
-        Err(e) => {
-            warn!("READDIRPLUS failed: getattr error: {}", e);
-            let res_data = NfsMessage::create_readdirplus_error_response(nfsstat3::NFS3ERR_IO)?;
+    // Listing needs read permission on the directory. Handing out the
+    // entries' handles and attributes is what LOOKUP does, so that part
+    // also needs search permission: without it the reply carries names
+    // only, and reading an entry still has to go through LOOKUP.
+    let dir_attrs = match super::access_check::require(
+        filesystem,
+        &args.dir.0,
+        cred,
+        super::perm::READ,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("READDIRPLUS denied: {:?}", status);
+            let res_data = NfsMessage::create_readdirplus_error_response(status)?;
             return RpcMessage::create_success_reply_with_data(xid, res_data);
         }
     };
+    let who = super::access_check::identity_for(filesystem, &args.dir.0, cred);
+    let with_handles = super::perm::check(&dir_attrs, &who, super::perm::EXEC);
+    let dir_attr = NfsMessage::fsal_to_fattr3(&dir_attrs);
 
     // Read directory entries
     // Use dircount as the count parameter (RFC 1813 says dircount is for entry names)
@@ -107,6 +122,12 @@ pub async fn handle_readdirplus(
         name.pack(&mut buf)?;
 
         cookie_counter.pack(&mut buf)?;
+
+        if !with_handles {
+            false.pack(&mut buf)?; // post_op_attr: no attributes
+            false.pack(&mut buf)?; // post_op_fh3: no handle
+            continue;
+        }
 
         // post_op_attr: Get attributes for this entry
         // We need to lookup the file handle first
@@ -211,7 +232,7 @@ mod tests {
         32768u32.pack(&mut args_buf).unwrap();
 
         // Call handler
-        let result = handle_readdirplus(1, &args_buf, &fs).await;
+        let result = handle_readdirplus(1, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -219,5 +240,82 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// The entries of a READDIRPLUS reply as (name, has attributes, has
+    /// handle), skipping the 24-byte accepted RPC header.
+    fn entries_of(reply: &[u8]) -> Vec<(String, bool, bool)> {
+        use crate::protocol::v3::nfs::{fattr3, fhandle3, filename3};
+        use std::io::{Cursor, Read};
+        use xdr_codec::Unpack;
+        let mut cur = Cursor::new(&reply[24..]);
+        assert_eq!(i32::unpack(&mut cur).unwrap().0, nfsstat3::NFS3_OK as i32);
+        if bool::unpack(&mut cur).unwrap().0 {
+            fattr3::unpack(&mut cur).unwrap();
+        }
+        cur.read_exact(&mut [0u8; COOKIEVERFSIZE as usize]).unwrap();
+        let mut entries = Vec::new();
+        while bool::unpack(&mut cur).unwrap().0 {
+            u64::unpack(&mut cur).unwrap(); // fileid
+            let name = filename3::unpack(&mut cur).unwrap().0.0;
+            u64::unpack(&mut cur).unwrap(); // cookie
+            let has_attrs = bool::unpack(&mut cur).unwrap().0;
+            if has_attrs {
+                fattr3::unpack(&mut cur).unwrap();
+            }
+            let has_handle = bool::unpack(&mut cur).unwrap().0;
+            if has_handle {
+                fhandle3::unpack(&mut cur).unwrap();
+            }
+            entries.push((name, has_attrs, has_handle));
+        }
+        entries
+    }
+
+    #[tokio::test]
+    async fn test_readdirplus_without_search_permission_returns_names_only() {
+        use crate::fsal::Filesystem;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use xdr_codec::Pack;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let dir = temp_dir.path().join("listonly");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("f"), b"secret").unwrap();
+        fs::set_permissions(&dir, PermissionsExt::from_mode(0o744)).unwrap();
+        let fs = LocalFilesystem::new(temp_dir.path(), 1).unwrap();
+        let root = fs.root_file_handle();
+        let dir_handle = fs.lookup(&root, "listonly").await.unwrap();
+        let owner = fs::metadata(&dir).unwrap().uid();
+        let stranger = Credentials::sys(owner.wrapping_add(1).max(1), 65000);
+
+        let mut args_buf = Vec::new();
+        crate::protocol::v3::nfs::fhandle3(dir_handle)
+            .pack(&mut args_buf)
+            .unwrap();
+        0u64.pack(&mut args_buf).unwrap(); // cookie
+        cookieverf3([0u8; COOKIEVERFSIZE as usize])
+            .pack(&mut args_buf)
+            .unwrap();
+        1024u32.pack(&mut args_buf).unwrap(); // dircount
+        8192u32.pack(&mut args_buf).unwrap(); // maxcount
+
+        // With search permission the entries come with handles and
+        // attributes ...
+        let reply = handle_readdirplus(1, &args_buf, &fs, &Credentials::sys(owner, 65000))
+            .await
+            .unwrap();
+        let entries = entries_of(&reply);
+        assert!(
+            entries.iter().any(|(n, a, h)| n == "f" && *a && *h),
+            "{entries:?}"
+        );
+
+        // ... a caller who may only read the directory gets the names.
+        let reply = handle_readdirplus(2, &args_buf, &fs, &stranger)
+            .await
+            .unwrap();
+        let entries = entries_of(&reply);
+        assert!(entries.iter().any(|(n, _, _)| n == "f"), "{entries:?}");
+        assert!(entries.iter().all(|(_, a, h)| !a && !h), "{entries:?}");
     }
 }

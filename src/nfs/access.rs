@@ -9,14 +9,10 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
-// Access mode bits (from RFC 1813)
-const ACCESS3_READ: u32 = 0x0001;
-const ACCESS3_LOOKUP: u32 = 0x0002;
-const ACCESS3_MODIFY: u32 = 0x0004;
-const ACCESS3_EXTEND: u32 = 0x0008;
-const ACCESS3_DELETE: u32 = 0x0010;
-const ACCESS3_EXECUTE: u32 = 0x0020;
+use super::access_check::identity_for;
+use super::perm::access_bits;
 
 /// Handle NFS ACCESS procedure (procedure 4)
 ///
@@ -33,6 +29,7 @@ pub async fn handle_access(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS ACCESS called (xid={})", xid);
 
@@ -69,34 +66,12 @@ pub async fn handle_access(
         }
     };
 
-    // For simplicity, grant all requested permissions
-    // In a production implementation, this would check actual file permissions
-    // against the user's UID/GID from the RPC credentials
-    let mut granted_access = 0u32;
-
-    // Check each requested access bit
-    if args.access & ACCESS3_READ != 0 {
-        granted_access |= ACCESS3_READ;
-    }
-    if args.access & ACCESS3_LOOKUP != 0 {
-        // LOOKUP is only valid for directories
-        use crate::fsal::FileType;
-        if file_attrs.ftype == FileType::Directory {
-            granted_access |= ACCESS3_LOOKUP;
-        }
-    }
-    if args.access & ACCESS3_MODIFY != 0 {
-        granted_access |= ACCESS3_MODIFY;
-    }
-    if args.access & ACCESS3_EXTEND != 0 {
-        granted_access |= ACCESS3_EXTEND;
-    }
-    if args.access & ACCESS3_DELETE != 0 {
-        granted_access |= ACCESS3_DELETE;
-    }
-    if args.access & ACCESS3_EXECUTE != 0 {
-        granted_access |= ACCESS3_EXECUTE;
-    }
+    // Evaluate the mode bits against the squashed caller identity. The
+    // client caches this answer, so write-class bits are also withheld on
+    // read-only exports instead of letting the client discover ROFS later.
+    let who = identity_for(filesystem, &args.object.0, cred);
+    let read_only = filesystem.is_read_only(&args.object.0);
+    let granted_access = access_bits(&file_attrs, &who, args.access, read_only);
 
     debug!(
         "ACCESS success: requested={:#06x}, granted={:#06x}",
@@ -129,6 +104,7 @@ pub async fn handle_access(
 
 #[cfg(test)]
 mod tests {
+    use super::super::perm::{ACCESS3_LOOKUP, ACCESS3_MODIFY, ACCESS3_READ};
     use super::*;
     use crate::fsal::{BackendConfig, Filesystem};
     use std::fs;
@@ -163,7 +139,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_access(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "ACCESS should succeed for existing file");
 
@@ -196,7 +172,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_access(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "ACCESS should succeed for directory");
     }
@@ -223,7 +199,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call ACCESS
-        let result = handle_access(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_access(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

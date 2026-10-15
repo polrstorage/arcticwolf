@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{COOKIEVERFSIZE, NfsMessage, cookieverf3, fileid3, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS READDIR request
 ///
@@ -23,6 +24,7 @@ pub async fn handle_readdir(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS READDIR: xid={}", xid);
 
@@ -45,6 +47,15 @@ pub async fn handle_readdir(
             return RpcMessage::create_success_reply_with_data(xid, res_data);
         }
     };
+
+    // Listing needs read permission on the directory.
+    if let Err(status) =
+        super::access_check::require(filesystem, &args.dir.0, cred, super::perm::READ).await
+    {
+        debug!("READDIR denied: {:?}", status);
+        let res_data = NfsMessage::create_readdir_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Read directory entries
     let (entries, eof) = match filesystem

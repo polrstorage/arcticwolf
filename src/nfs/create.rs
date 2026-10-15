@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS CREATE procedure (procedure 8)
 ///
@@ -25,6 +26,7 @@ pub async fn handle_create(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS CREATE called (xid={})", xid);
     debug!(
@@ -46,6 +48,20 @@ pub async fn handle_create(
     // Reject creates against handles whose export is configured read_only.
     if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
         debug!("CREATE denied: parent dir belongs to a read-only export");
+        let res_data = NfsMessage::create_create_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
+
+    // Creating an entry needs write + search permission on the directory.
+    if let Err(status) = super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        debug!("CREATE denied: {:?}", status);
         let res_data = NfsMessage::create_create_error_response(status)?;
         return RpcMessage::create_success_reply_with_data(xid, res_data);
     }
@@ -227,7 +243,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call CREATE
-        let result = handle_create(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_create(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "CREATE should succeed");
 
@@ -281,7 +297,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call CREATE - should succeed (UNCHECKED allows overwriting)
-        let result = handle_create(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_create(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

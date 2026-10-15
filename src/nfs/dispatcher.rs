@@ -4,8 +4,9 @@
 //
 // The dispatcher takes `&dyn NfsBackend` so each handler can borrow the
 // trait view it actually needs: most handlers only touch `Filesystem`,
-// while the write-class handlers additionally consult `ExportRegistry`
-// via `check_writable` to enforce per-export `read_only` configuration.
+// while the handlers additionally consult `ExportRegistry` via
+// `access_check` to enforce per-export `read_only` and squash
+// configuration against the caller's credentials.
 
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
@@ -14,6 +15,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::metrics::Metrics;
 use crate::protocol::v3::rpc::rpc_call_msg;
+use crate::rpc::auth::Credentials;
 
 use super::{
     access, commit, create, fsinfo, fsstat, getattr, link, lookup, mkdir, mknod, null, pathconf,
@@ -30,6 +32,9 @@ use super::{
 ///   bumped on entry (Phase 7). The server-wide `rpc_errors_total` is bumped
 ///   centrally in `crate::rpc::server` when this function returns `Err`, so
 ///   it is not touched here.
+/// * `cred` - Caller identity from the RPC credential; each handler maps it
+///   through the export's squash policy and checks POSIX permissions
+///   (`access_check` / `perm`) before touching the backend.
 ///
 /// # Returns
 /// Serialized RPC reply message
@@ -38,6 +43,7 @@ pub async fn dispatch(
     args_data: &[u8],
     backend: &dyn NfsBackend,
     metrics: &Metrics,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     let procedure = call.proc_;
     let xid = call.xid;
@@ -66,90 +72,90 @@ pub async fn dispatch(
         }
         1 => {
             // GETATTR - get file attributes
-            getattr::handle_getattr(xid, args_data, backend).await
+            getattr::handle_getattr(xid, args_data, backend, cred).await
         }
         2 => {
             // SETATTR - set file attributes
-            setattr::handle_setattr(xid, args_data, backend).await
+            setattr::handle_setattr(xid, args_data, backend, cred).await
         }
         3 => {
             // LOOKUP - lookup filename
-            lookup::handle_lookup(xid, args_data, backend).await
+            lookup::handle_lookup(xid, args_data, backend, cred).await
         }
         4 => {
             // ACCESS - check file access permissions
-            access::handle_access(xid, args_data, backend).await
+            access::handle_access(xid, args_data, backend, cred).await
         }
         5 => {
             // READLINK - read symbolic link
-            readlink::handle_readlink(xid, args_data, backend).await
+            readlink::handle_readlink(xid, args_data, backend, cred).await
         }
         6 => {
             // READ - read from file
-            read::handle_read(xid, args_data, backend).await
+            read::handle_read(xid, args_data, backend, cred).await
         }
         16 => {
             // READDIR - read directory entries
-            readdir::handle_readdir(xid, args_data, backend).await
+            readdir::handle_readdir(xid, args_data, backend, cred).await
         }
         18 => {
             // FSSTAT - get filesystem statistics
-            fsstat::handle_fsstat(xid, args_data, backend).await
+            fsstat::handle_fsstat(xid, args_data, backend, cred).await
         }
         19 => {
             // FSINFO - get filesystem information
-            fsinfo::handle_fsinfo(xid, args_data, backend).await
+            fsinfo::handle_fsinfo(xid, args_data, backend, cred).await
         }
         20 => {
             // PATHCONF - get filesystem path configuration
-            pathconf::handle_pathconf(xid, args_data, backend).await
+            pathconf::handle_pathconf(xid, args_data, backend, cred).await
         }
         17 => {
             // READDIRPLUS - read directory entries with attributes
-            readdirplus::handle_readdirplus(xid, args_data, backend).await
+            readdirplus::handle_readdirplus(xid, args_data, backend, cred).await
         }
         7 => {
             // WRITE - write to file
-            write::handle_write(xid, args_data, backend).await
+            write::handle_write(xid, args_data, backend, cred).await
         }
         8 => {
             // CREATE - create file
-            create::handle_create(xid, args_data, backend).await
+            create::handle_create(xid, args_data, backend, cred).await
         }
         9 => {
             // MKDIR - create directory
-            mkdir::handle_mkdir(xid, args_data, backend).await
+            mkdir::handle_mkdir(xid, args_data, backend, cred).await
         }
         10 => {
             // SYMLINK - create symbolic link
-            symlink::handle_symlink(xid, args_data, backend).await
+            symlink::handle_symlink(xid, args_data, backend, cred).await
         }
         11 => {
             // MKNOD - create special file
-            mknod::handle_mknod(xid, args_data, backend).await
+            mknod::handle_mknod(xid, args_data, backend, cred).await
         }
         12 => {
             // REMOVE - remove file
-            remove::handle_remove(xid, args_data, backend).await
+            remove::handle_remove(xid, args_data, backend, cred).await
         }
         13 => {
             // RMDIR - remove directory
-            rmdir::handle_rmdir(xid, args_data, backend).await
+            rmdir::handle_rmdir(xid, args_data, backend, cred).await
         }
         14 => {
             // RENAME - rename file or directory
-            rename::handle_rename(xid, args_data, backend).await
+            rename::handle_rename(xid, args_data, backend, cred).await
         }
         15 => {
             // LINK - create hard link
-            link::handle_link(xid, args_data, backend).await
+            link::handle_link(xid, args_data, backend, cred).await
         }
         21 => {
             // COMMIT - commit cached writes to stable storage.
             // Intentionally not gated by check_writable: Linux nfs-utils
             // serves COMMIT on read-only exports too, so writes that race
             // with an export flip don't surface as ROFS at sync time.
-            commit::handle_commit(xid, args_data, backend).await
+            commit::handle_commit(xid, args_data, backend, cred).await
         }
         _ => {
             warn!("Unknown NFS procedure: {}", procedure);
@@ -225,11 +231,11 @@ mod tests {
         // exactly the contract under test.
         for _ in 0..3 {
             let call = make_nfs_call(1);
-            let _ = dispatch(&call, &[], &backend, &metrics).await;
+            let _ = dispatch(&call, &[], &backend, &metrics, &Credentials::root()).await;
         }
         for _ in 0..2 {
             let call = make_nfs_call(6);
-            let _ = dispatch(&call, &[], &backend, &metrics).await;
+            let _ = dispatch(&call, &[], &backend, &metrics, &Credentials::root()).await;
         }
 
         assert_eq!(metrics.nfs_ops.getattr.load(Relaxed), 3);
@@ -238,7 +244,7 @@ mod tests {
 
         // NULL (proc 0) is the one path that succeeds with empty args.
         let call = make_nfs_call(0);
-        dispatch(&call, &[], &backend, &metrics)
+        dispatch(&call, &[], &backend, &metrics, &Credentials::root())
             .await
             .expect("NULL must succeed");
         assert_eq!(metrics.nfs_ops.null.load(Relaxed), 1);
@@ -261,7 +267,7 @@ mod tests {
             buf.extend_from_slice(&0u32.to_be_bytes());
         }
         let call = RpcMessage::deserialize_call(&buf).expect("deserialize");
-        let result = dispatch(&call, &[], &backend, &metrics).await;
+        let result = dispatch(&call, &[], &backend, &metrics, &Credentials::root()).await;
         assert!(result.is_err(), "NFS v2 must be rejected");
         // Version check precedes the counter bump, so nothing is recorded.
         assert_eq!(metrics.nfs_ops.getattr.load(Relaxed), 0);

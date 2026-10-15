@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use crate::fsal::{FileType, NfsBackend};
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS MKNOD procedure (11)
 ///
@@ -30,6 +31,7 @@ pub async fn handle_mknod(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS MKNOD: xid={}", xid);
 
@@ -46,6 +48,19 @@ pub async fn handle_mknod(
     // Reject mknod against handles whose export is configured read_only.
     if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
         debug!("MKNOD denied: parent dir belongs to a read-only export");
+        return create_mknod_response(xid, status, None, None, None);
+    }
+
+    // Creating an entry needs write + search permission on the directory.
+    if let Err(status) = super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        debug!("MKNOD denied: {:?}", status);
         return create_mknod_response(xid, status, None, None, None);
     }
 
@@ -81,6 +96,15 @@ pub async fn handle_mknod(
             (FileType::NamedPipe, mode, (0, 0))
         }
     };
+
+    // Device nodes need CAP_MKNOD; only (unsquashed) root gets them.
+    if matches!(file_type, FileType::CharDevice | FileType::BlockDevice)
+        && !super::access_check::identity_for(filesystem, &args.where_dir.0, cred).is_superuser()
+    {
+        debug!("MKNOD denied: device node requested by non-root caller");
+        let dir_attr = dir_before.map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+        return create_mknod_response(xid, nfsstat3::NFS3ERR_PERM, None, None, dir_attr);
+    }
 
     let name = &args.name.0;
 
