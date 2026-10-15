@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS SETATTR procedure (procedure 2)
 ///
@@ -26,6 +27,7 @@ pub async fn handle_setattr(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS SETATTR called (xid={})", xid);
 
@@ -41,13 +43,20 @@ pub async fn handle_setattr(
         return RpcMessage::create_success_reply_with_data(xid, res_data);
     }
 
-    // Get file attributes before setattr (for wcc_data)
-    let before_attrs = filesystem.getattr(&args.object.0).await.ok();
+    // Attributes before the change: the guard and the permission checks
+    // below need them, so an object we cannot stat is not touched at all.
+    let before = match filesystem.getattr(&args.object.0).await {
+        Ok(attrs) => attrs,
+        Err(e) => {
+            debug!("SETATTR: failed to get attributes: {}", e);
+            let status = super::error::classify_handle_error(&e);
+            let res_data = NfsMessage::create_setattr_error_response(status)?;
+            return RpcMessage::create_success_reply_with_data(xid, res_data);
+        }
+    };
 
     // Check guard if requested (guard is a union: CHECK with ctime or DONT_CHECK)
-    if let crate::protocol::v3::nfs::sattrguard3::CHECK(guard_ctime) = &args.guard
-        && let Some(ref before) = before_attrs
-    {
+    if let crate::protocol::v3::nfs::sattrguard3::CHECK(guard_ctime) = &args.guard {
         // Compare ctime - if different, file was modified
         if before.ctime.seconds != guard_ctime.seconds as u64
             || before.ctime.nseconds != guard_ctime.nseconds
@@ -61,6 +70,32 @@ pub async fn handle_setattr(
 
     // Apply attribute changes
     let new_attrs = &args.new_attributes;
+
+    let want_mode = matches!(
+        new_attrs.mode,
+        crate::protocol::v3::nfs::set_mode3::SET_MODE(_)
+    );
+    let want_size = matches!(
+        new_attrs.size,
+        crate::protocol::v3::nfs::set_size3::SET_SIZE(_)
+    );
+    let uid = match &new_attrs.uid {
+        crate::protocol::v3::nfs::set_uid3::SET_UID(u) => Some(*u),
+        _ => None,
+    };
+    let gid = match &new_attrs.gid {
+        crate::protocol::v3::nfs::set_gid3::SET_GID(g) => Some(*g),
+        _ => None,
+    };
+
+    // chmod/chown need ownership (or root), truncate needs write
+    // permission; see `perm::check_setattr` for the exact rules.
+    let who = super::access_check::identity_for(filesystem, &args.object.0, cred);
+    if let Err(status) = super::perm::check_setattr(&before, &who, want_mode, uid, gid, want_size) {
+        debug!("SETATTR denied: {:?}", status);
+        let res_data = NfsMessage::create_setattr_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Handle size change (truncate/extend)
     if let crate::protocol::v3::nfs::set_size3::SET_SIZE(new_size) = &new_attrs.size {
@@ -101,15 +136,6 @@ pub async fn handle_setattr(
     }
 
     // Handle uid/gid change
-    let uid = match &new_attrs.uid {
-        crate::protocol::v3::nfs::set_uid3::SET_UID(u) => Some(*u),
-        _ => None,
-    };
-    let gid = match &new_attrs.gid {
-        crate::protocol::v3::nfs::set_gid3::SET_GID(g) => Some(*g),
-        _ => None,
-    };
-
     if uid.is_some() || gid.is_some() {
         debug!("SETATTR: setting uid={:?}, gid={:?}", uid, gid);
 
@@ -226,7 +252,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call SETATTR
-        let result = handle_setattr(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_setattr(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "SETATTR should succeed");
 
@@ -286,8 +312,67 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call SETATTR
-        let result = handle_setattr(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_setattr(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "SETATTR should succeed");
+    }
+
+    /// SETATTR3args that only change the uid, with no guard. xdrgen cannot
+    /// pack the `default` arms, so the DONT_SET / DONT_CHANGE / DONT_CHECK
+    /// discriminators are written by hand.
+    fn chown_args(handle: &crate::fsal::FileHandle, uid: u32) -> Vec<u8> {
+        use crate::protocol::v3::nfs::{fhandle3, set_uid3};
+        use xdr_codec::Pack;
+        let mut buf = Vec::new();
+        fhandle3(handle.clone()).pack(&mut buf).unwrap();
+        0i32.pack(&mut buf).unwrap(); // mode: DONT_SET_MODE
+        set_uid3::SET_UID(uid).pack(&mut buf).unwrap();
+        0i32.pack(&mut buf).unwrap(); // gid: DONT_SET_GID
+        0i32.pack(&mut buf).unwrap(); // size: DONT_SET_SIZE
+        0i32.pack(&mut buf).unwrap(); // atime: DONT_CHANGE
+        0i32.pack(&mut buf).unwrap(); // mtime: DONT_CHANGE
+        0i32.pack(&mut buf).unwrap(); // guard: DONT_CHECK
+        buf
+    }
+
+    /// NFS status of a reply: it follows the 24-byte accepted RPC header.
+    fn status_of(reply: &[u8]) -> i32 {
+        i32::from_be_bytes(reply[24..28].try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_setattr_dangling_symlink_still_checks_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = TempDir::new().unwrap();
+        let config = BackendConfig::Local {
+            path: temp_dir.path().to_path_buf(),
+        };
+        let fs = config.create_filesystem(1).unwrap();
+        let link = temp_dir.path().join("dangle");
+        std::os::unix::fs::symlink("/nowhere", &link).unwrap();
+        let root_handle = fs.root_file_handle();
+        let handle = fs.lookup(&root_handle, "dangle").await.unwrap();
+        let owner = fs::symlink_metadata(&link).unwrap().uid();
+        let stranger = Credentials::sys(owner.wrapping_add(1).max(1), 65000);
+
+        // The link has an owner of its own, and a stranger may not change it.
+        let reply = handle_setattr(1, &chown_args(&handle, 0), fs.as_ref(), &stranger)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&reply), nfsstat3::NFS3ERR_PERM as i32);
+        assert_eq!(fs::symlink_metadata(&link).unwrap().uid(), owner);
+
+        // An object that cannot be stat'ed is not touched either.
+        fs::remove_file(&link).unwrap();
+        let reply = handle_setattr(
+            2,
+            &chown_args(&handle, 0),
+            fs.as_ref(),
+            &Credentials::root(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status_of(&reply), nfsstat3::NFS3ERR_STALE as i32);
+        assert!(!link.exists() && fs::symlink_metadata(&link).is_err());
     }
 }

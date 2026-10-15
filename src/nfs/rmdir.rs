@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS RMDIR request
 ///
@@ -26,6 +27,7 @@ pub async fn handle_rmdir(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS RMDIR: xid={}", xid);
 
@@ -42,6 +44,30 @@ pub async fn handle_rmdir(
     if let Err(status) = super::access_check::check_writable(filesystem, &args.dir.0) {
         debug!("RMDIR denied: parent dir belongs to a read-only export");
         return create_rmdir_response(xid, status, None);
+    }
+
+    // Removing an entry needs write + search permission on the directory,
+    // and ownership of the entry or directory when the sticky bit is set.
+    let dir_attrs = match super::access_check::require(
+        filesystem,
+        &args.dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("RMDIR denied: {:?}", status);
+            return create_rmdir_response(xid, status, None);
+        }
+    };
+    if let Err(status) =
+        super::access_check::check_sticky(filesystem, &args.dir.0, &dir_attrs, &args.name.0, cred)
+            .await
+    {
+        debug!("RMDIR denied by sticky bit");
+        return create_rmdir_response(xid, status, Some(NfsMessage::fsal_to_fattr3(&dir_attrs)));
     }
 
     // Get parent directory attributes before removal (for wcc_data)
@@ -187,7 +213,7 @@ mod tests {
         assert!(target_dir.exists());
 
         // Call RMDIR
-        let result = handle_rmdir(12345, &args_buf, &fs).await;
+        let result = handle_rmdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "RMDIR should succeed");
 
         // Verify directory was removed
@@ -221,7 +247,7 @@ mod tests {
         dirname.pack(&mut args_buf).unwrap();
 
         // Call RMDIR - should fail with NOENT
-        let result = handle_rmdir(12345, &args_buf, &fs).await;
+        let result = handle_rmdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "RMDIR should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_NOENT
@@ -259,7 +285,7 @@ mod tests {
         dirname.pack(&mut args_buf).unwrap();
 
         // Call RMDIR - should fail with NOTEMPTY
-        let result = handle_rmdir(12345, &args_buf, &fs).await;
+        let result = handle_rmdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "RMDIR should return response (not crash)");
 
         // Verify directory still exists

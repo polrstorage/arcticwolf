@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS RENAME request
 ///
@@ -25,6 +26,7 @@ pub async fn handle_rename(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS RENAME: xid={}", xid);
 
@@ -53,6 +55,67 @@ pub async fn handle_rename(
     }
     if let Err(status) = super::access_check::check_writable(filesystem, &args.to_dir.0) {
         debug!("RENAME denied: target dir belongs to a read-only export");
+        return create_rename_response(xid, status, None, None);
+    }
+
+    // Both directories are written: write + search permission on each,
+    // plus the sticky-bit ownership rule on the source entry and on the
+    // target entry it would replace — the backend's rename(2) runs as the
+    // daemon and would otherwise overwrite it regardless of its owner.
+    let from_attrs = match super::access_check::require(
+        filesystem,
+        &args.from_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("RENAME denied on source dir: {:?}", status);
+            return create_rename_response(xid, status, None, None);
+        }
+    };
+    let to_attrs = if args.from_dir.0 == args.to_dir.0 {
+        from_attrs.clone()
+    } else {
+        match super::access_check::require(
+            filesystem,
+            &args.to_dir.0,
+            cred,
+            super::perm::WRITE | super::perm::EXEC,
+        )
+        .await
+        {
+            Ok(attrs) => attrs,
+            Err(status) => {
+                debug!("RENAME denied on target dir: {:?}", status);
+                return create_rename_response(xid, status, None, None);
+            }
+        }
+    };
+    if let Err(status) = super::access_check::check_sticky(
+        filesystem,
+        &args.from_dir.0,
+        &from_attrs,
+        &args.from_name.0,
+        cred,
+    )
+    .await
+    {
+        debug!("RENAME denied by sticky bit on the source entry");
+        return create_rename_response(xid, status, None, None);
+    }
+    if let Err(status) = super::access_check::check_sticky(
+        filesystem,
+        &args.to_dir.0,
+        &to_attrs,
+        &args.to_name.0,
+        cred,
+    )
+    .await
+    {
+        debug!("RENAME denied by sticky bit on the target entry");
         return create_rename_response(xid, status, None, None);
     }
 
@@ -272,7 +335,7 @@ mod tests {
         to_name.pack(&mut args_buf).unwrap();
 
         // Call RENAME
-        let result = handle_rename(12345, &args_buf, &fs).await;
+        let result = handle_rename(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "RENAME should succeed");
 
         // Verify file was renamed
@@ -321,7 +384,7 @@ mod tests {
         to_name.pack(&mut args_buf).unwrap();
 
         // Call RENAME
-        let result = handle_rename(12346, &args_buf, &fs).await;
+        let result = handle_rename(12346, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "RENAME should succeed");
 
         // Verify directory was renamed
@@ -336,5 +399,60 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// RENAME3args for a rename within `dir`.
+    fn rename_args(dir: &crate::fsal::FileHandle, from: &str, to: &str) -> Vec<u8> {
+        use crate::protocol::v3::nfs::{fhandle3, filename3};
+        use xdr_codec::Pack;
+        let mut buf = Vec::new();
+        fhandle3(dir.clone()).pack(&mut buf).unwrap();
+        filename3(from.to_string()).pack(&mut buf).unwrap();
+        fhandle3(dir.clone()).pack(&mut buf).unwrap();
+        filename3(to.to_string()).pack(&mut buf).unwrap();
+        buf
+    }
+
+    /// NFS status of a reply: it follows the 24-byte accepted RPC header.
+    fn status_of(reply: &[u8]) -> i32 {
+        i32::from_be_bytes(reply[24..28].try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_rename_sticky_dir_protects_the_replaced_entry() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: needs root to chown to another uid");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        // A root-owned 1777 directory holding entries of two plain users.
+        fs::set_permissions(dir, PermissionsExt::from_mode(0o1777)).unwrap();
+        for (name, uid) in [("mine", 1000), ("mine2", 1000), ("theirs", 2000)] {
+            let path = dir.join(name);
+            fs::write(&path, name).unwrap();
+            let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), uid, uid) }, 0);
+        }
+        let fs = LocalFilesystem::new(dir, 1).unwrap();
+        let root_handle = fs.root_file_handle();
+        let cred = Credentials::sys(1000, 1000);
+
+        // Renaming over another user's entry is refused and changes nothing.
+        let reply = handle_rename(1, &rename_args(&root_handle, "mine", "theirs"), &fs, &cred)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&reply), nfsstat3::NFS3ERR_PERM as i32);
+        assert_eq!(fs::read(dir.join("theirs")).unwrap(), b"theirs");
+        assert!(dir.join("mine").exists());
+
+        // Over the caller's own entry it goes through.
+        let reply = handle_rename(2, &rename_args(&root_handle, "mine", "mine2"), &fs, &cred)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&reply), nfsstat3::NFS3_OK as i32);
+        assert_eq!(fs::read(dir.join("mine2")).unwrap(), b"mine");
+        assert!(!dir.join("mine").exists());
     }
 }

@@ -10,6 +10,7 @@ use crate::fsal::NfsBackend;
 use crate::nfs::error::classify_handle_error;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS FSSTAT procedure (procedure 18)
 ///
@@ -26,6 +27,9 @@ pub async fn handle_fsstat(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    // No permission check: attribute and link-target reads only need a
+    // valid handle (RFC 1813 §4.4), so the credential is unused here.
+    _cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS FSSTAT called (xid={})", xid);
 
@@ -134,7 +138,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSSTAT
-        let result = handle_fsstat(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_fsstat(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "FSSTAT should succeed");
 
@@ -163,7 +167,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSSTAT
-        let result = handle_fsstat(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_fsstat(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

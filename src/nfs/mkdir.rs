@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS MKDIR request
 ///
@@ -25,6 +26,7 @@ pub async fn handle_mkdir(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS MKDIR: xid={}", xid);
 
@@ -40,6 +42,19 @@ pub async fn handle_mkdir(
     // Reject mkdir against handles whose export is configured read_only.
     if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
         debug!("MKDIR denied: parent dir belongs to a read-only export");
+        return create_mkdir_response(xid, status, None, None, None);
+    }
+
+    // Creating an entry needs write + search permission on the directory.
+    if let Err(status) = super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        debug!("MKDIR denied: {:?}", status);
         return create_mkdir_response(xid, status, None, None, None);
     }
 
@@ -252,7 +267,7 @@ mod tests {
         sattr.pack(&mut args_buf).unwrap();
 
         // Call MKDIR
-        let result = handle_mkdir(12345, &args_buf, &fs).await;
+        let result = handle_mkdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "MKDIR should succeed");
 
         // Verify directory was created
@@ -311,7 +326,7 @@ mod tests {
         sattr.pack(&mut args_buf).unwrap();
 
         // Call MKDIR
-        let result = handle_mkdir(12345, &args_buf, &fs).await;
+        let result = handle_mkdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "MKDIR should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_EXIST

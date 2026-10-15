@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS READ procedure (procedure 6)
 ///
@@ -25,6 +26,7 @@ pub async fn handle_read(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS READ called (xid={})", xid);
 
@@ -37,6 +39,15 @@ pub async fn handle_read(
         args.offset,
         args.count
     );
+
+    // Read permission, with the owner override of RFC 1813 §4.4.
+    if let Err(status) =
+        super::access_check::require_io(filesystem, &args.file.0, cred, super::perm::READ).await
+    {
+        debug!("READ denied: {:?}", status);
+        let res_data = NfsMessage::create_read_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Read data from the file
     let data = match filesystem.read(&args.file.0, args.offset, args.count).await {
@@ -153,7 +164,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_read(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "READ should succeed");
 
@@ -192,7 +203,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_read(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "Partial READ should succeed");
     }
@@ -220,7 +231,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call READ
-        let result = handle_read(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_read(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

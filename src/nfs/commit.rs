@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS COMMIT procedure (21)
 ///
@@ -30,6 +31,7 @@ pub async fn handle_commit(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS COMMIT: xid={}", xid);
 
@@ -42,6 +44,15 @@ pub async fn handle_commit(
         args.offset,
         args.count
     );
+
+    // Same permission as WRITE: the data being committed got here through
+    // WRITE calls the caller was allowed to make.
+    if let Err(status) =
+        super::access_check::require_io(filesystem, &args.file.0, cred, super::perm::WRITE).await
+    {
+        debug!("COMMIT denied: {:?}", status);
+        return create_commit_response(xid, status, None, None);
+    }
 
     // Get file attributes before operation (for wcc_data)
     let file_before = filesystem.getattr(&args.file.0).await.ok();

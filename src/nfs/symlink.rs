@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle SYMLINK procedure
 ///
@@ -23,6 +24,7 @@ pub async fn handle_symlink(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS SYMLINK: xid={}", xid);
 
@@ -39,6 +41,19 @@ pub async fn handle_symlink(
     // Reject symlink creates against handles whose export is read_only.
     if let Err(status) = super::access_check::check_writable(filesystem, &args.where_dir.0) {
         debug!("SYMLINK denied: parent dir belongs to a read-only export");
+        return create_symlink_response(xid, status, None, None, None);
+    }
+
+    // Creating an entry needs write + search permission on the directory.
+    if let Err(status) = super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        debug!("SYMLINK denied: {:?}", status);
         return create_symlink_response(xid, status, None, None, None);
     }
 

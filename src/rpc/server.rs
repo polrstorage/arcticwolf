@@ -335,8 +335,6 @@ async fn route_rpc_call(
             return RpcMessage::create_auth_error_reply(call.xid, stat);
         }
     };
-    debug!("RPC caller: {:?}", cred);
-
     // Procedure arguments follow the fixed 24-byte call header and the two
     // opaque_auth fields, whose bodies `deserialize_call` already decoded:
     // each is flavor(4) + length(4) + body padded to a 4-byte boundary.
@@ -360,7 +358,7 @@ async fn route_rpc_call(
         100003 => {
             // NFS protocol (program 100003)
             debug!("Routing to NFS protocol handler");
-            crate::nfs::dispatch(call, args_data, filesystem, metrics).await
+            crate::nfs::dispatch(call, args_data, filesystem, metrics, &cred).await
         }
         _ => {
             warn!("Unknown program number: {}", call.prog);

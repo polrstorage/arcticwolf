@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::NfsMessage;
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS GETATTR procedure (procedure 1)
 ///
@@ -25,6 +26,9 @@ pub async fn handle_getattr(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    // No permission check: attribute and link-target reads only need a
+    // valid handle (RFC 1813 §4.4), so the credential is unused here.
+    _cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS GETATTR called (xid={})", xid);
 
@@ -95,7 +99,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call GETATTR
-        let result = handle_getattr(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_getattr(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "GETATTR should succeed for root");
 

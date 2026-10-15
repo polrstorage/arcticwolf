@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 // FSINFO property constants
 const FSF3_LINK: u32 = 0x0001; // Server supports hard links
@@ -31,6 +32,9 @@ pub async fn handle_fsinfo(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    // No permission check: attribute and link-target reads only need a
+    // valid handle (RFC 1813 §4.4), so the credential is unused here.
+    _cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS FSINFO called (xid={})", xid);
 
@@ -143,7 +147,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSINFO
-        let result = handle_fsinfo(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_fsinfo(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "FSINFO should succeed");
 
@@ -172,7 +176,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call FSINFO
-        let result = handle_fsinfo(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_fsinfo(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

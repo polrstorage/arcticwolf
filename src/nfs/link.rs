@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS LINK procedure (15)
 ///
@@ -30,6 +31,7 @@ pub async fn handle_link(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS LINK: xid={}", xid);
 
@@ -51,6 +53,19 @@ pub async fn handle_link(
     }
     if let Err(status) = super::access_check::check_writable(filesystem, &args.link_dir.0) {
         debug!("LINK denied: target dir belongs to a read-only export");
+        return create_link_response(xid, status, None, None);
+    }
+
+    // Creating an entry needs write + search permission on the directory.
+    if let Err(status) = super::access_check::require(
+        filesystem,
+        &args.link_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        debug!("LINK denied: {:?}", status);
         return create_link_response(xid, status, None, None);
     }
 

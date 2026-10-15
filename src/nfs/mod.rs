@@ -18,6 +18,7 @@ mod mkdir;
 mod mknod;
 mod null;
 mod pathconf;
+mod perm;
 mod read;
 mod readdir;
 mod readdirplus;

@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS REMOVE request
 ///
@@ -26,6 +27,7 @@ pub async fn handle_remove(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS REMOVE: xid={}", xid);
 
@@ -42,6 +44,30 @@ pub async fn handle_remove(
     if let Err(status) = super::access_check::check_writable(filesystem, &args.dir.0) {
         debug!("REMOVE denied: parent dir belongs to a read-only export");
         return create_remove_response(xid, status, None);
+    }
+
+    // Removing an entry needs write + search permission on the directory,
+    // and ownership of the entry or directory when the sticky bit is set.
+    let dir_attrs = match super::access_check::require(
+        filesystem,
+        &args.dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("REMOVE denied: {:?}", status);
+            return create_remove_response(xid, status, None);
+        }
+    };
+    if let Err(status) =
+        super::access_check::check_sticky(filesystem, &args.dir.0, &dir_attrs, &args.name.0, cred)
+            .await
+    {
+        debug!("REMOVE denied by sticky bit");
+        return create_remove_response(xid, status, Some(NfsMessage::fsal_to_fattr3(&dir_attrs)));
     }
 
     // Get directory attributes before removal (for wcc_data)
@@ -182,7 +208,7 @@ mod tests {
         assert!(test_file.exists());
 
         // Call REMOVE
-        let result = handle_remove(12345, &args_buf, &fs).await;
+        let result = handle_remove(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "REMOVE should succeed");
 
         // Verify file was removed
@@ -218,7 +244,7 @@ mod tests {
         filename.pack(&mut args_buf).unwrap();
 
         // Call REMOVE - should fail with NOENT
-        let result = handle_remove(12345, &args_buf, &fs).await;
+        let result = handle_remove(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "REMOVE should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_NOENT

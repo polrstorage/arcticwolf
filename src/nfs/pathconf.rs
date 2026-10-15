@@ -11,6 +11,7 @@ use crate::fsal::NfsBackend;
 use crate::nfs::error::classify_handle_error;
 use crate::protocol::v3::nfs::{NfsMessage, fattr3, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS PATHCONF request
 ///
@@ -25,6 +26,9 @@ pub async fn handle_pathconf(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    // No permission check: attribute and link-target reads only need a
+    // valid handle (RFC 1813 §4.4), so the credential is unused here.
+    _cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS PATHCONF: xid={}", xid);
 
