@@ -109,6 +109,14 @@ pub enum FileType {
     NamedPipe = 7,
 }
 
+/// Owner to give a newly created object: the caller's identity after the
+/// export's squash policy, with the parent's gid when it is set-gid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// File time (seconds, nanoseconds)
 #[derive(Debug, Clone, Copy)]
 pub struct FileTime {
@@ -229,14 +237,30 @@ pub trait Filesystem: Send + Sync {
 
     /// Create a file
     ///
+    /// The file is opened `O_CREAT | O_EXCL`: a name that already exists
+    /// is an error (`std::io::ErrorKind::AlreadyExists`) and the existing
+    /// file is left untouched, so a success always means a brand-new file.
+    /// `owner` is applied through the descriptor of that new file before
+    /// it is closed, so a concurrent rename in the directory cannot
+    /// redirect the change to another object. A chown the daemon may not
+    /// make (no `CAP_CHOWN`) is logged rather than reported: the file
+    /// exists, and the post-op attributes tell the client who owns it.
+    ///
     /// # Arguments
     /// * `dir_handle` - Directory handle
     /// * `name` - Name of new file
     /// * `mode` - File permissions
+    /// * `owner` - Owner of the new file; `None` leaves it to the daemon
     ///
     /// # Returns
     /// File handle of created file
-    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn create(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle>;
 
     /// Remove a file
     ///
@@ -251,10 +275,19 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Name of new directory
     /// * `mode` - Directory permissions
+    /// * `owner` - Owner of the new directory, as for [`create`](Self::create);
+    ///   an entry a concurrent rename swapped into its place is left alone
+    ///   and reported as an error
     ///
     /// # Returns
     /// File handle of created directory
-    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn mkdir(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle>;
 
     /// Remove a directory
     ///
@@ -284,11 +317,13 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Symlink name
     /// * `target` - Target path the symlink points to
+    /// * `owner` - Owner of the new link, as for [`mkdir`](Self::mkdir)
     async fn symlink(
         &self,
         dir_handle: &FileHandle,
         name: &str,
         target: &str,
+        owner: Option<Owner>,
     ) -> Result<FileHandle>;
 
     /// Read a symbolic link
@@ -338,6 +373,7 @@ pub trait Filesystem: Send + Sync {
     /// * `file_type` - Type of special file (BlockDevice, CharDevice, Socket, NamedPipe)
     /// * `mode` - File permissions
     /// * `rdev` - Device numbers (major, minor) for device files, ignored for FIFO/Socket
+    /// * `owner` - Owner of the new node, as for [`mkdir`](Self::mkdir)
     ///
     /// # Returns
     /// File handle of created special file
@@ -348,6 +384,7 @@ pub trait Filesystem: Send + Sync {
         file_type: FileType,
         mode: u32,
         rdev: (u32, u32),
+        owner: Option<Owner>,
     ) -> Result<FileHandle>;
 
     /// Report filesystem-wide statistics for the export that owns `handle`.

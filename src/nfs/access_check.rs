@@ -13,7 +13,7 @@
 //   compare the resulting identity against the object's mode bits (see
 //   [`super::perm`]) before the backend call, returning `NFS3ERR_ACCES`.
 
-use crate::fsal::{ExportRegistry, FileAttributes, FileHandle, NfsBackend};
+use crate::fsal::{ExportRegistry, FileAttributes, FileHandle, NfsBackend, Owner};
 use crate::protocol::v3::nfs::nfsstat3;
 use crate::rpc::auth::Credentials;
 
@@ -117,6 +117,29 @@ pub async fn require_io(
     } else {
         Err(nfsstat3::NFS3ERR_ACCES)
     }
+}
+
+/// Owner for an object the caller is about to create.
+///
+/// The daemon creates everything as its own uid, so CREATE / MKDIR /
+/// SYMLINK / MKNOD pass this to the backend, which applies it to the new
+/// object through the descriptor it created it with — the way the kernel
+/// would have assigned ownership had the caller run `open(2)` locally. It
+/// is the squashed caller identity; a set-gid parent directory passes its
+/// gid on instead of the caller's primary gid, as `mkdir(2)` does.
+pub fn owner_for_new(
+    backend: &dyn NfsBackend,
+    dir_handle: &FileHandle,
+    dir_attrs: &FileAttributes,
+    cred: &Credentials,
+) -> Owner {
+    let who = identity_for(backend, dir_handle, cred);
+    let gid = if dir_attrs.mode & 0o2000 != 0 {
+        dir_attrs.gid
+    } else {
+        who.gid
+    };
+    Owner { uid: who.uid, gid }
 }
 
 /// Sticky-bit rule for REMOVE / RMDIR / RENAME: in a directory with
@@ -373,6 +396,69 @@ mod tests {
                 .unwrap_err(),
             nfsstat3::NFS3ERR_STALE
         );
+    }
+
+    #[tokio::test]
+    async fn new_objects_get_the_caller_owner_and_inherit_a_setgid_group() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: needs root to chown to another uid");
+            return;
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let data = TempDir::new().unwrap();
+        std::fs::create_dir(data.path().join("sgid")).unwrap();
+        std::fs::set_permissions(data.path().join("sgid"), PermissionsExt::from_mode(0o2775))
+            .unwrap();
+        let c = std::ffi::CString::new(data.path().join("sgid").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chown(c.as_ptr(), 0, 4242) }, 0);
+
+        let router = MultiExportFilesystem::build_from_config(&[export_with_squash(
+            "/data",
+            1,
+            data.path().to_path_buf(),
+            Squash::None,
+        )])
+        .unwrap();
+        let root_h = router.root_handle_for("/data").unwrap();
+        let cred = Credentials::Sys {
+            uid: 1000,
+            gid: 100,
+            gids: vec![],
+        };
+        use crate::fsal::Filesystem;
+
+        let root_attrs = router.getattr(&root_h).await.unwrap();
+        let owner = owner_for_new(&router, &root_h, &root_attrs, &cred);
+        assert_eq!(
+            owner,
+            Owner {
+                uid: 1000,
+                gid: 100
+            }
+        );
+        router
+            .create(&root_h, "plain", 0o644, Some(owner))
+            .await
+            .unwrap();
+        let m = std::fs::metadata(data.path().join("plain")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (1000, 100));
+
+        let sgid_h = router.lookup(&root_h, "sgid").await.unwrap();
+        let sgid_attrs = router.getattr(&sgid_h).await.unwrap();
+        let owner = owner_for_new(&router, &sgid_h, &sgid_attrs, &cred);
+        assert_eq!(
+            owner,
+            Owner {
+                uid: 1000,
+                gid: 4242
+            }
+        );
+        router
+            .create(&sgid_h, "inherits", 0o644, Some(owner))
+            .await
+            .unwrap();
+        let m = std::fs::metadata(data.path().join("sgid/inherits")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (1000, 4242));
     }
 
     /// `std::os::unix::fs::MetadataExt::uid` without the trait import noise.

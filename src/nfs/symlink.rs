@@ -45,7 +45,8 @@ pub async fn handle_symlink(
     }
 
     // Creating an entry needs write + search permission on the directory.
-    if let Err(status) = super::access_check::require(
+    // The attributes double as the pre-op view for wcc_data and ownership.
+    let dir_before = match super::access_check::require(
         filesystem,
         &args.where_dir.0,
         cred,
@@ -53,19 +54,22 @@ pub async fn handle_symlink(
     )
     .await
     {
-        debug!("SYMLINK denied: {:?}", status);
-        return create_symlink_response(xid, status, None, None, None);
-    }
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("SYMLINK denied: {:?}", status);
+            return create_symlink_response(xid, status, None, None, None);
+        }
+    };
 
-    // Get parent directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
-
-    // Perform symlink operation
+    // Perform symlink operation; the backend hands the link to the caller.
+    let owner =
+        super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
     match filesystem
         .symlink(
             &args.where_dir.0,
             &args.name.0,
             &args.symlink.symlink_data.0,
+            Some(owner),
         )
         .await
     {
@@ -105,7 +109,7 @@ pub async fn handle_symlink(
             let status = map_error_to_status(&e);
 
             // Get parent directory attributes for failure case
-            let dir_attr = dir_before.map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_attr = Some(NfsMessage::fsal_to_fattr3(&dir_before));
 
             create_symlink_response(xid, status, None, None, dir_attr)
         }

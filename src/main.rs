@@ -117,6 +117,17 @@ async fn main() -> Result<()> {
     // so it can be shared with the admin context without a deep copy.
     let config = Arc::new(Config::load()?);
 
+    // Ownership of objects created through NFS is assigned with chown(2),
+    // which needs CAP_CHOWN. Say so up front rather than letting every
+    // CREATE log a warning and every client chown fail with NFS3ERR_PERM.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        eprintln!(
+            "Warning: running as uid {euid}, not root: new files will stay owned by uid {euid} \
+             and SETATTR uid/gid changes will fail with NFS3ERR_PERM"
+        );
+    }
+
     // Initialize tracing with the configured log filter.
     // Priority: config file -> RUST_LOG env -> "info".
     //
