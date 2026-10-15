@@ -15,6 +15,7 @@ use crate::fsal::{ExportRegistry, NfsBackend};
 use crate::metrics::Metrics;
 use crate::portmap::Registry;
 use crate::protocol::v3::rpc::{RpcMessage, rpc_call_msg};
+use crate::rpc::auth;
 use crate::shutdown::{InFlight, InFlightGuard};
 
 /// RPC server handling TCP connections with record marking
@@ -317,56 +318,31 @@ async fn route_rpc_call(
         return Err(anyhow!("Program {} not served on this port", call.prog));
     }
 
-    // Calculate where procedure arguments start (after RPC call header)
-    // RPC call header: xid(4) + mtype(4) + rpcvers(4) + prog(4) + vers(4) + proc(4) = 24 bytes
-    // Then: opaque_auth cred + opaque_auth verf (variable length)
-    // opaque_auth = flavor(4) + length(4) + body(length bytes, padded to 4-byte boundary)
-
-    let mut offset = 24; // After fixed RPC header fields
-
-    // Parse credential (opaque_auth)
-    if data.len() < offset + 8 {
-        return Err(anyhow!("RPC message too short for credential header"));
-    }
-    let cred_length = u32::from_be_bytes([
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ]) as usize;
-    let cred_padded = (cred_length + 3) & !3; // Round up to multiple of 4
-    offset += 8 + cred_padded; // flavor(4) + length(4) + body(padded)
-
-    debug!(
-        "Credential length: {} bytes (padded: {}), offset now: {}",
-        cred_length, cred_padded, offset
-    );
-
-    // Parse verifier (opaque_auth)
-    if data.len() < offset + 8 {
-        return Err(anyhow!("RPC message too short for verifier header"));
-    }
-    let verf_length = u32::from_be_bytes([
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ]) as usize;
-    let verf_padded = (verf_length + 3) & !3; // Round up to multiple of 4
-    offset += 8 + verf_padded; // flavor(4) + length(4) + body(padded)
-
-    debug!(
-        "Verifier length: {} bytes (padded: {}), offset now: {}",
-        verf_length, verf_padded, offset
-    );
-
-    // Now offset points to the procedure arguments
-    let args_offset = offset;
-    let args_data = if data.len() > args_offset {
-        &data[args_offset..]
-    } else {
-        &[]
+    // Authenticate before touching the procedure arguments. A denied call
+    // gets a MSG_DENIED reply (not a handler `Err`), so count it here to
+    // keep the "decoded but failed" semantics of `rpc_errors_total`.
+    let cred = match auth::parse_credentials(&call.cred, &call.verf) {
+        Ok(cred) => cred,
+        Err(stat) => {
+            warn!(
+                "Denying xid={} prog={} proc={}: cred flavor {:?} rejected with {:?}",
+                call.xid, call.prog, call.proc_, call.cred.flavor, stat
+            );
+            metrics
+                .server
+                .rpc_errors_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return RpcMessage::create_auth_error_reply(call.xid, stat);
+        }
     };
+    debug!("RPC caller: {:?}", cred);
+
+    // Procedure arguments follow the fixed 24-byte call header and the two
+    // opaque_auth fields, whose bodies `deserialize_call` already decoded:
+    // each is flavor(4) + length(4) + body padded to a 4-byte boundary.
+    let pad4 = |len: usize| (len + 3) & !3;
+    let args_offset = 24 + 8 + pad4(call.cred.body.len()) + 8 + pad4(call.verf.body.len());
+    let args_data = data.get(args_offset..).unwrap_or(&[]);
 
     // Route to appropriate handler based on program number
     match call.prog {
@@ -436,6 +412,101 @@ mod tests {
         assert!(result.is_err(), "a truncated header must fail to decode");
         assert_eq!(metrics.server.rpc_decode_errors_total.load(Relaxed), 1);
         assert_eq!(metrics.server.rpc_requests_total.load(Relaxed), 0);
+        assert_eq!(metrics.server.rpc_errors_total.load(Relaxed), 0);
+    }
+
+    /// An unsupported credential flavor is answered with MSG_DENIED /
+    /// AUTH_ERROR / AUTH_BADCRED and counted as a decoded-but-failed RPC.
+    #[tokio::test]
+    async fn unsupported_auth_flavor_is_denied_and_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exports = vec![ExportConfig {
+            name: "/data".to_string(),
+            uid: 1,
+            read_only: false,
+            backend: BackendConfig::Local {
+                path: tmp.path().to_path_buf(),
+            },
+        }];
+        let filesystem: Arc<dyn NfsBackend> = Arc::new(
+            MultiExportFilesystem::build_from_config(&exports).expect("build_from_config"),
+        );
+        let registry = Registry::new();
+        let metrics = Metrics::new();
+
+        // NFS NULL call whose credential is AUTH_DH with an 8-byte body.
+        let mut frame = Vec::new();
+        for word in [7u32, 0, 2, 100003, 3, 0] {
+            frame.extend_from_slice(&word.to_be_bytes());
+        }
+        frame.extend_from_slice(&3u32.to_be_bytes()); // cred flavor = AUTH_DH
+        frame.extend_from_slice(&8u32.to_be_bytes());
+        frame.extend_from_slice(&[0u8; 8]);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // verf = AUTH_NONE
+        frame.extend_from_slice(&0u32.to_be_bytes());
+
+        let reply = handle_rpc_message(&frame, &registry, filesystem.as_ref(), &[100003], &metrics)
+            .await
+            .expect("denial is a reply, not an error");
+
+        // xid, REPLY, MSG_DENIED, AUTH_ERROR, AUTH_BADCRED
+        let words: Vec<u32> = reply
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words, vec![7, 1, 1, 1, 1]);
+        assert_eq!(metrics.server.rpc_requests_total.load(Relaxed), 1);
+        assert_eq!(metrics.server.rpc_errors_total.load(Relaxed), 1);
+    }
+
+    /// AUTH_SYS credentials must not disturb argument decoding: a NULL call
+    /// with a non-empty credential body still succeeds.
+    #[tokio::test]
+    async fn auth_sys_call_is_accepted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exports = vec![ExportConfig {
+            name: "/data".to_string(),
+            uid: 1,
+            read_only: false,
+            backend: BackendConfig::Local {
+                path: tmp.path().to_path_buf(),
+            },
+        }];
+        let filesystem: Arc<dyn NfsBackend> = Arc::new(
+            MultiExportFilesystem::build_from_config(&exports).expect("build_from_config"),
+        );
+        let registry = Registry::new();
+        let metrics = Metrics::new();
+
+        // AUTH_SYS body: stamp, machinename "c" (len 1 + 3 pad), uid, gid, 1 gid.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // stamp
+        body.extend_from_slice(&1u32.to_be_bytes()); // machinename len
+        body.extend_from_slice(b"c\0\0\0");
+        body.extend_from_slice(&1000u32.to_be_bytes()); // uid
+        body.extend_from_slice(&100u32.to_be_bytes()); // gid
+        body.extend_from_slice(&1u32.to_be_bytes()); // gids len
+        body.extend_from_slice(&24u32.to_be_bytes());
+
+        let mut frame = Vec::new();
+        for word in [9u32, 0, 2, 100003, 3, 0] {
+            frame.extend_from_slice(&word.to_be_bytes());
+        }
+        frame.extend_from_slice(&1u32.to_be_bytes()); // AUTH_SYS
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // verf = AUTH_NONE
+        frame.extend_from_slice(&0u32.to_be_bytes());
+
+        let reply = handle_rpc_message(&frame, &registry, filesystem.as_ref(), &[100003], &metrics)
+            .await
+            .expect("NULL with AUTH_SYS must succeed");
+        let words: Vec<u32> = reply
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // xid, REPLY, MSG_ACCEPTED, verf AUTH_NONE (flavor, len), SUCCESS
+        assert_eq!(words, vec![9, 1, 0, 0, 0, 0]);
         assert_eq!(metrics.server.rpc_errors_total.load(Relaxed), 0);
     }
 }
