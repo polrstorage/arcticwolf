@@ -29,7 +29,7 @@ jobs:
       - name: Deploy arcticwolf
         run: ./ci/nfstest.sh deploy
 
-      - name: Verify exports, isolation, read-only and fsstat
+      - name: Verify exports, isolation, read-only, fsstat and permissions
         run: ./ci/nfstest.sh verify
 
       # skip test open until we start to review the failures
