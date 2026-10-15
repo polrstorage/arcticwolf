@@ -65,7 +65,7 @@ async fn metrics_counts_admin_commands_and_per_export_io() {
     // create + write + read on /data (uid 1) → 3 requests, 11 bytes each way.
     let root = fs.root_handle_for("/data").expect("/data root handle");
     let file = fs
-        .create(&root, "probe.bin", 0o644)
+        .create(&root, "probe.bin", 0o644, None)
         .await
         .expect("create probe file");
     let written = fs.write(&file, 0, b"hello world").await.expect("write");

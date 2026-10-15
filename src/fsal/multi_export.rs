@@ -830,9 +830,15 @@ impl Filesystem for MultiExportFilesystem {
         r
     }
 
-    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn create(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<super::Owner>,
+    ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.create(dir_handle, name, mode).await;
+        let r = inner.create(dir_handle, name, mode, owner).await;
         metrics.record_result(&r);
         r
     }
@@ -844,9 +850,15 @@ impl Filesystem for MultiExportFilesystem {
         r
     }
 
-    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn mkdir(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<super::Owner>,
+    ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.mkdir(dir_handle, name, mode).await;
+        let r = inner.mkdir(dir_handle, name, mode, owner).await;
         metrics.record_result(&r);
         r
     }
@@ -884,9 +896,10 @@ impl Filesystem for MultiExportFilesystem {
         dir_handle: &FileHandle,
         name: &str,
         target: &str,
+        owner: Option<super::Owner>,
     ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.symlink(dir_handle, name, target).await;
+        let r = inner.symlink(dir_handle, name, target, owner).await;
         metrics.record_result(&r);
         r
     }
@@ -925,9 +938,12 @@ impl Filesystem for MultiExportFilesystem {
         file_type: FileType,
         mode: u32,
         rdev: (u32, u32),
+        owner: Option<super::Owner>,
     ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.mknod(dir_handle, name, file_type, mode, rdev).await;
+        let r = inner
+            .mknod(dir_handle, name, file_type, mode, rdev, owner)
+            .await;
         metrics.record_result(&r);
         r
     }

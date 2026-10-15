@@ -46,7 +46,8 @@ pub async fn handle_mkdir(
     }
 
     // Creating an entry needs write + search permission on the directory.
-    if let Err(status) = super::access_check::require(
+    // The attributes double as the pre-op view for ownership inheritance.
+    let dir_before = match super::access_check::require(
         filesystem,
         &args.where_dir.0,
         cred,
@@ -54,12 +55,12 @@ pub async fn handle_mkdir(
     )
     .await
     {
-        debug!("MKDIR denied: {:?}", status);
-        return create_mkdir_response(xid, status, None, None, None);
-    }
-
-    // Get parent directory attributes before operation (for wcc_data)
-    let _dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("MKDIR denied: {:?}", status);
+            return create_mkdir_response(xid, status, None, None, None);
+        }
+    };
 
     // Extract mode from sattr3, default to 0755
     let mode = match args.attributes.mode {
@@ -67,9 +68,11 @@ pub async fn handle_mkdir(
         crate::protocol::v3::nfs::set_mode3::default => 0o755,
     };
 
-    // Perform mkdir operation
+    // Perform mkdir operation; the backend hands the directory to the caller.
+    let owner =
+        super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
     match filesystem
-        .mkdir(&args.where_dir.0, &args.name.0, mode)
+        .mkdir(&args.where_dir.0, &args.name.0, mode, Some(owner))
         .await
     {
         Ok(new_dir_handle) => {

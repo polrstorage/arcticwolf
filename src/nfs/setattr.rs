@@ -141,10 +141,14 @@ pub async fn handle_setattr(
 
         if let Err(e) = filesystem.setattr_owner(&args.object.0, uid, gid).await {
             debug!("SETATTR: failed to set owner: {}", e);
+            // chown(2) reports EPERM ("Operation not permitted") both for
+            // a non-owner and for a daemon without CAP_CHOWN.
             let error_status = if e.to_string().contains("not found") {
                 nfsstat3::NFS3ERR_STALE
-            } else if e.to_string().contains("Permission denied") {
-                nfsstat3::NFS3ERR_ACCES
+            } else if e.to_string().contains("Permission denied")
+                || e.to_string().contains("not permitted")
+            {
+                nfsstat3::NFS3ERR_PERM
             } else {
                 nfsstat3::NFS3ERR_IO
             };
