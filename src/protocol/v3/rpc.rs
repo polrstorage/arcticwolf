@@ -70,6 +70,22 @@ impl RpcMessage {
         Ok(response)
     }
 
+    /// Create a `MSG_DENIED` / `AUTH_ERROR` reply (RFC 5531 §9).
+    ///
+    /// The generated `rpc_reply_msg` is flattened around the accepted-reply
+    /// shape and has no room for `reject_stat` / `auth_stat`, so the
+    /// rejected form is packed by hand:
+    /// `xid, REPLY, MSG_DENIED, AUTH_ERROR, auth_stat`.
+    pub fn create_auth_error_reply(xid: u32, stat: auth_stat) -> Result<BytesMut> {
+        let mut buf = Vec::with_capacity(20);
+        xid.pack(&mut buf)?;
+        msg_type::REPLY.pack(&mut buf)?;
+        reply_stat::MSG_DENIED.pack(&mut buf)?;
+        reject_stat::AUTH_ERROR.pack(&mut buf)?;
+        stat.pack(&mut buf)?;
+        Ok(BytesMut::from(&buf[..]))
+    }
+
     /// Create an RPC error reply for unsupported programs
     pub fn create_prog_unavail_reply(xid: u32) -> Result<BytesMut> {
         let rpc_reply = rpc_reply_msg {

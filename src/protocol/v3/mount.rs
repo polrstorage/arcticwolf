@@ -55,7 +55,10 @@ impl MountMessage {
     pub fn create_mount_ok(fhandle_bytes: Vec<u8>) -> mountres3 {
         mountres3::MNT3_OK(mountres3_ok {
             fhandle: fhandle3(fhandle_bytes), // Wrap in newtype
-            auth_flavors: vec![0],            // AUTH_NONE
+            // Advertise AUTH_SYS only. The Linux client picks the first
+            // flavor it supports from this list, so listing AUTH_NONE first
+            // would make it send anonymous credentials for every NFS call.
+            auth_flavors: vec![crate::protocol::v3::rpc::auth_flavor::AUTH_SYS as i32],
         })
     }
 

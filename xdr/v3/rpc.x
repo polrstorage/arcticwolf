@@ -15,7 +15,8 @@ enum auth_flavor {
     AUTH_NONE  = 0,
     AUTH_SYS   = 1,
     AUTH_SHORT = 2,
-    AUTH_DH    = 3
+    AUTH_DH    = 3,
+    RPCSEC_GSS = 6
 };
 
 /* Authentication data */
@@ -24,12 +25,13 @@ struct opaque_auth {
     opaque body<400>;
 };
 
-/* AUTH_SYS credentials */
+/* AUTH_SYS credentials (RFC 5531 Appendix A) */
 struct auth_sys_params {
     unsigned int stamp;
     string machinename<255>;
     unsigned int uid;
     unsigned int gid;
+    unsigned int gids<16>;
 };
 
 /* Version mismatch info */
