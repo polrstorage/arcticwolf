@@ -21,169 +21,26 @@ jobs:
           make image
           docker tag freezevicente/arcticwolf:latest arcticwolf:test
 
-      - name: Install k3s
-        run: |
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
-          sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $GITHUB_ENV
-
-      - name: Wait for k3s to be ready
-        run: |
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          kubectl wait --for=condition=Ready nodes --all --timeout=120s
-          kubectl get nodes
-
-      - name: Load image into k3s
-        run: |
-          docker save arcticwolf:test | sudo k3s ctr images import -
+      # The test steps live in ci/nfstest.sh so they can also be run
+      # outside GitHub Actions.
+      - name: Set up k3s and NFS client
+        run: ./ci/nfstest.sh setup
 
       - name: Deploy arcticwolf
-        run: |
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          # Update image in deployment to use local image
-          sed -i 's|freezevicente/arcticwolf:latest|arcticwolf:test|g' deploy/k8s/deployment.yaml
-          sed -i '/imagePullPolicy/d' deploy/k8s/deployment.yaml
-          # Add imagePullPolicy: Never for local image
-          sed -i 's|image: arcticwolf:test|image: arcticwolf:test\n          imagePullPolicy: Never|g' deploy/k8s/deployment.yaml
-          kubectl apply -f deploy/k8s/deployment.yaml
-          kubectl wait --for=condition=Ready pod -l app=arcticwolf --timeout=120s
+        run: ./ci/nfstest.sh deploy
 
-      - name: Get pod info
-        run: |
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          kubectl get pods -o wide
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-          echo "NODE_IP=${NODE_IP}" >> $GITHUB_ENV
-          echo "NFS server available at ${NODE_IP} (hostNetwork)"
-
-      - name: Install NFS client tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y nfs-common
-
-      # Phase 4 of #26: MOUNT MNT now routes the client dirpath against
-      # ExportRegistry, and MOUNT EXPORT (proc 5) enumerates configured
-      # exports. Verify both protocol pieces against the two exports
-      # defined in deploy/k8s/deployment.yaml.
-      - name: Verify MOUNT EXPORT lists both exports
-        run: |
-          showmount -e ${NODE_IP}
-          showmount -e ${NODE_IP} | grep -E '^/data\b'
-          showmount -e ${NODE_IP} | grep -E '^/backup\b'
-
-      - name: Mount /data export
-        run: |
-          sudo mkdir -p /mnt/nfs_data
-          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/data /mnt/nfs_data
-          ls -la /mnt/nfs_data/
-
-      - name: Mount /backup export
-        run: |
-          sudo mkdir -p /mnt/nfs_backup
-          sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/backup /mnt/nfs_backup
-          ls -la /mnt/nfs_backup/
-
-      - name: Verify per-export isolation
-        run: |
-          # Files written through /data must not show up in /backup —
-          # the multi-export router dispatches by the uid prefix in each
-          # file handle, so /data and /backup own disjoint trees even
-          # though they share a single NFS server. /backup is read_only
-          # in Phase 5 of #26, so we only seed /data and check that the
-          # filename doesn't leak into the other mount.
-          sudo bash -c 'echo data-only > /mnt/nfs_data/hello-data.txt'
-          sudo test -f /mnt/nfs_data/hello-data.txt
-          if sudo test -e /mnt/nfs_backup/hello-data.txt; then
-            echo "ISOLATION FAILURE: /data file visible in /backup mount" >&2
-            exit 1
-          fi
-          echo "per-export isolation verified"
-
-      # Phase 5 of #26: every write-class NFS procedure short-circuits to
-      # NFS3ERR_ROFS when the handle's export is configured read_only=true.
-      # The kernel client surfaces that as EROFS, so any write against
-      # /mnt/nfs_backup must fail at the syscall layer while reads still
-      # succeed.
-      - name: Verify /backup rejects writes with EROFS
-        run: |
-          set +e
-          sudo bash -c 'echo nope > /mnt/nfs_backup/ro-write.txt' 2> /tmp/rofs.err
-          rc=$?
-          set -e
-          if [ $rc -eq 0 ]; then
-            echo "FAILURE: write to read-only /backup unexpectedly succeeded" >&2
-            exit 1
-          fi
-          # NFS3ERR_ROFS → EROFS → "Read-only file system" in shell error.
-          # Match loosely so locale variations don't break the assertion.
-          if ! grep -qi "read-only" /tmp/rofs.err; then
-            echo "FAILURE: expected EROFS, got:" >&2
-            cat /tmp/rofs.err >&2
-            exit 1
-          fi
-          # mkdir against the ro export must also fail.
-          if sudo mkdir /mnt/nfs_backup/ro-dir 2>/dev/null; then
-            echo "FAILURE: mkdir on read-only /backup unexpectedly succeeded" >&2
-            exit 1
-          fi
-          # Reads must still work — only write-class ops are gated.
-          sudo ls /mnt/nfs_backup/ >/dev/null
-          echo "read-only export correctly rejects writes"
-
-      # Phase 5 of #26: fsstat now consults statvfs(2) on the export's
-      # root rather than returning hardcoded values. df should report
-      # numbers consistent with the underlying mount on the pod (a PVC
-      # for /data, an emptyDir for /backup); we don't pin exact figures
-      # because the host filesystem varies between CI runs, but the
-      # values must be non-zero and df must succeed for both mounts.
-      - name: Show per-export df stats
-        run: |
-          df -h /mnt/nfs_data /mnt/nfs_backup
-          data_total=$(df --output=size /mnt/nfs_data | tail -n1 | tr -d ' ')
-          backup_total=$(df --output=size /mnt/nfs_backup | tail -n1 | tr -d ' ')
-          if [ "$data_total" = "0" ] || [ "$backup_total" = "0" ]; then
-            echo "FAILURE: fsstat reports zero size for an export" >&2
-            df --output=source,size,used,avail /mnt/nfs_data /mnt/nfs_backup >&2
-            exit 1
-          fi
-          echo "per-export fsstat stats look sane"
-
-      - name: Verify MNT NOENT for unknown dirpath
-        run: |
-          sudo mkdir -p /mnt/nfs_missing
-          # A bogus dirpath must fail at mount time — MNT3ERR_NOENT
-          # surfaces to the client as ENOENT and mount(8) exits non-zero.
-          if sudo mount -t nfs -o nfsvers=3,tcp,nolock ${NODE_IP}:/nonexistent /mnt/nfs_missing 2>&1; then
-            sudo umount /mnt/nfs_missing || true
-            echo "ERROR: mounting an unknown export should have failed" >&2
-            exit 1
-          fi
-          echo "unknown dirpath correctly rejected"
+      - name: Verify exports, isolation, read-only and fsstat
+        run: ./ci/nfstest.sh verify
 
       # skip test open until we start to review the failures
       # read/write tests are mandatory and must pass
       - name: Run NFS POSIX tests against /data
-        run: |
-          docker run --network host --privileged --rm \
-            registry.opensuse.org/home/vcheng/containers/containers/nfstester:latest \
-            nfstest_posix -s localhost --export=/data --nfsversion=3 \
-            -o nolock,noresvport \
-            --runtest=read,write
+        run: ./ci/nfstest.sh posix
 
       - name: Get pod logs
         if: always()
-        run: |
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          echo "=== Pod Status ==="
-          kubectl get pods -l app=arcticwolf -o wide
-          echo ""
-          echo "=== Pod Logs ==="
-          kubectl logs -l app=arcticwolf --tail=200
+        run: ./ci/nfstest.sh logs
 
       - name: Cleanup
         if: always()
-        run: |
-          sudo umount /mnt/nfs_data || true
-          sudo umount /mnt/nfs_backup || true
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          kubectl delete -f deploy/k8s/deployment.yaml || true
+        run: ./ci/nfstest.sh cleanup
