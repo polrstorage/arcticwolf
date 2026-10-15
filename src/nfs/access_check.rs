@@ -37,6 +37,9 @@ mod tests {
             name: name.to_string(),
             uid,
             read_only,
+            squash: Default::default(),
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             backend: ConfigBackend::Local { path },
         }
     }

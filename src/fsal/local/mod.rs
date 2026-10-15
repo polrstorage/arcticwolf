@@ -17,7 +17,7 @@ use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats};
 #[cfg(test)]
 use super::handle::FileHandleExt;
 #[cfg(test)]
-use super::{ExportInfo, ExportRegistry};
+use super::{ExportInfo, ExportRegistry, SquashPolicy};
 
 /// Local filesystem implementation
 pub struct LocalFilesystem {
@@ -936,6 +936,10 @@ impl ExportRegistry for LocalFilesystem {
 
     fn is_read_only(&self, _handle: &FileHandle) -> bool {
         false
+    }
+
+    fn squash_policy(&self, _handle: &FileHandle) -> SquashPolicy {
+        SquashPolicy::NONE
     }
 
     fn export_for_handle(&self, handle: &FileHandle) -> Option<u32> {

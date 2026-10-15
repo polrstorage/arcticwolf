@@ -19,6 +19,12 @@ mount_port = 0
 #
 # Optional keys:
 #   read_only  - if true, deny writes against this export (default: false)
+#   squash     - "root" (default): map uid/gid 0 to anonuid/anongid, like
+#                exportfs root_squash; "all": map every caller; "none": trust
+#                the AUTH_SYS credential as sent. AUTH_NONE callers are always
+#                mapped to anonuid/anongid.
+#   anonuid    - uid for squashed/anonymous callers (default: 65534)
+#   anongid    - gid for squashed/anonymous callers (default: 65534)
 #
 # Backend-specific keys (sit alongside the keys above):
 #   local backend: path - absolute path on the server's local filesystem
@@ -27,6 +33,10 @@ mount_port = 0
 name = "/data"
 uid = 1
 read_only = false
+# Explicit defaults, shown for reference.
+squash = "root"
+anonuid = 65534
+anongid = 65534
 backend = "local"
 path = "/srv/nfs/data"
 

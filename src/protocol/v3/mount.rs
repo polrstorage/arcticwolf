@@ -125,6 +125,9 @@ mod tests {
             name: "/data".to_string(),
             uid: 1,
             read_only: false,
+            squash: crate::config::Squash::Root,
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             fsal: "local".to_string(),
         }];
         let bytes = MountMessage::serialize_exports(&exports);
@@ -148,12 +151,18 @@ mod tests {
                 name: "/data".to_string(),
                 uid: 1,
                 read_only: false,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
             ExportInfo {
                 name: "/backup".to_string(),
                 uid: 2,
                 read_only: true,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
         ];
