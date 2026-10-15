@@ -62,9 +62,62 @@ pub struct ExportConfig {
     /// If true, deny writes against this export.
     #[serde(default)]
     pub read_only: bool,
+    /// How caller identities are mapped before permission checks.
+    /// Defaults to `root`, matching `exportfs(8)`.
+    #[serde(default)]
+    pub squash: Squash,
+    /// uid that squashed callers (and `AUTH_NONE` callers) act as.
+    #[serde(default = "default_anon_id")]
+    pub anonuid: u32,
+    /// gid that squashed callers (and `AUTH_NONE` callers) act as.
+    #[serde(default = "default_anon_id")]
+    pub anongid: u32,
     /// Backend-specific configuration. Discriminated by the `backend` field.
     #[serde(flatten)]
     pub backend: BackendConfig,
+}
+
+/// Default anonymous uid/gid: `nobody`/`nogroup` on Linux.
+pub const DEFAULT_ANON_ID: u32 = 65534;
+
+fn default_anon_id() -> u32 {
+    DEFAULT_ANON_ID
+}
+
+impl ExportConfig {
+    /// The identity-mapping policy for this export, as the FSAL consumes it.
+    pub fn squash_policy(&self) -> crate::fsal::SquashPolicy {
+        crate::fsal::SquashPolicy {
+            squash: self.squash,
+            anonuid: self.anonuid,
+            anongid: self.anongid,
+        }
+    }
+}
+
+/// Identity squashing applied to the caller of every NFS procedure.
+///
+/// Same three modes as `exportfs(8)`: `root` maps uid 0 / gid 0 to the
+/// anonymous ids, `all` maps every caller, `none` trusts the credential
+/// as sent. `AUTH_NONE` callers are always anonymous regardless of mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Squash {
+    #[default]
+    Root,
+    All,
+    None,
+}
+
+impl Squash {
+    /// Lowercase name as written in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Squash::Root => "root",
+            Squash::All => "all",
+            Squash::None => "none",
+        }
+    }
 }
 
 /// Storage backend selection for an export.
@@ -190,6 +243,9 @@ impl Default for Config {
                 name: "/".to_string(),
                 uid: 1,
                 read_only: false,
+                squash: Default::default(),
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 backend: BackendConfig::Local {
                     path: PathBuf::from("/tmp/nfs_exports"),
                 },
@@ -353,6 +409,9 @@ mod tests {
             name: name.to_string(),
             uid,
             read_only: false,
+            squash: Default::default(),
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             backend: BackendConfig::Local {
                 path: PathBuf::from(path),
             },
@@ -498,6 +557,67 @@ mod tests {
     }
 
     #[test]
+    fn test_squash_defaults_to_root_and_nobody() {
+        let toml = r#"
+[[exports]]
+name = "/data"
+uid = 1
+backend = "local"
+path = "/srv/data"
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let export = &config.exports[0];
+        assert_eq!(export.squash, Squash::Root);
+        assert_eq!(export.anonuid, DEFAULT_ANON_ID);
+        assert_eq!(export.anongid, DEFAULT_ANON_ID);
+        assert_eq!(export.squash_policy(), crate::fsal::SquashPolicy::default());
+    }
+
+    #[test]
+    fn test_squash_keys_parse() {
+        let toml = r#"
+[[exports]]
+name = "/data"
+uid = 1
+squash = "none"
+anonuid = 4000
+anongid = 4001
+backend = "local"
+path = "/srv/data"
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let export = &config.exports[0];
+        assert_eq!(export.squash, Squash::None);
+        assert_eq!(export.anonuid, 4000);
+        assert_eq!(export.anongid, 4001);
+        for (text, want) in [("root", Squash::Root), ("all", Squash::All)] {
+            let toml = format!(
+                "[[exports]]\nname = \"/d\"\nuid = 1\nsquash = \"{text}\"\nbackend = \"local\"\npath = \"/srv\"\n"
+            );
+            let config: Config = toml::from_str(&toml).expect("parse");
+            assert_eq!(config.exports[0].squash, want);
+            assert_eq!(want.as_str(), text);
+        }
+    }
+
+    #[test]
+    fn test_squash_rejects_unknown_mode() {
+        let toml = r#"
+[[exports]]
+name = "/data"
+uid = 1
+squash = "root_squash"
+backend = "local"
+path = "/srv/data"
+"#;
+        let err = toml::from_str::<Config>(toml).expect_err("must reject");
+        assert!(
+            err.to_string().contains("root_squash"),
+            "error should name the bad value: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_unknown_backend_discriminator_is_rejected() {
         // The `backend` tag selects a BackendConfig variant; unknown values
         // (e.g. an S3 backend that doesn't exist yet) must fail at parse time
@@ -627,6 +747,9 @@ mod tests {
             name: "/data".to_string(),
             uid: 1,
             read_only: false,
+            squash: Default::default(),
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             backend: BackendConfig::Local {
                 path: PathBuf::from("relative/path"),
             },

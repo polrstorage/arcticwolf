@@ -37,7 +37,7 @@ pub fn handle(call: &rpc_call_msg, registry: &dyn ExportRegistry) -> Result<Byte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsal::{ExportInfo, FileHandle};
+    use crate::fsal::{ExportInfo, FileHandle, SquashPolicy};
 
     /// Minimal `ExportRegistry` for tests — backed by a static list so we
     /// don't need the full multi-export filesystem plumbing here.
@@ -52,6 +52,10 @@ mod tests {
         }
         fn is_read_only(&self, _handle: &FileHandle) -> bool {
             false
+        }
+
+        fn squash_policy(&self, _handle: &FileHandle) -> SquashPolicy {
+            SquashPolicy::NONE
         }
         fn export_for_handle(&self, _handle: &FileHandle) -> Option<u32> {
             None
@@ -85,12 +89,18 @@ mod tests {
                 name: "/data".to_string(),
                 uid: 1,
                 read_only: false,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
             ExportInfo {
                 name: "/backup".to_string(),
                 uid: 2,
                 read_only: true,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
         ]);

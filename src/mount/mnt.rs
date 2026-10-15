@@ -65,7 +65,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use crate::fsal::handle::HANDLE_LEN;
-    use crate::fsal::{ExportInfo, FileHandle};
+    use crate::fsal::{ExportInfo, FileHandle, SquashPolicy};
     use std::collections::HashMap;
 
     /// Test-only `ExportRegistry` that lets each test pin the exact set of
@@ -95,6 +95,10 @@ mod tests {
         }
         fn is_read_only(&self, _handle: &FileHandle) -> bool {
             false
+        }
+
+        fn squash_policy(&self, _handle: &FileHandle) -> SquashPolicy {
+            SquashPolicy::NONE
         }
         fn export_for_handle(&self, _handle: &FileHandle) -> Option<u32> {
             None

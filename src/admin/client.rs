@@ -221,7 +221,7 @@ pub fn render_exports_list(data: &Value, json: bool) -> Result<String> {
     let mut out = String::new();
     writeln!(
         out,
-        "{:<uid_w$}  {:<name_w$}  {:<fsal_w$}  READ-ONLY",
+        "{:<uid_w$}  {:<name_w$}  {:<fsal_w$}  READ-ONLY  SQUASH",
         "UID",
         "NAME",
         "FSAL",
@@ -238,30 +238,24 @@ pub fn render_exports_list(data: &Value, json: bool) -> Result<String> {
         } else {
             "false"
         };
+        // `root`/`all`/`none`; older daemons without the field show `?`.
+        let squash = e["squash"].as_str().unwrap_or("?");
+        // READ-ONLY is padded to its 9-char header so SQUASH lines up.
+        let line = format!(
+            "{:<uid_w$}  {:<name_w$}  {:<fsal_w$}  {:<9}  {}",
+            uid,
+            name,
+            fsal,
+            ro,
+            squash,
+            uid_w = uid_w,
+            name_w = name_w,
+            fsal_w = fsal_w,
+        );
         if idx + 1 == exports.len() {
-            write!(
-                out,
-                "{:<uid_w$}  {:<name_w$}  {:<fsal_w$}  {}",
-                uid,
-                name,
-                fsal,
-                ro,
-                uid_w = uid_w,
-                name_w = name_w,
-                fsal_w = fsal_w,
-            )?;
+            write!(out, "{}", line)?;
         } else {
-            writeln!(
-                out,
-                "{:<uid_w$}  {:<name_w$}  {:<fsal_w$}  {}",
-                uid,
-                name,
-                fsal,
-                ro,
-                uid_w = uid_w,
-                name_w = name_w,
-                fsal_w = fsal_w,
-            )?;
+            writeln!(out, "{}", line)?;
         }
     }
     Ok(out)
@@ -451,21 +445,21 @@ mod tests {
         let data = json!({ "exports": [], "retired_uids": [] });
         let rendered = render_exports_list(&data, false).expect("render");
         // No rows → output is just the header line with header-width pads.
-        assert_eq!(rendered.trim_end(), "UID  NAME  FSAL  READ-ONLY");
+        assert_eq!(rendered.trim_end(), "UID  NAME  FSAL  READ-ONLY  SQUASH");
     }
 
     #[test]
     fn render_exports_list_one_row_aligned() {
         let data = json!({
             "exports": [
-                { "uid": 1, "name": "/data", "fsal": "local", "read_only": false },
+                { "uid": 1, "name": "/data", "fsal": "local", "read_only": false, "squash": "root" },
             ],
             "retired_uids": [],
         });
         let rendered = render_exports_list(&data, false).expect("render");
         // `/data` is wider than the `NAME` header (4 chars vs 5), so the
         // name column widens to 5; everything else is at the header floor.
-        let expected = "UID  NAME   FSAL   READ-ONLY\n1    /data  local  false";
+        let expected = "UID  NAME   FSAL   READ-ONLY  SQUASH\n1    /data  local  false      root";
         assert_eq!(rendered.trim_end(), expected);
     }
 
@@ -475,8 +469,8 @@ mod tests {
         // actually has to widen each column past the header floor.
         let data = json!({
             "exports": [
-                { "uid": 1, "name": "/d", "fsal": "local", "read_only": false },
-                { "uid": 999999, "name": "/very/long/export/name", "fsal": "local", "read_only": true },
+                { "uid": 1, "name": "/d", "fsal": "local", "read_only": false, "squash": "none" },
+                { "uid": 999999, "name": "/very/long/export/name", "fsal": "local", "read_only": true, "squash": "all" },
             ],
             "retired_uids": [],
         });
@@ -484,10 +478,9 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         // Header + 2 rows.
         assert_eq!(lines.len(), 3, "got: {rendered:?}");
-        // Every line is the same length once the dynamic widths apply
-        // (READ-ONLY column is the trailing field so no padding follows
-        // it — but every line's READ-ONLY value must start at the same
-        // column offset).
+        // Every line's READ-ONLY and SQUASH values must start at the same
+        // column offset as their headers (SQUASH is the trailing field so
+        // no padding follows it).
         let header = lines[0];
         let row1 = lines[1];
         let row2 = lines[2];
@@ -506,5 +499,8 @@ mod tests {
             Some("t"),
             "row2 READ-ONLY must start at the header's READ-ONLY column: {row2:?}"
         );
+        let sq_col = header.find("SQUASH").expect("header has SQUASH");
+        assert_eq!(row1.get(sq_col..), Some("none"), "{row1:?}");
+        assert_eq!(row2.get(sq_col..), Some("all"), "{row2:?}");
     }
 }

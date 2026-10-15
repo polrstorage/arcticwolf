@@ -270,10 +270,13 @@ async fn main() -> Result<()> {
             config::BackendConfig::Local { path } => path.display().to_string(),
         };
         println!(
-            "  Export: {} (uid {}, {}, backend={}, path={})",
+            "  Export: {} (uid {}, {}, squash={}, anon={}:{}, backend={}, path={})",
             export.name,
             export.uid,
             if export.read_only { "ro" } else { "rw" },
+            export.squash.as_str(),
+            export.anonuid,
+            export.anongid,
             source.backend.name(),
             backend_path,
         );

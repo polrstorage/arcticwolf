@@ -204,6 +204,9 @@ mod tests {
             name: "/data".to_string(),
             uid: 1,
             read_only: false,
+            squash: Default::default(),
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             backend: BackendConfig::Local {
                 path: dir.path().to_path_buf(),
             },

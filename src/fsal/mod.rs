@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::config::{DEFAULT_ANON_ID, Squash};
+
 #[allow(unused_imports)]
 pub use handle::{FileHandle, FileHandleExt, HandleManager};
 pub use local::LocalFilesystem;
@@ -375,9 +377,48 @@ pub struct ExportInfo {
     pub uid: u32,
     /// True if writes are denied against this export.
     pub read_only: bool,
+    /// Identity squashing mode (`root` / `all` / `none`).
+    pub squash: Squash,
+    /// uid used for squashed and anonymous callers.
+    pub anonuid: u32,
+    /// gid used for squashed and anonymous callers.
+    pub anongid: u32,
     /// Short FSAL discriminator (`"local"` today). Forward-compatible: when
     /// other backends land, this becomes their variant name.
     pub fsal: String,
+}
+
+/// Per-export identity mapping, resolved from `ExportConfig`.
+///
+/// Consumed by `crate::nfs::access_check` to turn the RPC credential into
+/// the identity that permission checks and new-file ownership use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SquashPolicy {
+    pub squash: Squash,
+    pub anonuid: u32,
+    pub anongid: u32,
+}
+
+impl SquashPolicy {
+    /// Trust the credential as sent (`squash = "none"`). Used by the
+    /// single-export test registry on `LocalFilesystem`.
+    pub const NONE: SquashPolicy = SquashPolicy {
+        squash: Squash::None,
+        anonuid: DEFAULT_ANON_ID,
+        anongid: DEFAULT_ANON_ID,
+    };
+}
+
+impl Default for SquashPolicy {
+    /// `root` squash to `nobody`, the same default as `exportfs(8)` and
+    /// as an `[[exports]]` entry that omits the squash keys.
+    fn default() -> Self {
+        SquashPolicy {
+            squash: Squash::Root,
+            anonuid: DEFAULT_ANON_ID,
+            anongid: DEFAULT_ANON_ID,
+        }
+    }
 }
 
 /// Registry of NFS exports, decoupled from per-handle filesystem operations.
@@ -402,6 +443,14 @@ pub trait ExportRegistry: Send + Sync {
     /// missing — write paths should treat that as a stale-handle error
     /// elsewhere; this method only answers the read-only question.
     fn is_read_only(&self, handle: &FileHandle) -> bool;
+
+    /// Identity-mapping policy of the export that owns `handle`.
+    ///
+    /// Returns the conservative [`SquashPolicy::default`] (root squash to
+    /// `nobody`) for handles whose export uid prefix is unknown or
+    /// missing; the backend call that follows fails them with
+    /// `NFS3ERR_STALE` anyway.
+    fn squash_policy(&self, handle: &FileHandle) -> SquashPolicy;
 
     /// Decode the export uid embedded in `handle`'s prefix, if present.
     #[allow(dead_code)]
