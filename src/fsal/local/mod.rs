@@ -340,10 +340,12 @@ impl Filesystem for LocalFilesystem {
     async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let path = self.resolve_handle(handle)?;
 
+        // No O_CREAT: the handle names a file that exists, and a file that
+        // vanished must fail rather than reappear owned by the daemon.
+        // O_CREAT would also trip fs.protected_regular, which refuses it
+        // to root on another user's file in a world-writable sticky dir.
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(&path)
             .await
             .context(format!("Failed to open file for writing: {:?}", path))?;
@@ -1124,6 +1126,21 @@ mod tests {
             FileType::Directory,
             "Root should be a directory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_does_not_recreate_removed_file() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let file = fs.create(&root, "gone", 0o644, None).await.unwrap();
+        std::fs::remove_file(temp_dir.path().join("gone")).unwrap();
+
+        let err = fs.write(&file, 0, b"late").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(!temp_dir.path().join("gone").exists());
     }
 
     #[tokio::test]
