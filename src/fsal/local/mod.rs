@@ -156,26 +156,7 @@ impl LocalFilesystem {
 
     /// Convert std::fs::Metadata to FileAttributes
     fn metadata_to_attr(&self, metadata: &fs::Metadata, _path: &Path) -> FileAttributes {
-        use std::os::unix::fs::FileTypeExt;
-        let file_type = metadata.file_type();
-
-        let ftype = if file_type.is_dir() {
-            FileType::Directory
-        } else if file_type.is_file() {
-            FileType::RegularFile
-        } else if file_type.is_symlink() {
-            FileType::SymbolicLink
-        } else if file_type.is_fifo() {
-            FileType::NamedPipe
-        } else if file_type.is_char_device() {
-            FileType::CharDevice
-        } else if file_type.is_block_device() {
-            FileType::BlockDevice
-        } else if file_type.is_socket() {
-            FileType::Socket
-        } else {
-            FileType::RegularFile // Default
-        };
+        let ftype = ftype_of(metadata.file_type());
 
         FileAttributes {
             ftype,
@@ -219,8 +200,9 @@ impl Filesystem for LocalFilesystem {
         // Validate path is within export root
         self.validate_path(&full_path)?;
 
-        // Check if file exists
-        if !full_path.exists() {
+        // Check the entry exists without following it: a dangling symlink
+        // is still an entry the client may READLINK, chown or remove.
+        if tokio_fs::symlink_metadata(&full_path).await.is_err() {
             return Err(anyhow!("File not found: {}", name));
         }
 
@@ -235,7 +217,10 @@ impl Filesystem for LocalFilesystem {
     async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes> {
         let path = self.resolve_handle(handle)?;
 
-        let metadata = tokio_fs::metadata(&path)
+        // lstat: a symlink handle describes the link itself (NF3LNK), as
+        // READDIR already reports it, and a dangling link still has
+        // attributes to check SETATTR against.
+        let metadata = tokio_fs::symlink_metadata(&path)
             .await
             .context(format!("Failed to stat: {:?}", path))?;
 
@@ -309,26 +294,7 @@ impl Filesystem for LocalFilesystem {
                 .await
                 .context(format!("Failed to get metadata for: {:?}", entry_path))?;
 
-            use std::os::unix::fs::FileTypeExt;
-            let ft = entry_metadata.file_type();
-
-            let file_type = if ft.is_dir() {
-                FileType::Directory
-            } else if ft.is_file() {
-                FileType::RegularFile
-            } else if ft.is_symlink() {
-                FileType::SymbolicLink
-            } else if ft.is_fifo() {
-                FileType::NamedPipe
-            } else if ft.is_char_device() {
-                FileType::CharDevice
-            } else if ft.is_block_device() {
-                FileType::BlockDevice
-            } else if ft.is_socket() {
-                FileType::Socket
-            } else {
-                FileType::RegularFile // Default
-            };
+            let file_type = ftype_of(entry_metadata.file_type());
 
             let name = entry.file_name().to_string_lossy().to_string();
 
@@ -828,6 +794,28 @@ impl Filesystem for LocalFilesystem {
     }
 }
 
+/// Map an `std` file type onto the FSAL's.
+fn ftype_of(ft: fs::FileType) -> FileType {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_dir() {
+        FileType::Directory
+    } else if ft.is_file() {
+        FileType::RegularFile
+    } else if ft.is_symlink() {
+        FileType::SymbolicLink
+    } else if ft.is_fifo() {
+        FileType::NamedPipe
+    } else if ft.is_char_device() {
+        FileType::CharDevice
+    } else if ft.is_block_device() {
+        FileType::BlockDevice
+    } else if ft.is_socket() {
+        FileType::Socket
+    } else {
+        FileType::RegularFile // Default
+    }
+}
+
 /// Query `statvfs(2)` and `pathconf(2)` to assemble [`FsStats`] for `path`.
 ///
 /// Runs entirely from synchronous syscalls so callers can dispatch it on the
@@ -1239,5 +1227,17 @@ mod tests {
             handle1, handle2,
             "Multiple lookups should return same handle"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dangling_symlink_has_attributes_and_can_be_looked_up() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        std::os::unix::fs::symlink("/nowhere", temp_dir.path().join("dangle")).unwrap();
+
+        let handle = fs.lookup(&root, "dangle").await.unwrap();
+        let attrs = fs.getattr(&handle).await.unwrap();
+        assert_eq!(attrs.ftype, FileType::SymbolicLink);
+        assert_eq!(attrs.size, "/nowhere".len() as u64);
     }
 }
