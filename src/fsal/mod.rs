@@ -262,6 +262,22 @@ pub trait Filesystem: Send + Sync {
         owner: Option<Owner>,
     ) -> Result<FileHandle>;
 
+    /// Create a file for NFS CREATE EXCLUSIVE (RFC 1813 §3.3.8).
+    ///
+    /// Like [`create`](Self::create) with mode 0644, but the eight-byte
+    /// `verifier` is stored in the file's mtime and atime (first and
+    /// second four bytes, big-endian, as knfsd does). If `name` already
+    /// exists as an empty regular file carrying the same verifier, it is
+    /// the result of an earlier attempt whose reply was lost: its handle
+    /// is returned instead of `AlreadyExists`.
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle>;
+
     /// Remove a file
     ///
     /// # Arguments
