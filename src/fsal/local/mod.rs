@@ -8,6 +8,7 @@ use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -479,6 +480,71 @@ impl Filesystem for LocalFilesystem {
         Ok(handle)
     }
 
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle> {
+        let dir_path = self.resolve_handle(dir_handle)?;
+
+        // Security: prevent path traversal
+        if name.contains('/') || name.contains("..") {
+            return Err(anyhow!("Invalid filename: {}", name));
+        }
+
+        let full_path = dir_path.join(name);
+
+        // Validate path is within export root
+        self.validate_path(&full_path)?;
+
+        let (v_mtime, v_atime) = verifier_times(verifier);
+        match tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full_path)
+            .await
+        {
+            Ok(file) => {
+                let file = file.into_std().await;
+                let path = full_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    settle_new_file(&file, &path, 0o644, owner)?;
+                    let times = fs::FileTimes::new()
+                        .set_accessed(SystemTime::UNIX_EPOCH + Duration::from_secs(v_atime.into()))
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(v_mtime.into()));
+                    file.set_times(times)
+                })
+                .await
+                .context("spawn_blocking failed")?
+                .context(format!("Failed to store the verifier on {:?}", full_path))?;
+                debug!("CREATE EXCLUSIVE: {:?} -> handle", full_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A retransmit of a create that did succeed finds an empty
+                // regular file still carrying the verifier.
+                let meta = tokio_fs::symlink_metadata(&full_path)
+                    .await
+                    .context(format!("Failed to stat: {:?}", full_path))?;
+                let retransmit = meta.file_type().is_file()
+                    && meta.len() == 0
+                    && meta.mtime() == i64::from(v_mtime)
+                    && meta.atime() == i64::from(v_atime);
+                if !retransmit {
+                    return Err(e).context(format!("Failed to create file: {:?}", full_path));
+                }
+                debug!(
+                    "CREATE EXCLUSIVE: {:?} carries the verifier, retransmit",
+                    full_path
+                );
+            }
+            Err(e) => return Err(e).context(format!("Failed to create file: {:?}", full_path)),
+        }
+
+        Ok(self.handle_manager.create_handle(full_path))
+    }
+
     async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
@@ -940,6 +1006,16 @@ fn pin_new_object(path: &Path, want: FileType) -> std::io::Result<fs::File> {
         )));
     }
     Ok(file)
+}
+
+/// The mtime and atime seconds a CREATE EXCLUSIVE verifier is stored as:
+/// its first and second four bytes, big-endian, as knfsd does.
+fn verifier_times(verifier: [u8; 8]) -> (u32, u32) {
+    let (m, a) = verifier.split_at(4);
+    (
+        u32::from_be_bytes(m.try_into().unwrap()),
+        u32::from_be_bytes(a.try_into().unwrap()),
+    )
 }
 
 /// Query `statvfs(2)` and `pathconf(2)` to assemble [`FsStats`] for `path`.
@@ -1475,5 +1551,35 @@ mod tests {
         assert!(pin_new_object(&file, FileType::Directory).is_err());
         assert!(pin_new_object(&link, FileType::RegularFile).is_err());
         assert!(pin_new_object(&temp_dir.path().join("missing"), FileType::RegularFile).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_exclusive_stores_the_verifier_and_accepts_a_retransmit() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let verf = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
+        let first = fs.create_exclusive(&root, "x", None, verf).await.unwrap();
+        let meta = std::fs::metadata(temp_dir.path().join("x")).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.mtime(), 0x0102_0304);
+        assert_eq!(meta.atime(), 0x0506_0708);
+
+        // The same verifier is a retransmit and yields the same file.
+        let again = fs.create_exclusive(&root, "x", None, verf).await.unwrap();
+        assert_eq!(again, first);
+        // A different one is a genuine collision.
+        let other = [0x11, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let err = fs
+            .create_exclusive(&root, "x", None, other)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists)
+        );
+        // So is the same verifier once the file holds data.
+        std::fs::write(temp_dir.path().join("x"), b"data").unwrap();
+        assert!(fs.create_exclusive(&root, "x", None, verf).await.is_err());
     }
 }

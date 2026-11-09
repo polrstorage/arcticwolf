@@ -75,23 +75,28 @@ pub async fn handle_create(
     // into the directory meanwhile can be handed over by mistake.
     let owner =
         super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
-    let mode = match &args.how {
-        createhow3::UNCHECKED(attrs) | createhow3::GUARDED(attrs) => match &attrs.mode {
-            set_mode3::SET_MODE(m) => *m,
-            _ => 0o644, // Default mode
-        },
-        // EXCLUSIVE carries a verifier instead of attributes. It is still
-        // handled like GUARDED: the verifier is not stored in atime/mtime,
-        // so a retransmitted create is reported as NFS3ERR_EXIST.
-        createhow3::EXCLUSIVE(_verf) => 0o644,
+    let created = match &args.how {
+        createhow3::UNCHECKED(attrs) | createhow3::GUARDED(attrs) => {
+            let mode = match &attrs.mode {
+                set_mode3::SET_MODE(m) => *m,
+                _ => 0o644, // Default mode
+            };
+            filesystem
+                .create(&args.where_dir.0, filename, mode, Some(owner))
+                .await
+        }
+        // EXCLUSIVE stores the verifier in the file's times, so a
+        // retransmit with the same verifier finds its file and succeeds.
+        createhow3::EXCLUSIVE(verf) => {
+            filesystem
+                .create_exclusive(&args.where_dir.0, filename, Some(owner), verf.0)
+                .await
+        }
     };
-    let created = filesystem
-        .create(&args.where_dir.0, filename, mode, Some(owner))
-        .await;
 
-    // The backend opens O_CREAT|O_EXCL, so a success is a brand-new file.
-    // A name that is already taken is NFS3ERR_EXIST for GUARDED and
-    // EXCLUSIVE; UNCHECKED keeps that file as it is (see `reuse_existing`).
+    // A name that is already taken is NFS3ERR_EXIST for GUARDED and for an
+    // EXCLUSIVE create with another verifier; UNCHECKED keeps that file as
+    // it is (see `reuse_existing`).
     let file_handle = match created {
         Ok(handle) => handle,
         Err(e) if is_exists(&e) => match &args.how {
@@ -474,5 +479,33 @@ mod tests {
             assert_eq!(status_of(&reply), nfsstat3::NFS3ERR_EXIST as i32);
             assert_eq!(fs::read(&existing).unwrap(), b"old content");
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_exclusive_retransmit_is_accepted() {
+        let (fs, temp_dir) = open_export();
+        let root_handle = fs.root_file_handle();
+        // The first attempt creates the file; a retransmit with the same
+        // verifier finds it and succeeds again instead of NFS3ERR_EXIST.
+        for xid in [1, 2] {
+            let verf = createverf3([9, 8, 7, 6, 5, 4, 3, 2]);
+            let args = create_args(&root_handle, "excl", createhow3::EXCLUSIVE(verf));
+            let reply = handle_create(xid, &args, fs.as_ref(), &Credentials::root())
+                .await
+                .unwrap();
+            assert_eq!(status_of(&reply), nfsstat3::NFS3_OK as i32, "attempt {xid}");
+        }
+        assert_eq!(fs::metadata(temp_dir.path().join("excl")).unwrap().len(), 0);
+
+        // Another client's verifier is a real collision.
+        let args = create_args(
+            &root_handle,
+            "excl",
+            createhow3::EXCLUSIVE(createverf3([0; 8])),
+        );
+        let reply = handle_create(3, &args, fs.as_ref(), &Credentials::root())
+            .await
+            .unwrap();
+        assert_eq!(status_of(&reply), nfsstat3::NFS3ERR_EXIST as i32);
     }
 }

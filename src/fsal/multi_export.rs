@@ -843,6 +843,21 @@ impl Filesystem for MultiExportFilesystem {
         r
     }
 
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<super::Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle> {
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner
+            .create_exclusive(dir_handle, name, owner, verifier)
+            .await;
+        metrics.record_result(&r);
+        r
+    }
+
     async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
         let r = inner.remove(dir_handle, name).await;
