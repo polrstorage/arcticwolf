@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS LOOKUP procedure (procedure 3)
 ///
@@ -26,6 +27,7 @@ pub async fn handle_lookup(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS LOOKUP called (xid={})", xid);
 
@@ -40,6 +42,15 @@ pub async fn handle_lookup(
         args.what_dir.0.len(),
         name
     );
+
+    // Search permission on the directory (POSIX: x bit).
+    if let Err(status) =
+        super::access_check::require(filesystem, &args.what_dir.0, cred, super::perm::EXEC).await
+    {
+        debug!("LOOKUP denied: {:?}", status);
+        let res_data = NfsMessage::create_lookup_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
 
     // Look up the file in the directory
     let file_handle = match filesystem.lookup(&args.what_dir.0, name).await {
@@ -157,7 +168,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call LOOKUP
-        let result = handle_lookup(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_lookup(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "LOOKUP should succeed for existing file");
 
@@ -190,7 +201,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call LOOKUP
-        let result = handle_lookup(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_lookup(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),

@@ -11,15 +11,20 @@ data:
     nfs_port = 2049
     mount_port = 0
 
-    # Two exports so the multi-export wiring is exercised end-to-end in
+    # Three exports so the multi-export wiring is exercised end-to-end in
     # CI: /data is the read-write export the POSIX suite drives against;
     # /backup is mounted read_only so the Phase 5 enforcement path (every
     # write-class NFS procedure short-circuits to NFS3ERR_ROFS) gets
-    # covered against a real Linux NFS client.
+    # covered against a real Linux NFS client; /scratch keeps the default
+    # root squash so ci/nfstest.sh can check that a root caller lands as
+    # anonuid while a plain user keeps its own uid.
     [[exports]]
     name = "/data"
     uid = 1
     read_only = false
+    # The POSIX suite runs as root on the client and expects to behave as
+    # root on the export, so this one trusts the credential as sent.
+    squash = "none"
     backend = "local"
     path = "/tmp/nfs_data"
 
@@ -29,6 +34,13 @@ data:
     read_only = true
     backend = "local"
     path = "/tmp/nfs_backup"
+
+    [[exports]]
+    name = "/scratch"
+    uid = 3
+    squash = "root"
+    backend = "local"
+    path = "/tmp/nfs_scratch"
 
     [logging]
     level = "debug"
@@ -50,6 +62,16 @@ spec:
         app: arcticwolf
     spec:
       hostNetwork: true
+      # The emptyDir arrives root-owned 0755; a root-squashed client could
+      # not create anything in it, so open it up like /tmp before the
+      # server starts.
+      initContainers:
+        - name: init-scratch
+          image: freezevicente/arcticwolf:latest
+          command: ["chmod", "1777", "/tmp/nfs_scratch"]
+          volumeMounts:
+            - name: nfs-scratch
+              mountPath: /tmp/nfs_scratch
       containers:
         - name: arcticwolf
           image: freezevicente/arcticwolf:latest
@@ -68,6 +90,8 @@ spec:
               mountPath: /tmp/nfs_data
             - name: nfs-backup
               mountPath: /tmp/nfs_backup
+            - name: nfs-scratch
+              mountPath: /tmp/nfs_scratch
             - name: config
               mountPath: /etc/arcticwolf
               readOnly: true
@@ -83,6 +107,8 @@ spec:
           persistentVolumeClaim:
             claimName: nfs-exports
         - name: nfs-backup
+          emptyDir: {}
+        - name: nfs-scratch
           emptyDir: {}
         - name: config
           configMap:

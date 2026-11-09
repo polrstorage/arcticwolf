@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use crate::fsal::{FileType, NfsBackend};
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS MKNOD procedure (11)
 ///
@@ -30,6 +31,7 @@ pub async fn handle_mknod(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS MKNOD: xid={}", xid);
 
@@ -49,8 +51,22 @@ pub async fn handle_mknod(
         return create_mknod_response(xid, status, None, None, None);
     }
 
-    // Get directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
+    // Creating an entry needs write + search permission on the directory.
+    // The attributes double as the pre-op view for wcc_data and ownership.
+    let dir_before = match super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("MKNOD denied: {:?}", status);
+            return create_mknod_response(xid, status, None, None, None);
+        }
+    };
 
     // Extract file type, mode, and device numbers from union
     let (file_type, mode, rdev) = match &args.what {
@@ -82,11 +98,22 @@ pub async fn handle_mknod(
         }
     };
 
+    // Device nodes need CAP_MKNOD; only (unsquashed) root gets them.
+    if matches!(file_type, FileType::CharDevice | FileType::BlockDevice)
+        && !super::access_check::identity_for(filesystem, &args.where_dir.0, cred).is_superuser()
+    {
+        debug!("MKNOD denied: device node requested by non-root caller");
+        let dir_attr = Some(NfsMessage::fsal_to_fattr3(&dir_before));
+        return create_mknod_response(xid, nfsstat3::NFS3ERR_PERM, None, None, dir_attr);
+    }
+
     let name = &args.name.0;
 
-    // Perform mknod operation
+    // Perform mknod operation; the backend hands the node to the caller.
+    let owner =
+        super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
     match filesystem
-        .mknod(&args.where_dir.0, name, file_type, mode, rdev)
+        .mknod(&args.where_dir.0, name, file_type, mode, rdev, Some(owner))
         .await
     {
         Ok(handle) => {
@@ -115,7 +142,7 @@ pub async fn handle_mknod(
         Err(e) => {
             warn!("MKNOD failed: {}", e);
             let status = map_error_to_status(&e);
-            let dir_attr = dir_before.map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_attr = Some(NfsMessage::fsal_to_fattr3(&dir_before));
             create_mknod_response(xid, status, None, None, dir_attr)
         }
     }

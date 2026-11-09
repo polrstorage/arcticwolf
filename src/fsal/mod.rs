@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::config::{DEFAULT_ANON_ID, Squash};
+
 #[allow(unused_imports)]
 pub use handle::{FileHandle, FileHandleExt, HandleManager};
 pub use local::LocalFilesystem;
@@ -105,6 +107,14 @@ pub enum FileType {
     SymbolicLink = 5,
     Socket = 6,
     NamedPipe = 7,
+}
+
+/// Owner to give a newly created object: the caller's identity after the
+/// export's squash policy, with the parent's gid when it is set-gid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// File time (seconds, nanoseconds)
@@ -227,14 +237,46 @@ pub trait Filesystem: Send + Sync {
 
     /// Create a file
     ///
+    /// The file is opened `O_CREAT | O_EXCL`: a name that already exists
+    /// is an error (`std::io::ErrorKind::AlreadyExists`) and the existing
+    /// file is left untouched, so a success always means a brand-new file.
+    /// `owner` is applied through the descriptor of that new file before
+    /// it is closed, so a concurrent rename in the directory cannot
+    /// redirect the change to another object. A chown the daemon may not
+    /// make (no `CAP_CHOWN`) is logged rather than reported: the file
+    /// exists, and the post-op attributes tell the client who owns it.
+    ///
     /// # Arguments
     /// * `dir_handle` - Directory handle
     /// * `name` - Name of new file
     /// * `mode` - File permissions
+    /// * `owner` - Owner of the new file; `None` leaves it to the daemon
     ///
     /// # Returns
     /// File handle of created file
-    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn create(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle>;
+
+    /// Create a file for NFS CREATE EXCLUSIVE (RFC 1813 §3.3.8).
+    ///
+    /// Like [`create`](Self::create) with mode 0644, but the eight-byte
+    /// `verifier` is stored in the file's mtime and atime (first and
+    /// second four bytes, big-endian, as knfsd does). If `name` already
+    /// exists as an empty regular file carrying the same verifier, it is
+    /// the result of an earlier attempt whose reply was lost: its handle
+    /// is returned instead of `AlreadyExists`.
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle>;
 
     /// Remove a file
     ///
@@ -249,10 +291,19 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Name of new directory
     /// * `mode` - Directory permissions
+    /// * `owner` - Owner of the new directory, as for [`create`](Self::create);
+    ///   an entry a concurrent rename swapped into its place is left alone
+    ///   and reported as an error
     ///
     /// # Returns
     /// File handle of created directory
-    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle>;
+    async fn mkdir(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle>;
 
     /// Remove a directory
     ///
@@ -282,11 +333,13 @@ pub trait Filesystem: Send + Sync {
     /// * `dir_handle` - Parent directory handle
     /// * `name` - Symlink name
     /// * `target` - Target path the symlink points to
+    /// * `owner` - Owner of the new link, as for [`mkdir`](Self::mkdir)
     async fn symlink(
         &self,
         dir_handle: &FileHandle,
         name: &str,
         target: &str,
+        owner: Option<Owner>,
     ) -> Result<FileHandle>;
 
     /// Read a symbolic link
@@ -336,6 +389,7 @@ pub trait Filesystem: Send + Sync {
     /// * `file_type` - Type of special file (BlockDevice, CharDevice, Socket, NamedPipe)
     /// * `mode` - File permissions
     /// * `rdev` - Device numbers (major, minor) for device files, ignored for FIFO/Socket
+    /// * `owner` - Owner of the new node, as for [`mkdir`](Self::mkdir)
     ///
     /// # Returns
     /// File handle of created special file
@@ -346,6 +400,7 @@ pub trait Filesystem: Send + Sync {
         file_type: FileType,
         mode: u32,
         rdev: (u32, u32),
+        owner: Option<Owner>,
     ) -> Result<FileHandle>;
 
     /// Report filesystem-wide statistics for the export that owns `handle`.
@@ -375,9 +430,48 @@ pub struct ExportInfo {
     pub uid: u32,
     /// True if writes are denied against this export.
     pub read_only: bool,
+    /// Identity squashing mode (`root` / `all` / `none`).
+    pub squash: Squash,
+    /// uid used for squashed and anonymous callers.
+    pub anonuid: u32,
+    /// gid used for squashed and anonymous callers.
+    pub anongid: u32,
     /// Short FSAL discriminator (`"local"` today). Forward-compatible: when
     /// other backends land, this becomes their variant name.
     pub fsal: String,
+}
+
+/// Per-export identity mapping, resolved from `ExportConfig`.
+///
+/// Consumed by `crate::nfs::access_check` to turn the RPC credential into
+/// the identity that permission checks and new-file ownership use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SquashPolicy {
+    pub squash: Squash,
+    pub anonuid: u32,
+    pub anongid: u32,
+}
+
+impl SquashPolicy {
+    /// Trust the credential as sent (`squash = "none"`). Used by the
+    /// single-export test registry on `LocalFilesystem`.
+    pub const NONE: SquashPolicy = SquashPolicy {
+        squash: Squash::None,
+        anonuid: DEFAULT_ANON_ID,
+        anongid: DEFAULT_ANON_ID,
+    };
+}
+
+impl Default for SquashPolicy {
+    /// `root` squash to `nobody`, the same default as `exportfs(8)` and
+    /// as an `[[exports]]` entry that omits the squash keys.
+    fn default() -> Self {
+        SquashPolicy {
+            squash: Squash::Root,
+            anonuid: DEFAULT_ANON_ID,
+            anongid: DEFAULT_ANON_ID,
+        }
+    }
 }
 
 /// Registry of NFS exports, decoupled from per-handle filesystem operations.
@@ -402,6 +496,14 @@ pub trait ExportRegistry: Send + Sync {
     /// missing — write paths should treat that as a stale-handle error
     /// elsewhere; this method only answers the read-only question.
     fn is_read_only(&self, handle: &FileHandle) -> bool;
+
+    /// Identity-mapping policy of the export that owns `handle`.
+    ///
+    /// Returns the conservative [`SquashPolicy::default`] (root squash to
+    /// `nobody`) for handles whose export uid prefix is unknown or
+    /// missing; the backend call that follows fails them with
+    /// `NFS3ERR_STALE` anyway.
+    fn squash_policy(&self, handle: &FileHandle) -> SquashPolicy;
 
     /// Decode the export uid embedded in `handle`'s prefix, if present.
     #[allow(dead_code)]

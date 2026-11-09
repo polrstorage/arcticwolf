@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use arcticwolf::admin::{DEFAULT_ADMIN_SOCKET_PATH, client};
-use arcticwolf::config::{BackendConfig, ExportConfig};
+use arcticwolf::config::{BackendConfig, DEFAULT_ANON_ID, ExportConfig, Squash};
 use arcticwolf::fsal::multi_export::ExportSelector;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
@@ -113,9 +113,36 @@ struct ExportsAddArgs {
     /// Mark the new export read-only.
     #[arg(long, default_value_t = false)]
     read_only: bool,
+    /// Identity squashing: `root` (default, like exportfs), `all` or `none`.
+    #[arg(long, value_enum, default_value_t = SquashKind::Root)]
+    squash: SquashKind,
+    /// uid that squashed and anonymous callers act as.
+    #[arg(long, default_value_t = DEFAULT_ANON_ID)]
+    anonuid: u32,
+    /// gid that squashed and anonymous callers act as.
+    #[arg(long, default_value_t = DEFAULT_ANON_ID)]
+    anongid: u32,
     /// Validate inputs against the live snapshot without mutating it.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+}
+
+/// CLI mirror of [`Squash`], so clap can validate the value.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SquashKind {
+    Root,
+    All,
+    None,
+}
+
+impl From<SquashKind> for Squash {
+    fn from(kind: SquashKind) -> Self {
+        match kind {
+            SquashKind::Root => Squash::Root,
+            SquashKind::All => Squash::All,
+            SquashKind::None => Squash::None,
+        }
+    }
 }
 
 /// Selector arg pair shared by `remove`: exactly one of `--name`/`--uid`.
@@ -350,6 +377,9 @@ fn export_config_from(args: &ExportsAddArgs) -> Result<ExportConfig, String> {
                 name: args.name.clone(),
                 uid: args.uid,
                 read_only: args.read_only,
+                squash: args.squash.into(),
+                anonuid: args.anonuid,
+                anongid: args.anongid,
                 backend: BackendConfig::Local { path },
             })
         }
@@ -743,6 +773,9 @@ mod tests {
             fsal: FsalKind::Local,
             path: Some(PathBuf::from("/srv/extra")),
             read_only: false,
+            squash: SquashKind::Root,
+            anonuid: DEFAULT_ANON_ID,
+            anongid: DEFAULT_ANON_ID,
             dry_run: false,
         };
         let code = run_exports_add(
@@ -755,6 +788,9 @@ mod tests {
                         fsal: args.fsal.clone(),
                         path: args.path.clone(),
                         read_only: args.read_only,
+                        squash: args.squash,
+                        anonuid: args.anonuid,
+                        anongid: args.anongid,
                         dry_run: args.dry_run,
                     }),
                 },
@@ -894,6 +930,9 @@ mod tests {
             fsal: FsalKind::Local,
             path: Some(PathBuf::from("/srv/extra")),
             read_only: false,
+            squash: SquashKind::Root,
+            anonuid: DEFAULT_ANON_ID,
+            anongid: DEFAULT_ANON_ID,
             dry_run: false,
         };
         let code = run_exports_add(
@@ -906,6 +945,9 @@ mod tests {
                         fsal: args.fsal.clone(),
                         path: args.path.clone(),
                         read_only: args.read_only,
+                        squash: args.squash,
+                        anonuid: args.anonuid,
+                        anongid: args.anongid,
                         dry_run: args.dry_run,
                     }),
                 },

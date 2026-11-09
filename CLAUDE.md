@@ -134,6 +134,12 @@ Required fields:
 Optional fields:
 
 - `read_only` — if `true`, deny writes against this export. Defaults to `false`.
+- `squash` — identity mapping applied to every caller, same meaning as in
+  `exportfs(8)`: `"root"` (default) maps uid 0 / gid 0 to `anonuid`/`anongid`,
+  `"all"` maps every caller, `"none"` trusts the `AUTH_SYS` credential as sent.
+  `AUTH_NONE` callers are always anonymous.
+- `anonuid`, `anongid` — the ids that squashed and anonymous callers act as.
+  Default `65534` (`nobody`/`nogroup`).
 
 ### Startup validation (fail-fast)
 

@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS MKDIR request
 ///
@@ -25,6 +26,7 @@ pub async fn handle_mkdir(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS MKDIR: xid={}", xid);
 
@@ -43,8 +45,22 @@ pub async fn handle_mkdir(
         return create_mkdir_response(xid, status, None, None, None);
     }
 
-    // Get parent directory attributes before operation (for wcc_data)
-    let _dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
+    // Creating an entry needs write + search permission on the directory.
+    // The attributes double as the pre-op view for ownership inheritance.
+    let dir_before = match super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("MKDIR denied: {:?}", status);
+            return create_mkdir_response(xid, status, None, None, None);
+        }
+    };
 
     // Extract mode from sattr3, default to 0755
     let mode = match args.attributes.mode {
@@ -52,9 +68,11 @@ pub async fn handle_mkdir(
         crate::protocol::v3::nfs::set_mode3::default => 0o755,
     };
 
-    // Perform mkdir operation
+    // Perform mkdir operation; the backend hands the directory to the caller.
+    let owner =
+        super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
     match filesystem
-        .mkdir(&args.where_dir.0, &args.name.0, mode)
+        .mkdir(&args.where_dir.0, &args.name.0, mode, Some(owner))
         .await
     {
         Ok(new_dir_handle) => {
@@ -252,7 +270,7 @@ mod tests {
         sattr.pack(&mut args_buf).unwrap();
 
         // Call MKDIR
-        let result = handle_mkdir(12345, &args_buf, &fs).await;
+        let result = handle_mkdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "MKDIR should succeed");
 
         // Verify directory was created
@@ -311,7 +329,7 @@ mod tests {
         sattr.pack(&mut args_buf).unwrap();
 
         // Call MKDIR
-        let result = handle_mkdir(12345, &args_buf, &fs).await;
+        let result = handle_mkdir(12345, &args_buf, &fs, &Credentials::root()).await;
         assert!(result.is_ok(), "MKDIR should return response (not crash)");
 
         // TODO: Parse response and verify status is NFS3ERR_EXIST

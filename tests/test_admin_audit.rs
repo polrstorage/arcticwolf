@@ -25,6 +25,9 @@ fn cfg(name: &str, uid: u32, path: PathBuf, read_only: bool) -> ExportConfig {
         name: name.to_string(),
         uid,
         read_only,
+        squash: Default::default(),
+        anonuid: arcticwolf::config::DEFAULT_ANON_ID,
+        anongid: arcticwolf::config::DEFAULT_ANON_ID,
         backend: BackendConfig::Local { path },
     }
 }

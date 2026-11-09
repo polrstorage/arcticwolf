@@ -55,7 +55,10 @@ impl MountMessage {
     pub fn create_mount_ok(fhandle_bytes: Vec<u8>) -> mountres3 {
         mountres3::MNT3_OK(mountres3_ok {
             fhandle: fhandle3(fhandle_bytes), // Wrap in newtype
-            auth_flavors: vec![0],            // AUTH_NONE
+            // Advertise AUTH_SYS only. The Linux client picks the first
+            // flavor it supports from this list, so listing AUTH_NONE first
+            // would make it send anonymous credentials for every NFS call.
+            auth_flavors: vec![crate::protocol::v3::rpc::auth_flavor::AUTH_SYS as i32],
         })
     }
 
@@ -122,6 +125,9 @@ mod tests {
             name: "/data".to_string(),
             uid: 1,
             read_only: false,
+            squash: crate::config::Squash::Root,
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             fsal: "local".to_string(),
         }];
         let bytes = MountMessage::serialize_exports(&exports);
@@ -145,12 +151,18 @@ mod tests {
                 name: "/data".to_string(),
                 uid: 1,
                 read_only: false,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
             ExportInfo {
                 name: "/backup".to_string(),
                 uid: 2,
                 read_only: true,
+                squash: crate::config::Squash::Root,
+                anonuid: crate::config::DEFAULT_ANON_ID,
+                anongid: crate::config::DEFAULT_ANON_ID,
                 fsal: "local".to_string(),
             },
         ];

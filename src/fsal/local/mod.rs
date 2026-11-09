@@ -5,19 +5,21 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use super::handle::{FileHandle, HandleManager};
-use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats};
+use super::{DirEntry, FileAttributes, FileTime, FileType, Filesystem, FsStats, Owner};
 
 #[cfg(test)]
 use super::handle::FileHandleExt;
 #[cfg(test)]
-use super::{ExportInfo, ExportRegistry};
+use super::{ExportInfo, ExportRegistry, SquashPolicy};
 
 /// Local filesystem implementation
 pub struct LocalFilesystem {
@@ -156,26 +158,7 @@ impl LocalFilesystem {
 
     /// Convert std::fs::Metadata to FileAttributes
     fn metadata_to_attr(&self, metadata: &fs::Metadata, _path: &Path) -> FileAttributes {
-        use std::os::unix::fs::FileTypeExt;
-        let file_type = metadata.file_type();
-
-        let ftype = if file_type.is_dir() {
-            FileType::Directory
-        } else if file_type.is_file() {
-            FileType::RegularFile
-        } else if file_type.is_symlink() {
-            FileType::SymbolicLink
-        } else if file_type.is_fifo() {
-            FileType::NamedPipe
-        } else if file_type.is_char_device() {
-            FileType::CharDevice
-        } else if file_type.is_block_device() {
-            FileType::BlockDevice
-        } else if file_type.is_socket() {
-            FileType::Socket
-        } else {
-            FileType::RegularFile // Default
-        };
+        let ftype = ftype_of(metadata.file_type());
 
         FileAttributes {
             ftype,
@@ -219,8 +202,9 @@ impl Filesystem for LocalFilesystem {
         // Validate path is within export root
         self.validate_path(&full_path)?;
 
-        // Check if file exists
-        if !full_path.exists() {
+        // Check the entry exists without following it: a dangling symlink
+        // is still an entry the client may READLINK, chown or remove.
+        if tokio_fs::symlink_metadata(&full_path).await.is_err() {
             return Err(anyhow!("File not found: {}", name));
         }
 
@@ -235,7 +219,10 @@ impl Filesystem for LocalFilesystem {
     async fn getattr(&self, handle: &FileHandle) -> Result<FileAttributes> {
         let path = self.resolve_handle(handle)?;
 
-        let metadata = tokio_fs::metadata(&path)
+        // lstat: a symlink handle describes the link itself (NF3LNK), as
+        // READDIR already reports it, and a dangling link still has
+        // attributes to check SETATTR against.
+        let metadata = tokio_fs::symlink_metadata(&path)
             .await
             .context(format!("Failed to stat: {:?}", path))?;
 
@@ -309,26 +296,7 @@ impl Filesystem for LocalFilesystem {
                 .await
                 .context(format!("Failed to get metadata for: {:?}", entry_path))?;
 
-            use std::os::unix::fs::FileTypeExt;
-            let ft = entry_metadata.file_type();
-
-            let file_type = if ft.is_dir() {
-                FileType::Directory
-            } else if ft.is_file() {
-                FileType::RegularFile
-            } else if ft.is_symlink() {
-                FileType::SymbolicLink
-            } else if ft.is_fifo() {
-                FileType::NamedPipe
-            } else if ft.is_char_device() {
-                FileType::CharDevice
-            } else if ft.is_block_device() {
-                FileType::BlockDevice
-            } else if ft.is_socket() {
-                FileType::Socket
-            } else {
-                FileType::RegularFile // Default
-            };
+            let file_type = ftype_of(entry_metadata.file_type());
 
             let name = entry.file_name().to_string_lossy().to_string();
 
@@ -373,10 +341,12 @@ impl Filesystem for LocalFilesystem {
     async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let path = self.resolve_handle(handle)?;
 
+        // No O_CREAT: the handle names a file that exists, and a file that
+        // vanished must fail rather than reappear owned by the daemon.
+        // O_CREAT would also trip fs.protected_regular, which refuses it
+        // to root on another user's file in a world-writable sticky dir.
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(&path)
             .await
             .context(format!("Failed to open file for writing: {:?}", path))?;
@@ -442,18 +412,36 @@ impl Filesystem for LocalFilesystem {
     ) -> Result<()> {
         let path = self.resolve_handle(handle)?;
 
-        // Note: chown requires root privileges on Unix systems
-        // For now, we'll just log this and return success
-        // In production, you might want to use nix::unistd::chown
-        debug!(
-            "SETATTR: {:?} uid={:?} gid={:?} (not implemented)",
-            path, uid, gid
-        );
+        // `lchown` so a symlink's own owner changes rather than its
+        // target's. -1 leaves the respective id untouched. Changing the
+        // owner needs CAP_CHOWN, so this fails with EPERM when the daemon
+        // is not running as root; the handler maps that to NFS3ERR_PERM.
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .context("path contains NUL")?;
+        let uid_arg = uid.map_or(u32::MAX, |u| u) as libc::uid_t;
+        let gid_arg = gid.map_or(u32::MAX, |g| g) as libc::gid_t;
+        tokio::task::spawn_blocking(move || {
+            if unsafe { libc::lchown(c_path.as_ptr(), uid_arg, gid_arg) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking failed")?
+        .context(format!("Failed to chown {:?} to {:?}:{:?}", path, uid, gid))?;
+
+        debug!("SETATTR: {:?} uid={:?} gid={:?}", path, uid, gid);
 
         Ok(())
     }
 
-    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn create(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -466,15 +454,22 @@ impl Filesystem for LocalFilesystem {
         // Validate path is within export root
         self.validate_path(&full_path)?;
 
-        // Create file
-        let file = tokio_fs::File::create(&full_path)
+        // Create file. O_EXCL turns an existing entry into an error
+        // instead of truncating it, so the caller can tell a file it just
+        // made (and may hand to the client) from one that was already there.
+        let file = tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full_path)
             .await
-            .context(format!("Failed to create file: {:?}", full_path))?;
+            .context(format!("Failed to create file: {:?}", full_path))?
+            .into_std()
+            .await;
 
-        // Set permissions
-        let permissions = fs::Permissions::from_mode(mode);
-        file.set_permissions(permissions)
+        let path = full_path.clone();
+        tokio::task::spawn_blocking(move || settle_new_file(&file, &path, mode, owner))
             .await
+            .context("spawn_blocking failed")?
             .context("Failed to set permissions")?;
 
         // Create handle
@@ -483,6 +478,71 @@ impl Filesystem for LocalFilesystem {
         debug!("CREATE: {:?} mode={:o} -> handle", full_path, mode);
 
         Ok(handle)
+    }
+
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle> {
+        let dir_path = self.resolve_handle(dir_handle)?;
+
+        // Security: prevent path traversal
+        if name.contains('/') || name.contains("..") {
+            return Err(anyhow!("Invalid filename: {}", name));
+        }
+
+        let full_path = dir_path.join(name);
+
+        // Validate path is within export root
+        self.validate_path(&full_path)?;
+
+        let (v_mtime, v_atime) = verifier_times(verifier);
+        match tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full_path)
+            .await
+        {
+            Ok(file) => {
+                let file = file.into_std().await;
+                let path = full_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    settle_new_file(&file, &path, 0o644, owner)?;
+                    let times = fs::FileTimes::new()
+                        .set_accessed(SystemTime::UNIX_EPOCH + Duration::from_secs(v_atime.into()))
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(v_mtime.into()));
+                    file.set_times(times)
+                })
+                .await
+                .context("spawn_blocking failed")?
+                .context(format!("Failed to store the verifier on {:?}", full_path))?;
+                debug!("CREATE EXCLUSIVE: {:?} -> handle", full_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A retransmit of a create that did succeed finds an empty
+                // regular file still carrying the verifier.
+                let meta = tokio_fs::symlink_metadata(&full_path)
+                    .await
+                    .context(format!("Failed to stat: {:?}", full_path))?;
+                let retransmit = meta.file_type().is_file()
+                    && meta.len() == 0
+                    && meta.mtime() == i64::from(v_mtime)
+                    && meta.atime() == i64::from(v_atime);
+                if !retransmit {
+                    return Err(e).context(format!("Failed to create file: {:?}", full_path));
+                }
+                debug!(
+                    "CREATE EXCLUSIVE: {:?} carries the verifier, retransmit",
+                    full_path
+                );
+            }
+            Err(e) => return Err(e).context(format!("Failed to create file: {:?}", full_path)),
+        }
+
+        Ok(self.handle_manager.create_handle(full_path))
     }
 
     async fn remove(&self, dir_handle: &FileHandle, name: &str) -> Result<()> {
@@ -508,7 +568,13 @@ impl Filesystem for LocalFilesystem {
         Ok(())
     }
 
-    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn mkdir(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
         // Security: prevent path traversal
@@ -526,11 +592,16 @@ impl Filesystem for LocalFilesystem {
             .await
             .context(format!("Failed to create directory: {:?}", full_path))?;
 
-        // Set permissions
-        let permissions = fs::Permissions::from_mode(mode);
-        tokio_fs::set_permissions(&full_path, permissions)
-            .await
-            .context("Failed to set permissions")?;
+        // Owner and mode go through a descriptor of the directory we just
+        // made, so a concurrent rename cannot point them at something else.
+        let path = full_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = pin_new_object(&path, FileType::Directory)?;
+            settle_new_file(&dir, &path, mode, owner)
+        })
+        .await
+        .context("spawn_blocking failed")?
+        .context("Failed to set permissions")?;
 
         // Create handle
         let handle = self.handle_manager.create_handle(full_path.clone());
@@ -606,6 +677,7 @@ impl Filesystem for LocalFilesystem {
         dir_handle: &FileHandle,
         name: &str,
         target: &str,
+        owner: Option<Owner>,
     ) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
 
@@ -634,6 +706,18 @@ impl Filesystem for LocalFilesystem {
                 "Failed to create symlink {:?} -> {}",
                 symlink_path, target
             ))?;
+
+        if let Some(owner) = owner {
+            let path = symlink_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let link = pin_new_object(&path, FileType::SymbolicLink)?;
+                chown_fd(&link, &path, owner);
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .context("spawn_blocking failed")?
+            .context("Failed to set owner")?;
+        }
 
         debug!("SYMLINK: {:?} -> {}", symlink_path, target);
 
@@ -760,6 +844,7 @@ impl Filesystem for LocalFilesystem {
         file_type: FileType,
         mode: u32,
         rdev: (u32, u32),
+        owner: Option<Owner>,
     ) -> Result<FileHandle> {
         let dir_path = self.resolve_handle(dir_handle)?;
         let file_path = dir_path.join(name);
@@ -817,6 +902,10 @@ impl Filesystem for LocalFilesystem {
                     ));
                 }
             }
+            if let Some(owner) = owner {
+                let node = pin_new_object(&file_path_clone, file_type_clone)?;
+                chown_fd(&node, &file_path_clone, owner);
+            }
             Ok(())
         })
         .await
@@ -826,6 +915,107 @@ impl Filesystem for LocalFilesystem {
         let handle = self.handle_manager.create_handle(file_path.clone());
         Ok(handle)
     }
+}
+
+/// Map an `std` file type onto the FSAL's.
+fn ftype_of(ft: fs::FileType) -> FileType {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_dir() {
+        FileType::Directory
+    } else if ft.is_file() {
+        FileType::RegularFile
+    } else if ft.is_symlink() {
+        FileType::SymbolicLink
+    } else if ft.is_fifo() {
+        FileType::NamedPipe
+    } else if ft.is_char_device() {
+        FileType::CharDevice
+    } else if ft.is_block_device() {
+        FileType::BlockDevice
+    } else if ft.is_socket() {
+        FileType::Socket
+    } else {
+        FileType::RegularFile // Default
+    }
+}
+
+/// Give the object behind `file` to `owner`.
+///
+/// `file` is the descriptor `create` got from `O_EXCL`, or an `O_NOFOLLOW`
+/// open [`pin_new_object`] has checked, so a concurrent rename in the
+/// parent cannot redirect the chown to another user's object. It runs
+/// before any chmod, because chown clears set-id bits. Failure is logged,
+/// not returned: the object exists, and the usual cause is a daemon
+/// without `CAP_CHOWN`, which main.rs warns about at startup.
+fn chown_fd(file: &fs::File, path: &Path, owner: Owner) {
+    let rc = unsafe {
+        libc::fchownat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            owner.uid,
+            owner.gid,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            "could not set owner {}:{} on new object {:?}: {}",
+            owner.uid,
+            owner.gid,
+            path,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Owner, then mode, through the descriptor of a file we just created.
+fn settle_new_file(
+    file: &fs::File,
+    path: &Path,
+    mode: u32,
+    owner: Option<Owner>,
+) -> std::io::Result<()> {
+    if let Some(owner) = owner {
+        chown_fd(file, path, owner);
+    }
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+/// Open the object just created at `path` for [`chown_fd`] without
+/// following anything, and make sure it is still the one we made: the
+/// daemon creates as itself, so an entry of another type or owner was
+/// swapped in by a concurrent rename and must not be touched. A directory
+/// gets a real descriptor (its mode is set through it too); anything else
+/// an `O_PATH` one.
+fn pin_new_object(path: &Path, want: FileType) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = if want == FileType::Directory {
+        libc::O_DIRECTORY
+    } else {
+        libc::O_PATH
+    } | libc::O_NOFOLLOW;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if ftype_of(meta.file_type()) != want || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other(format!(
+            "{:?} was replaced before it could be handed over",
+            path
+        )));
+    }
+    Ok(file)
+}
+
+/// The mtime and atime seconds a CREATE EXCLUSIVE verifier is stored as:
+/// its first and second four bytes, big-endian, as knfsd does.
+fn verifier_times(verifier: [u8; 8]) -> (u32, u32) {
+    let (m, a) = verifier.split_at(4);
+    (
+        u32::from_be_bytes(m.try_into().unwrap()),
+        u32::from_be_bytes(a.try_into().unwrap()),
+    )
 }
 
 /// Query `statvfs(2)` and `pathconf(2)` to assemble [`FsStats`] for `path`.
@@ -938,6 +1128,10 @@ impl ExportRegistry for LocalFilesystem {
         false
     }
 
+    fn squash_policy(&self, _handle: &FileHandle) -> SquashPolicy {
+        SquashPolicy::NONE
+    }
+
     fn export_for_handle(&self, handle: &FileHandle) -> Option<u32> {
         handle.as_slice().export_uid()
     }
@@ -953,6 +1147,37 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let fs = LocalFilesystem::new(temp_dir.path(), 1).expect("Failed to create filesystem");
         (fs, temp_dir)
+    }
+
+    /// chown to a different uid needs CAP_CHOWN, which the test process
+    /// only has inside the root build container.
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[tokio::test]
+    async fn test_setattr_owner_changes_uid_gid_without_following_symlinks() {
+        if !running_as_root() {
+            eprintln!("skipping: needs root to chown to another uid");
+            return;
+        }
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let file = fs.create(&root, "owned", 0o644, None).await.unwrap();
+        let link = fs.symlink(&root, "link", "owned", None).await.unwrap();
+
+        fs.setattr_owner(&file, Some(1000), Some(1001))
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(temp_dir.path().join("owned")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (1000, 1001));
+
+        // Only the gid, and only on the link itself.
+        fs.setattr_owner(&link, None, Some(2000)).await.unwrap();
+        let link_meta = std::fs::symlink_metadata(temp_dir.path().join("link")).unwrap();
+        assert_eq!(link_meta.gid(), 2000);
+        let target_meta = std::fs::metadata(temp_dir.path().join("owned")).unwrap();
+        assert_eq!((target_meta.uid(), target_meta.gid()), (1000, 1001));
     }
 
     #[tokio::test]
@@ -980,13 +1205,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_does_not_recreate_removed_file() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let file = fs.create(&root, "gone", 0o644, None).await.unwrap();
+        std::fs::remove_file(temp_dir.path().join("gone")).unwrap();
+
+        let err = fs.write(&file, 0, b"late").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(!temp_dir.path().join("gone").exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_existing_file() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let taken = temp_dir.path().join("taken");
+        std::fs::write(&taken, b"keep me").unwrap();
+        std::fs::set_permissions(&taken, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = fs.create(&root, "taken", 0o600, None).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists)
+        );
+        // Neither the contents nor the mode of the existing file changed.
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep me");
+        assert_eq!(std::fs::metadata(&taken).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[tokio::test]
     async fn test_create_and_lookup_file() {
         let (fs, _temp_dir) = create_test_fs();
         let root = fs.root_file_handle();
 
         // Create a file
         let file_handle = fs
-            .create(&root, "test.txt", 0o644)
+            .create(&root, "test.txt", 0o644, None)
             .await
             .expect("Failed to create file");
 
@@ -1018,7 +1276,7 @@ mod tests {
 
         // Create file
         let file_handle = fs
-            .create(&root, "data.txt", 0o644)
+            .create(&root, "data.txt", 0o644, None)
             .await
             .expect("Failed to create file");
 
@@ -1052,7 +1310,7 @@ mod tests {
 
         // Create directory
         let dir_handle = fs
-            .mkdir(&root, "subdir", 0o755)
+            .mkdir(&root, "subdir", 0o755, None)
             .await
             .expect("Failed to create directory");
 
@@ -1079,18 +1337,18 @@ mod tests {
 
         // Create nested directory structure
         let dir1 = fs
-            .mkdir(&root, "dir1", 0o755)
+            .mkdir(&root, "dir1", 0o755, None)
             .await
             .expect("Failed to create dir1");
 
         let dir2 = fs
-            .mkdir(&dir1, "dir2", 0o755)
+            .mkdir(&dir1, "dir2", 0o755, None)
             .await
             .expect("Failed to create dir2");
 
         // Create file in nested directory
         let file = fs
-            .create(&dir2, "nested.txt", 0o644)
+            .create(&dir2, "nested.txt", 0o644, None)
             .await
             .expect("Failed to create nested file");
 
@@ -1109,7 +1367,7 @@ mod tests {
         let root = fs.root_file_handle();
 
         // Create and remove file
-        fs.create(&root, "temp.txt", 0o644)
+        fs.create(&root, "temp.txt", 0o644, None)
             .await
             .expect("Failed to create file");
 
@@ -1128,7 +1386,7 @@ mod tests {
         let root = fs.root_file_handle();
 
         // Create and remove directory
-        fs.mkdir(&root, "tempdir", 0o755)
+        fs.mkdir(&root, "tempdir", 0o755, None)
             .await
             .expect("Failed to create directory");
 
@@ -1147,13 +1405,13 @@ mod tests {
         let root = fs.root_file_handle();
 
         // Try to create file with path traversal
-        let result = fs.create(&root, "../etc/passwd", 0o644).await;
+        let result = fs.create(&root, "../etc/passwd", 0o644, None).await;
         assert!(result.is_err(), "Should prevent path traversal with ..");
 
-        let result = fs.create(&root, "subdir/../file", 0o644).await;
+        let result = fs.create(&root, "subdir/../file", 0o644, None).await;
         assert!(result.is_err(), "Should prevent .. in filename");
 
-        let result = fs.create(&root, "dir/file", 0o644).await;
+        let result = fs.create(&root, "dir/file", 0o644, None).await;
         assert!(result.is_err(), "Should prevent / in filename");
     }
 
@@ -1217,7 +1475,7 @@ mod tests {
         let root = fs.root_file_handle();
 
         // Create file
-        fs.create(&root, "file.txt", 0o644)
+        fs.create(&root, "file.txt", 0o644, None)
             .await
             .expect("Failed to create file");
 
@@ -1235,5 +1493,93 @@ mod tests {
             handle1, handle2,
             "Multiple lookups should return same handle"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dangling_symlink_has_attributes_and_can_be_looked_up() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        std::os::unix::fs::symlink("/nowhere", temp_dir.path().join("dangle")).unwrap();
+
+        let handle = fs.lookup(&root, "dangle").await.unwrap();
+        let attrs = fs.getattr(&handle).await.unwrap();
+        assert_eq!(attrs.ftype, FileType::SymbolicLink);
+        assert_eq!(attrs.size, "/nowhere".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_create_sets_owner_through_the_descriptor() {
+        if !running_as_root() {
+            eprintln!("skipping: needs root to chown to another uid");
+            return;
+        }
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let owner = Owner {
+            uid: 1000,
+            gid: 1001,
+        };
+        fs.create(&root, "f", 0o2644, Some(owner)).await.unwrap();
+        fs.mkdir(&root, "d", 0o2750, Some(owner)).await.unwrap();
+        fs.symlink(&root, "l", "f", Some(owner)).await.unwrap();
+        fs.mknod(&root, "p", FileType::NamedPipe, 0o600, (0, 0), Some(owner))
+            .await
+            .unwrap();
+        for name in ["f", "d", "l", "p"] {
+            let meta = std::fs::symlink_metadata(temp_dir.path().join(name)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (1000, 1001), "{name}");
+        }
+        // chown ran before chmod, so the set-gid bits survived.
+        let f = std::fs::metadata(temp_dir.path().join("f")).unwrap();
+        assert_eq!(f.mode() & 0o7777, 0o2644);
+        let d = std::fs::metadata(temp_dir.path().join("d")).unwrap();
+        assert_eq!(d.mode() & 0o7777, 0o2750);
+    }
+
+    #[test]
+    fn pin_new_object_only_accepts_what_we_made() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let link = temp_dir.path().join("link");
+        std::os::unix::fs::symlink("file", &link).unwrap();
+
+        assert!(pin_new_object(&file, FileType::RegularFile).is_ok());
+        assert!(pin_new_object(&link, FileType::SymbolicLink).is_ok());
+        // The wrong kind of object at the path is never handed over, and
+        // the link is not followed to the file behind it.
+        assert!(pin_new_object(&file, FileType::Directory).is_err());
+        assert!(pin_new_object(&link, FileType::RegularFile).is_err());
+        assert!(pin_new_object(&temp_dir.path().join("missing"), FileType::RegularFile).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_exclusive_stores_the_verifier_and_accepts_a_retransmit() {
+        let (fs, temp_dir) = create_test_fs();
+        let root = fs.root_file_handle();
+        let verf = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
+        let first = fs.create_exclusive(&root, "x", None, verf).await.unwrap();
+        let meta = std::fs::metadata(temp_dir.path().join("x")).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.mtime(), 0x0102_0304);
+        assert_eq!(meta.atime(), 0x0506_0708);
+
+        // The same verifier is a retransmit and yields the same file.
+        let again = fs.create_exclusive(&root, "x", None, verf).await.unwrap();
+        assert_eq!(again, first);
+        // A different one is a genuine collision.
+        let other = [0x11, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let err = fs
+            .create_exclusive(&root, "x", None, other)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists)
+        );
+        // So is the same verifier once the file holds data.
+        std::fs::write(temp_dir.path().join("x"), b"data").unwrap();
+        assert!(fs.create_exclusive(&root, "x", None, verf).await.is_err());
     }
 }

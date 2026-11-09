@@ -27,7 +27,10 @@ use crate::metrics::{ExportMetrics, ExportMetricsSnapshot};
 
 use super::handle::{FileHandle, FileHandleExt};
 use super::local::LocalFilesystem;
-use super::{DirEntry, ExportInfo, ExportRegistry, FileAttributes, FileType, Filesystem, FsStats};
+use super::{
+    DirEntry, ExportInfo, ExportRegistry, FileAttributes, FileType, Filesystem, FsStats,
+    SquashPolicy,
+};
 
 /// Normalize and validate an export name.
 ///
@@ -128,6 +131,7 @@ fn build_backend(config: &ExportConfig) -> Result<LocalFilesystem> {
 struct ExportEntry {
     name: String,
     read_only: bool,
+    squash: SquashPolicy,
     /// Short discriminator for the active backend variant (`"local"`).
     /// Reported in the `exports list` admin response so operators can see
     /// which FSAL each export is using without consulting the config.
@@ -301,6 +305,7 @@ impl MultiExportFilesystem {
             let entry = ExportEntry {
                 name: export.name.clone(),
                 read_only: export.read_only,
+                squash: export.squash_policy(),
                 fsal: export.backend.name(),
                 fs: Arc::new(fs),
                 metrics: Arc::new(ExportMetrics::default()),
@@ -473,6 +478,7 @@ impl MultiExportFilesystem {
         let entry = ExportEntry {
             name: config.name.clone(),
             read_only: config.read_only,
+            squash: config.squash_policy(),
             fsal: config.backend.name(),
             fs: Arc::new(fs),
             // A freshly-added export starts with zeroed counters; a uid
@@ -695,6 +701,9 @@ impl ExportRegistry for MultiExportFilesystem {
                     name: entry.name.clone(),
                     uid,
                     read_only: entry.read_only,
+                    squash: entry.squash.squash,
+                    anonuid: entry.squash.anonuid,
+                    anongid: entry.squash.anongid,
                     fsal: entry.fsal.to_string(),
                 }
             })
@@ -714,6 +723,16 @@ impl ExportRegistry for MultiExportFilesystem {
             Some(uid) => snapshot.by_uid.get(&uid).is_some_and(|e| e.read_only),
             None => false,
         }
+    }
+
+    fn squash_policy(&self, handle: &FileHandle) -> SquashPolicy {
+        let snapshot = self.state.load();
+        handle
+            .as_slice()
+            .export_uid()
+            .and_then(|uid| snapshot.by_uid.get(&uid))
+            .map(|e| e.squash)
+            .unwrap_or_default()
     }
 
     fn export_for_handle(&self, handle: &FileHandle) -> Option<u32> {
@@ -811,9 +830,30 @@ impl Filesystem for MultiExportFilesystem {
         r
     }
 
-    async fn create(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn create(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<super::Owner>,
+    ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.create(dir_handle, name, mode).await;
+        let r = inner.create(dir_handle, name, mode, owner).await;
+        metrics.record_result(&r);
+        r
+    }
+
+    async fn create_exclusive(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        owner: Option<super::Owner>,
+        verifier: [u8; 8],
+    ) -> Result<FileHandle> {
+        let (inner, metrics) = self.inner_for_handle(dir_handle)?;
+        let r = inner
+            .create_exclusive(dir_handle, name, owner, verifier)
+            .await;
         metrics.record_result(&r);
         r
     }
@@ -825,9 +865,15 @@ impl Filesystem for MultiExportFilesystem {
         r
     }
 
-    async fn mkdir(&self, dir_handle: &FileHandle, name: &str, mode: u32) -> Result<FileHandle> {
+    async fn mkdir(
+        &self,
+        dir_handle: &FileHandle,
+        name: &str,
+        mode: u32,
+        owner: Option<super::Owner>,
+    ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.mkdir(dir_handle, name, mode).await;
+        let r = inner.mkdir(dir_handle, name, mode, owner).await;
         metrics.record_result(&r);
         r
     }
@@ -865,9 +911,10 @@ impl Filesystem for MultiExportFilesystem {
         dir_handle: &FileHandle,
         name: &str,
         target: &str,
+        owner: Option<super::Owner>,
     ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.symlink(dir_handle, name, target).await;
+        let r = inner.symlink(dir_handle, name, target, owner).await;
         metrics.record_result(&r);
         r
     }
@@ -906,9 +953,12 @@ impl Filesystem for MultiExportFilesystem {
         file_type: FileType,
         mode: u32,
         rdev: (u32, u32),
+        owner: Option<super::Owner>,
     ) -> Result<FileHandle> {
         let (inner, metrics) = self.inner_for_handle(dir_handle)?;
-        let r = inner.mknod(dir_handle, name, file_type, mode, rdev).await;
+        let r = inner
+            .mknod(dir_handle, name, file_type, mode, rdev, owner)
+            .await;
         metrics.record_result(&r);
         r
     }
@@ -924,7 +974,7 @@ impl Filesystem for MultiExportFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BackendConfig as ConfigBackend;
+    use crate::config::{BackendConfig as ConfigBackend, DEFAULT_ANON_ID, Squash};
     use crate::fsal::handle::HANDLE_LEN;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -934,6 +984,9 @@ mod tests {
             name: name.to_string(),
             uid,
             read_only,
+            squash: Default::default(),
+            anonuid: crate::config::DEFAULT_ANON_ID,
+            anongid: crate::config::DEFAULT_ANON_ID,
             backend: ConfigBackend::Local { path },
         }
     }
@@ -1001,12 +1054,18 @@ mod tests {
                     name: "/data".to_string(),
                     uid: 1,
                     read_only: false,
+                    squash: Squash::Root,
+                    anonuid: DEFAULT_ANON_ID,
+                    anongid: DEFAULT_ANON_ID,
                     fsal: "local".to_string(),
                 },
                 ExportInfo {
                     name: "/backup".to_string(),
                     uid: 2,
                     read_only: true,
+                    squash: Squash::Root,
+                    anonuid: DEFAULT_ANON_ID,
+                    anongid: DEFAULT_ANON_ID,
                     fsal: "local".to_string(),
                 },
             ]

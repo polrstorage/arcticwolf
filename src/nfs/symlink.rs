@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle SYMLINK procedure
 ///
@@ -23,6 +24,7 @@ pub async fn handle_symlink(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS SYMLINK: xid={}", xid);
 
@@ -42,15 +44,32 @@ pub async fn handle_symlink(
         return create_symlink_response(xid, status, None, None, None);
     }
 
-    // Get parent directory attributes before operation (for wcc_data)
-    let dir_before = filesystem.getattr(&args.where_dir.0).await.ok();
+    // Creating an entry needs write + search permission on the directory.
+    // The attributes double as the pre-op view for wcc_data and ownership.
+    let dir_before = match super::access_check::require(
+        filesystem,
+        &args.where_dir.0,
+        cred,
+        super::perm::WRITE | super::perm::EXEC,
+    )
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(status) => {
+            debug!("SYMLINK denied: {:?}", status);
+            return create_symlink_response(xid, status, None, None, None);
+        }
+    };
 
-    // Perform symlink operation
+    // Perform symlink operation; the backend hands the link to the caller.
+    let owner =
+        super::access_check::owner_for_new(filesystem, &args.where_dir.0, &dir_before, cred);
     match filesystem
         .symlink(
             &args.where_dir.0,
             &args.name.0,
             &args.symlink.symlink_data.0,
+            Some(owner),
         )
         .await
     {
@@ -90,7 +109,7 @@ pub async fn handle_symlink(
             let status = map_error_to_status(&e);
 
             // Get parent directory attributes for failure case
-            let dir_attr = dir_before.map(|attr| NfsMessage::fsal_to_fattr3(&attr));
+            let dir_attr = Some(NfsMessage::fsal_to_fattr3(&dir_before));
 
             create_symlink_response(xid, status, None, None, dir_attr)
         }

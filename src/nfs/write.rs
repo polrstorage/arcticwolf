@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::fsal::NfsBackend;
 use crate::protocol::v3::nfs::{NfsMessage, nfsstat3};
 use crate::protocol::v3::rpc::RpcMessage;
+use crate::rpc::auth::Credentials;
 
 /// Handle NFS WRITE procedure (procedure 7)
 ///
@@ -25,6 +26,7 @@ pub async fn handle_write(
     xid: u32,
     args_data: &[u8],
     filesystem: &dyn NfsBackend,
+    cred: &Credentials,
 ) -> Result<BytesMut> {
     debug!("NFS WRITE called (xid={})", xid);
 
@@ -42,6 +44,15 @@ pub async fn handle_write(
     // Reject writes against handles whose export is configured read_only.
     if let Err(status) = super::access_check::check_writable(filesystem, &args.file.0) {
         debug!("WRITE denied: handle belongs to a read-only export");
+        let res_data = NfsMessage::create_write_error_response(status)?;
+        return RpcMessage::create_success_reply_with_data(xid, res_data);
+    }
+
+    // Write permission, with the owner override of RFC 1813 §4.4.
+    if let Err(status) =
+        super::access_check::require_io(filesystem, &args.file.0, cred, super::perm::WRITE).await
+    {
+        debug!("WRITE denied: {:?}", status);
         let res_data = NfsMessage::create_write_error_response(status)?;
         return RpcMessage::create_success_reply_with_data(xid, res_data);
     }
@@ -176,7 +187,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_write(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "WRITE should succeed");
 
@@ -219,7 +230,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_write(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(result.is_ok(), "WRITE with offset should succeed");
 
@@ -254,7 +265,7 @@ mod tests {
         args.pack(&mut args_buf).unwrap();
 
         // Call WRITE
-        let result = handle_write(12345, &args_buf, fs.as_ref()).await;
+        let result = handle_write(12345, &args_buf, fs.as_ref(), &Credentials::root()).await;
 
         assert!(
             result.is_ok(),
